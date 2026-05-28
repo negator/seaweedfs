@@ -31,6 +31,10 @@ func (d *recordingDispatcher) Delete(_ context.Context, action *engine.CompiledA
 	return d.err
 }
 
+func (d *recordingDispatcher) Annotate(_ context.Context, _ string, _ *bootstrap.Entry, _ time.Time, _ string) error {
+	return nil
+}
+
 // findShardForPath returns the shard ID for an entry with given path
 // in given bucket. Helper for tests that want to force entries onto
 // a known shard.

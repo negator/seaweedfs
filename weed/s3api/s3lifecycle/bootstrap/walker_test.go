@@ -14,8 +14,10 @@ import (
 
 // recorder captures dispatched (action, entry) pairs for assertion.
 type recorder struct {
-	calls []dispatchCall
-	err   error // when set, every Delete returns this error
+	calls         []dispatchCall
+	err           error // when set, every Delete returns this error
+	annotateCalls []annotateCall
+	annotateErr   error // when set, every Annotate returns this error
 }
 
 type dispatchCall struct {
@@ -23,11 +25,31 @@ type dispatchCall struct {
 	path string
 }
 
+type annotateCall struct {
+	bucket    string
+	path      string
+	expiresAt time.Time
+	ruleID    string
+}
+
 func (r *recorder) Delete(ctx context.Context, action *engine.CompiledAction, entry *Entry) error {
 	if r.err != nil {
 		return r.err
 	}
 	r.calls = append(r.calls, dispatchCall{kind: action.Key.ActionKind, path: entry.Path})
+	return nil
+}
+
+func (r *recorder) Annotate(_ context.Context, bucket string, entry *Entry, expiresAt time.Time, ruleID string) error {
+	if r.annotateErr != nil {
+		return r.annotateErr
+	}
+	r.annotateCalls = append(r.annotateCalls, annotateCall{
+		bucket:    bucket,
+		path:      entry.Path,
+		expiresAt: expiresAt,
+		ruleID:    ruleID,
+	})
 	return nil
 }
 
@@ -398,6 +420,168 @@ func TestWalk_NonMPUDirectorySkipped(t *testing.T) {
 	}
 	if len(rec.calls) != 0 {
 		t.Fatalf("plain directory should not dispatch, got %v", rec.calls)
+	}
+}
+
+func TestWalk_NotYetDueExpirationDaysAnnotates(t *testing.T) {
+	rule := &s3lifecycle.Rule{
+		ID:             "exp-rule",
+		Status:         s3lifecycle.StatusEnabled,
+		ExpirationDays: 30,
+	}
+	snap := compileEvDriven(t, "bk", rule)
+	mod := mustTime(t, "2024-01-01T00:00:00Z")
+	now := mod.Add(s3lifecycle.DaysToDuration(10)) // 10d in, not yet due at 30d
+
+	rec := &recorder{}
+	_, err := Walk(context.Background(), snap, "bk", EntryCallback([]*Entry{
+		{Path: "logs/a", IsLatest: true, ModTime: mod},
+	}), rec, WalkOptions{Now: now})
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("not-yet-due entry must not dispatch delete, got %v", rec.calls)
+	}
+	if len(rec.annotateCalls) != 1 {
+		t.Fatalf("want 1 Annotate call, got %d", len(rec.annotateCalls))
+	}
+	ac := rec.annotateCalls[0]
+	if ac.bucket != "bk" {
+		t.Fatalf("annotate bucket want bk, got %q", ac.bucket)
+	}
+	if ac.path != "logs/a" {
+		t.Fatalf("annotate path want logs/a, got %q", ac.path)
+	}
+	if ac.ruleID != "exp-rule" {
+		t.Fatalf("annotate ruleID want exp-rule, got %q", ac.ruleID)
+	}
+	wantExpiry := mod.Add(s3lifecycle.DaysToDuration(30))
+	if !ac.expiresAt.Equal(wantExpiry) {
+		t.Fatalf("annotate expiresAt want %v, got %v", wantExpiry, ac.expiresAt)
+	}
+}
+
+func TestWalk_NotYetDueDateAnnotates(t *testing.T) {
+	expDate := mustTime(t, "2099-01-01T00:00:00Z")
+	rule := &s3lifecycle.Rule{
+		ID:             "date-rule",
+		Status:         s3lifecycle.StatusEnabled,
+		ExpirationDate: expDate,
+	}
+	snap := compileEvDriven(t, "bk", rule)
+	now := mustTime(t, "2024-06-01T00:00:00Z") // well before the expiration date
+
+	rec := &recorder{}
+	_, err := Walk(context.Background(), snap, "bk", EntryCallback([]*Entry{
+		{Path: "obj/a", IsLatest: true, ModTime: mustTime(t, "2024-01-01T00:00:00Z")},
+	}), rec, WalkOptions{Now: now})
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("pre-date entry must not dispatch delete, got %v", rec.calls)
+	}
+	if len(rec.annotateCalls) != 1 {
+		t.Fatalf("want 1 Annotate call, got %d", len(rec.annotateCalls))
+	}
+	if !rec.annotateCalls[0].expiresAt.Equal(expDate) {
+		t.Fatalf("annotate expiresAt want %v, got %v", expDate, rec.annotateCalls[0].expiresAt)
+	}
+	if rec.annotateCalls[0].ruleID != "date-rule" {
+		t.Fatalf("annotate ruleID want date-rule, got %q", rec.annotateCalls[0].ruleID)
+	}
+}
+
+func TestWalk_DueActionDoesNotAnnotate(t *testing.T) {
+	rule := &s3lifecycle.Rule{
+		ID:             "exp-rule",
+		Status:         s3lifecycle.StatusEnabled,
+		ExpirationDays: 30,
+	}
+	snap := compileEvDriven(t, "bk", rule)
+	mod := mustTime(t, "2024-01-01T00:00:00Z")
+	now := mod.Add(s3lifecycle.DaysToDuration(60)) // well past the 30d threshold
+
+	rec := &recorder{}
+	_, err := Walk(context.Background(), snap, "bk", EntryCallback([]*Entry{
+		{Path: "obj/a", IsLatest: true, ModTime: mod},
+	}), rec, WalkOptions{Now: now})
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if len(rec.calls) != 1 || rec.calls[0].path != "obj/a" {
+		t.Fatalf("due entry must dispatch delete, got %v", rec.calls)
+	}
+	if len(rec.annotateCalls) != 0 {
+		t.Fatalf("dispatched-for-delete entry must not be annotated, got %v", rec.annotateCalls)
+	}
+}
+
+func TestWalk_EarliestExpirationAnnotated(t *testing.T) {
+	// Two rules both matching the object; r2 expires sooner. Walker must
+	// annotate with the earliest expiry date and its rule ID.
+	mod := mustTime(t, "2024-01-01T00:00:00Z")
+	r1 := &s3lifecycle.Rule{
+		ID:             "r1",
+		Status:         s3lifecycle.StatusEnabled,
+		ExpirationDays: 30, // expires in 30d
+	}
+	r2 := &s3lifecycle.Rule{
+		ID:             "r2",
+		Status:         s3lifecycle.StatusEnabled,
+		ExpirationDays: 10, // expires in 10d — earliest
+	}
+	snap := compileEvDriven(t, "bk", r1, r2)
+	now := mod.Add(s3lifecycle.DaysToDuration(5)) // 5d in, neither is due
+
+	rec := &recorder{}
+	_, err := Walk(context.Background(), snap, "bk", EntryCallback([]*Entry{
+		{Path: "obj/a", IsLatest: true, ModTime: mod},
+	}), rec, WalkOptions{Now: now})
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("neither rule is due, no delete expected, got %v", rec.calls)
+	}
+	if len(rec.annotateCalls) != 1 {
+		t.Fatalf("want exactly 1 Annotate call, got %d", len(rec.annotateCalls))
+	}
+	wantExpiry := mod.Add(s3lifecycle.DaysToDuration(10))
+	if !rec.annotateCalls[0].expiresAt.Equal(wantExpiry) {
+		t.Fatalf("want earliest expiry %v, got %v", wantExpiry, rec.annotateCalls[0].expiresAt)
+	}
+	if rec.annotateCalls[0].ruleID != "r2" {
+		t.Fatalf("want ruleID r2 (earliest), got %q", rec.annotateCalls[0].ruleID)
+	}
+}
+
+func TestWalk_AnnotateErrorIsNonFatal(t *testing.T) {
+	// Annotate failure must not halt the walk — a missing annotation is
+	// a missing response header, not a data-loss event.
+	rule := &s3lifecycle.Rule{
+		ID:             "r",
+		Status:         s3lifecycle.StatusEnabled,
+		ExpirationDays: 30,
+	}
+	snap := compileEvDriven(t, "bk", rule)
+	mod := mustTime(t, "2024-01-01T00:00:00Z")
+	now := mod.Add(s3lifecycle.DaysToDuration(5)) // not yet due
+
+	rec := &recorder{annotateErr: errors.New("filer write failed")}
+	cp, err := Walk(context.Background(), snap, "bk", EntryCallback([]*Entry{
+		{Path: "obj/a", IsLatest: true, ModTime: mod},
+		{Path: "obj/b", IsLatest: true, ModTime: mod},
+	}), rec, WalkOptions{Now: now})
+	if err != nil {
+		t.Fatalf("Walk must not fail on Annotate error, got %v", err)
+	}
+	if !cp.Completed {
+		t.Fatalf("walk should complete despite Annotate error")
+	}
+	if cp.LastScannedPath != "obj/b" {
+		t.Fatalf("walk should scan all entries, checkpoint want obj/b, got %q", cp.LastScannedPath)
 	}
 }
 

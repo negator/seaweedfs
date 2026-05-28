@@ -3,16 +3,21 @@ package dailyrun
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_lifecycle_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle/bootstrap"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle/engine"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/time/rate"
+	"google.golang.org/grpc"
 )
 
 // walkerStubClient captures the last LifecycleDeleteRequest so tests
@@ -192,4 +197,146 @@ func TestWalkerDispatcher_NilGuardsReturnError(t *testing.T) {
 
 	nilClient := &WalkerDispatcher{}
 	require.Error(t, nilClient.Delete(context.Background(), sampleAction(t, s3lifecycle.ActionKindExpirationDays), &bootstrap.Entry{Path: "obj"}))
+}
+
+// annotateFiler is a minimal SeaweedFilerClient stub for Annotate tests.
+// Only LookupDirectoryEntry and UpdateEntry are implemented; other methods
+// panic if called (inherited from the embedded interface).
+type annotateFiler struct {
+	filer_pb.SeaweedFilerClient
+	// entries maps "dir\x00name" to the filer Entry to return on lookup.
+	entries     map[string]*filer_pb.Entry
+	lookupErr   error
+	updateErr   error
+	lastUpdated *filer_pb.UpdateEntryRequest
+}
+
+func (f *annotateFiler) key(dir, name string) string { return dir + "\x00" + name }
+
+func (f *annotateFiler) LookupDirectoryEntry(_ context.Context, req *filer_pb.LookupDirectoryEntryRequest, _ ...grpc.CallOption) (*filer_pb.LookupDirectoryEntryResponse, error) {
+	if f.lookupErr != nil {
+		return nil, f.lookupErr
+	}
+	e := f.entries[f.key(req.Directory, req.Name)]
+	if e == nil {
+		return nil, fmt.Errorf("not found")
+	}
+	return &filer_pb.LookupDirectoryEntryResponse{Entry: e}, nil
+}
+
+func (f *annotateFiler) UpdateEntry(_ context.Context, req *filer_pb.UpdateEntryRequest, _ ...grpc.CallOption) (*filer_pb.UpdateEntryResponse, error) {
+	if f.updateErr != nil {
+		return nil, f.updateErr
+	}
+	f.lastUpdated = req
+	return &filer_pb.UpdateEntryResponse{}, nil
+}
+
+func TestWalkerDispatcher_AnnotateNilFilerNoOp(t *testing.T) {
+	d := &WalkerDispatcher{Client: &walkerStubClient{}, FilerClient: nil}
+	err := d.Annotate(context.Background(), "bkt", &bootstrap.Entry{Path: "obj"}, time.Now(), "r1")
+	require.NoError(t, err, "nil FilerClient must be a no-op")
+}
+
+func TestWalkerDispatcher_AnnotateVersionedSkipped(t *testing.T) {
+	filer := &annotateFiler{entries: map[string]*filer_pb.Entry{}}
+	d := &WalkerDispatcher{
+		Client:      &walkerStubClient{},
+		FilerClient: filer,
+		BucketsPath: "/buckets",
+	}
+	err := d.Annotate(context.Background(), "bkt", &bootstrap.Entry{Path: "obj", VersionID: "v-abc"}, time.Now(), "r1")
+	require.NoError(t, err, "versioned entry must be skipped silently")
+	assert.Nil(t, filer.lastUpdated, "no UpdateEntry call expected for versioned entry")
+}
+
+func TestWalkerDispatcher_AnnotateWritesExpiration(t *testing.T) {
+	expiresAt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	ruleID := "my-rule"
+
+	entry := &filer_pb.Entry{
+		Name:       "obj",
+		Attributes: &filer_pb.FuseAttributes{FileSize: 100},
+		Extended:   map[string][]byte{},
+	}
+	filer := &annotateFiler{
+		entries: map[string]*filer_pb.Entry{
+			"/buckets/bkt\x00obj": entry,
+		},
+	}
+	d := &WalkerDispatcher{
+		Client:      &walkerStubClient{},
+		FilerClient: filer,
+		BucketsPath: "/buckets",
+	}
+
+	err := d.Annotate(context.Background(), "bkt", &bootstrap.Entry{Path: "obj"}, expiresAt, ruleID)
+	require.NoError(t, err)
+	require.NotNil(t, filer.lastUpdated, "UpdateEntry must be called")
+
+	val := string(filer.lastUpdated.Entry.Extended[s3_constants.ExtExpirationKey])
+	assert.True(t, strings.Contains(val, "Thu, 01 Jan 2026 00:00:00 GMT"),
+		"expiry-date must be formatted as HTTP time, got: %s", val)
+	assert.True(t, strings.Contains(val, ruleID),
+		"rule-id must be present, got: %s", val)
+}
+
+func TestWalkerDispatcher_AnnotateWritesExpirationSubdirObject(t *testing.T) {
+	// Objects under subdirectories: "foo/bar" → dir="/buckets/bkt/foo", name="bar"
+	expiresAt := time.Date(2027, 6, 15, 0, 0, 0, 0, time.UTC)
+	entry := &filer_pb.Entry{
+		Name:       "bar",
+		Attributes: &filer_pb.FuseAttributes{},
+		Extended:   map[string][]byte{},
+	}
+	filer := &annotateFiler{
+		entries: map[string]*filer_pb.Entry{
+			"/buckets/bkt/foo\x00bar": entry,
+		},
+	}
+	d := &WalkerDispatcher{
+		Client:      &walkerStubClient{},
+		FilerClient: filer,
+		BucketsPath: "/buckets",
+	}
+
+	err := d.Annotate(context.Background(), "bkt", &bootstrap.Entry{Path: "foo/bar"}, expiresAt, "rule-x")
+	require.NoError(t, err)
+	require.NotNil(t, filer.lastUpdated)
+	assert.Equal(t, "/buckets/bkt/foo", filer.lastUpdated.Directory)
+}
+
+func TestWalkerDispatcher_AnnotateLookupFailureReturnsError(t *testing.T) {
+	filer := &annotateFiler{lookupErr: errors.New("lookup failed")}
+	d := &WalkerDispatcher{
+		Client:      &walkerStubClient{},
+		FilerClient: filer,
+		BucketsPath: "/buckets",
+	}
+	err := d.Annotate(context.Background(), "bkt", &bootstrap.Entry{Path: "obj"}, time.Now(), "r1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "lookup failed")
+	assert.Nil(t, filer.lastUpdated, "UpdateEntry must not be called when lookup fails")
+}
+
+func TestWalkerDispatcher_AnnotateUpdateFailureReturnsError(t *testing.T) {
+	entry := &filer_pb.Entry{
+		Name:       "obj",
+		Attributes: &filer_pb.FuseAttributes{},
+		Extended:   map[string][]byte{},
+	}
+	filer := &annotateFiler{
+		entries: map[string]*filer_pb.Entry{
+			"/buckets/bkt\x00obj": entry,
+		},
+		updateErr: errors.New("write failed"),
+	}
+	d := &WalkerDispatcher{
+		Client:      &walkerStubClient{},
+		FilerClient: filer,
+		BucketsPath: "/buckets",
+	}
+	err := d.Annotate(context.Background(), "bkt", &bootstrap.Entry{Path: "obj"}, time.Now(), "r1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "write failed")
 }
