@@ -57,6 +57,11 @@ type ListFunc func(ctx context.Context, bucket, start string, cb func(*Entry) er
 // the caller decides whether to retry from the recorded last_scanned_path.
 type Dispatcher interface {
 	Delete(ctx context.Context, action *engine.CompiledAction, entry *Entry) error
+	// Annotate persists the computed expiration date for a not-yet-due object so
+	// GET/HEAD handlers can return the x-amz-expiration response header without
+	// re-evaluating lifecycle rules on every request. Errors are non-fatal: a
+	// missing annotation is a missing header, not a data-loss event.
+	Annotate(ctx context.Context, bucket string, entry *Entry, expiresAt time.Time, ruleID string) error
 }
 
 // Checkpoint is the resume state. Caller persists it under
@@ -137,6 +142,12 @@ func walkEntry(ctx context.Context, snap *engine.Snapshot, bucket string, entry 
 		NoncurrentIndex:  entry.NoncurrentIndex,
 		Tags:             entry.Tags,
 	}
+	// earliestExpiry tracks the soonest expiration across all matching expiration-kind
+	// rules that are not yet due. Used to annotate the object after the loop.
+	var earliestExpiry time.Time
+	var expiryRuleID string
+	dispatched := false
+
 	for _, key := range keys {
 		action := snap.Action(key)
 		if action == nil {
@@ -167,6 +178,15 @@ func walkEntry(ctx context.Context, snap *engine.Snapshot, bucket string, entry 
 		}
 		res := s3lifecycle.EvaluateAction(action.Rule, key.ActionKind, info, now)
 		if res.Action == s3lifecycle.ActionNone {
+			// Not yet due: capture the earliest expiration date so we can annotate.
+			if key.ActionKind == s3lifecycle.ActionKindExpirationDays ||
+				key.ActionKind == s3lifecycle.ActionKindExpirationDate {
+				dueAt := s3lifecycle.ComputeDueAt(action.Rule, key.ActionKind, info)
+				if !dueAt.IsZero() && (earliestExpiry.IsZero() || dueAt.Before(earliestExpiry)) {
+					earliestExpiry = dueAt
+					expiryRuleID = action.Rule.ID
+				}
+			}
 			continue
 		}
 		if err := dispatch.Delete(ctx, action, entry); err != nil {
@@ -174,7 +194,17 @@ func walkEntry(ctx context.Context, snap *engine.Snapshot, bucket string, entry 
 				bucket, entry.Path, key.ActionKind, err)
 			return err
 		}
+		dispatched = true
 		stats.S3LifecycleBootstrapDispatchCounter.WithLabelValues(bucket, key.ActionKind.String()).Inc()
+	}
+
+	// Annotate not-yet-expired objects so GET/HEAD can return x-amz-expiration.
+	// Skip if the object was already dispatched for deletion.
+	if !dispatched && !earliestExpiry.IsZero() {
+		if err := dispatch.Annotate(ctx, bucket, entry, earliestExpiry, expiryRuleID); err != nil {
+			glog.Warningf("lifecycle bootstrap: annotate %s/%s: %v", bucket, entry.Path, err)
+			// Non-fatal: a missing annotation is just a missing response header.
+		}
 	}
 	return nil
 }

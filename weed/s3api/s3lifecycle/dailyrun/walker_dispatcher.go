@@ -3,12 +3,16 @@ package dailyrun
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_lifecycle_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle/bootstrap"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle/engine"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"golang.org/x/time/rate"
 )
 
@@ -25,6 +29,11 @@ type WalkerDispatcher struct {
 	// daily-run's processMatches uses so the walker and replay paths
 	// can't combine to burst past the cap. nil disables throttling.
 	Limiter *rate.Limiter
+	// FilerClient and BucketsPath are used by Annotate to write the
+	// expiration date back to the object's Extended metadata.
+	// If FilerClient is nil, Annotate is a no-op.
+	FilerClient filer_pb.SeaweedFilerClient
+	BucketsPath string
 }
 
 // Compile-time check.
@@ -100,4 +109,51 @@ func (d *WalkerDispatcher) Delete(ctx context.Context, action *engine.CompiledAc
 		return fmt.Errorf("walker dispatch %s/%s %s: outcome=%s reason=%s",
 			action.Bucket, objectPath, action.Key.ActionKind, resp.Outcome, resp.Reason)
 	}
+}
+
+// Annotate writes the computed expiration date into the object's Extended
+// metadata so GET/HEAD handlers can return x-amz-expiration without
+// re-evaluating lifecycle rules per request.
+//
+// Only non-versioned objects (VersionID == "") are annotated; versioned
+// objects require path resolution through the .versions/ directory which
+// is intentionally deferred.
+//
+// Errors are logged by the caller but do not halt the walk.
+func (d *WalkerDispatcher) Annotate(ctx context.Context, bucket string, entry *bootstrap.Entry, expiresAt time.Time, ruleID string) error {
+	if d == nil || d.FilerClient == nil {
+		return nil
+	}
+	// Only annotate non-versioned objects for now.
+	if entry.VersionID != "" {
+		return nil
+	}
+
+	objectPath := entry.Path
+	fullPath := util.NewFullPath(d.BucketsPath+"/"+bucket, objectPath)
+	dir, name := fullPath.DirAndName()
+
+	resp, err := filer_pb.LookupEntry(ctx, d.FilerClient, &filer_pb.LookupDirectoryEntryRequest{
+		Directory: dir,
+		Name:      name,
+	})
+	if err != nil || resp == nil || resp.Entry == nil {
+		return fmt.Errorf("annotate lookup %s/%s: %w", bucket, objectPath, err)
+	}
+
+	e := resp.Entry
+	if e.Extended == nil {
+		e.Extended = make(map[string][]byte)
+	}
+	value := fmt.Sprintf("expiry-date=%q, rule-id=%q",
+		expiresAt.UTC().Format(http.TimeFormat), ruleID)
+	e.Extended[s3_constants.ExtExpirationKey] = []byte(value)
+
+	if err := filer_pb.UpdateEntry(ctx, d.FilerClient, &filer_pb.UpdateEntryRequest{
+		Directory: dir,
+		Entry:     e,
+	}); err != nil {
+		return fmt.Errorf("annotate update %s/%s: %w", bucket, objectPath, err)
+	}
+	return nil
 }

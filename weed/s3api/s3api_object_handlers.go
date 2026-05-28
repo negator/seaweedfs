@@ -2048,6 +2048,13 @@ func (s3a *S3ApiServer) setResponseHeaders(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	// Set x-amz-expiration if the lifecycle walker annotated this object.
+	if entry.Extended != nil {
+		if v, ok := entry.Extended[s3_constants.ExtExpirationKey]; ok {
+			w.Header().Set(s3_constants.AmzExpiration, string(v))
+		}
+	}
+
 	// Apply S3 passthrough headers from query parameters
 	// AWS S3 supports overriding response headers via query parameters like:
 	// ?response-cache-control=no-cache&response-content-type=application/json

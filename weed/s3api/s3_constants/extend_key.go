@@ -30,6 +30,12 @@ const (
 	ExtChecksumAlgorithm = "x-seaweedfs-checksum-algorithm"
 	ExtChecksumValue     = "x-seaweedfs-checksum-value"
 
+	// Lifecycle expiration annotation (use x-seaweedfs- prefix to avoid leaking in generic header loop).
+	// Stored by the lifecycle walker for not-yet-due objects; read by GET/HEAD handlers to emit
+	// the x-amz-expiration response header.
+	// Format: expiry-date="Mon, 02 Jan 2006 15:04:05 GMT", rule-id="<rule-id>"
+	ExtExpirationKey = "x-seaweedfs-expiration"
+
 	// Bucket Policy
 	ExtBucketPolicyKey = "Seaweed-X-Amz-Bucket-Policy"
 
