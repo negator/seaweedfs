@@ -40,25 +40,24 @@ const (
 	DeletionBatchSize = 100000
 )
 
-// retryablePatterns contains error message patterns that indicate temporary/transient conditions
-// that should be retried. These patterns are based on actual error messages from the deletion pipeline.
+// retryablePatterns contains transient conditions specific to the deletion
+// pipeline, on top of the network and service failures util.IsTransientErrorMessage
+// already covers.
+//
+// Context cancellation counts as retryable here but not in util: this decides
+// whether to requeue the deletion, not whether to retry a call, and a cancelled
+// batch leaves the file still needing deletion.
 var retryablePatterns = []string{
 	"is read only",              // Volume temporarily read-only (tiering, maintenance)
 	"error reading from server", // Network I/O errors
-	"connection reset by peer",  // Network connection issues
 	"closed network connection", // Network connection closed unexpectedly
-	"connection refused",        // Server temporarily unavailable
 	"timeout",                   // Operation timeout (network or server)
 	"deadline exceeded",         // Context deadline exceeded
-	"context canceled",          // Context cancellation (may be transient)
+	"context canceled",          // Context cancellation
 	"lookup error",              // Volume lookup failures
 	"lookup failed",             // Volume server discovery issues
 	"too many requests",         // Rate limiting / backpressure
-	"service unavailable",       // HTTP 503 errors
-	"temporarily unavailable",   // Temporary service issues
 	"try again",                 // Explicit retry suggestion
-	"i/o timeout",               // Network I/O timeout
-	"broken pipe",               // Connection broken during operation
 }
 
 // DeletionRetryItem represents a file deletion that failed and needs to be retried
@@ -307,7 +306,7 @@ func (f *Filer) loopProcessingDeletion() {
 			glog.V(0).Infof("deletion processor shutting down")
 			return
 		case <-ticker.C:
-			f.fileIdDeletionQueue.Consume(func(fileIds []string) {
+			f.FileIdDeletionQueue.Consume(func(fileIds []string) {
 				for i := 0; i < len(fileIds); i += DeletionBatchSize {
 					end := i + DeletionBatchSize
 					if end > len(fileIds) {
@@ -491,6 +490,10 @@ func isRetryableError(errorMsg string) bool {
 		return false
 	}
 
+	if util.IsTransientErrorMessage(errorMsg) {
+		return true
+	}
+
 	errorLower := strings.ToLower(errorMsg)
 	for _, pattern := range retryablePatterns {
 		if strings.Contains(errorLower, pattern) {
@@ -596,23 +599,23 @@ func (f *Filer) DeleteChunks(ctx context.Context, fullpath util.FullPath, chunks
 func (f *Filer) doDeleteChunks(ctx context.Context, chunks []*filer_pb.FileChunk) {
 	for _, chunk := range chunks {
 		if !chunk.IsChunkManifest {
-			f.fileIdDeletionQueue.EnQueue(chunk.GetFileIdString())
+			f.FileIdDeletionQueue.EnQueue(chunk.GetFileIdString())
 			continue
 		}
-		dataChunks, manifestResolveErr := ResolveOneChunkManifest(ctx, f.MasterClient.LookupFileId, chunk)
+		dataChunks, manifestResolveErr := ResolveOneChunkManifest(ctx, f.MasterClient.LookupFileId, chunk, f.MasterClient)
 		if manifestResolveErr != nil {
 			glog.V(0).InfofCtx(ctx, "failed to resolve manifest %s: %v", chunk.FileId, manifestResolveErr)
 		}
 		for _, dChunk := range dataChunks {
-			f.fileIdDeletionQueue.EnQueue(dChunk.GetFileIdString())
+			f.FileIdDeletionQueue.EnQueue(dChunk.GetFileIdString())
 		}
-		f.fileIdDeletionQueue.EnQueue(chunk.GetFileIdString())
+		f.FileIdDeletionQueue.EnQueue(chunk.GetFileIdString())
 	}
 }
 
 func (f *Filer) DeleteChunksNotRecursive(chunks []*filer_pb.FileChunk) {
 	for _, chunk := range chunks {
-		f.fileIdDeletionQueue.EnQueue(chunk.GetFileIdString())
+		f.FileIdDeletionQueue.EnQueue(chunk.GetFileIdString())
 	}
 }
 
@@ -625,7 +628,7 @@ func (f *Filer) deleteChunksIfNotNew(ctx context.Context, oldEntry, newEntry *En
 		newChunks = newEntry.GetChunks()
 	}
 
-	toDelete, err := MinusChunks(ctx, f.MasterClient.GetLookupFileIdFunction(), oldChunks, newChunks)
+	toDelete, err := MinusChunks(ctx, f.MasterClient.GetLookupFileIdFunction(), oldChunks, newChunks, f.MasterClient)
 	if err != nil {
 		glog.ErrorfCtx(ctx, "Failed to resolve old entry chunks when delete old entry chunks. new: %s, old: %s", newChunks, oldChunks)
 		return

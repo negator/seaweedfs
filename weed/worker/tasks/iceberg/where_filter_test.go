@@ -173,7 +173,7 @@ func TestSplitWhereConjunctionQuoteAware(t *testing.T) {
 
 func TestPartitionPredicateMatchesUsesPartitionFieldIDs(t *testing.T) {
 	spec := iceberg.NewPartitionSpec(iceberg.PartitionField{
-		SourceID:  2,
+		SourceIDs: []int{2},
 		FieldID:   1000,
 		Name:      "name",
 		Transform: iceberg.IdentityTransform{},
@@ -193,7 +193,7 @@ func TestCompactDataFilesWhereFilter(t *testing.T) {
 	fs, client := startFakeFiler(t)
 
 	partitionSpec := iceberg.NewPartitionSpec(iceberg.PartitionField{
-		SourceID:  2,
+		SourceIDs: []int{2},
 		FieldID:   1000,
 		Name:      "name",
 		Transform: iceberg.IdentityTransform{},
@@ -241,11 +241,11 @@ func TestCompactDataFilesWhereFilter(t *testing.T) {
 		t.Fatalf("unexpected result: %q", result)
 	}
 
-	meta, _, err := loadCurrentMetadata(context.Background(), client, setup.BucketName, setup.tablePath())
+	state, err := loadCurrentMetadata(context.Background(), client, setup.BucketName, setup.tablePath())
 	if err != nil {
 		t.Fatalf("loadCurrentMetadata: %v", err)
 	}
-	manifests, err := loadCurrentManifests(context.Background(), client, setup.BucketName, setup.tablePath(), meta)
+	manifests, err := loadCurrentManifests(context.Background(), client, setup.BucketName, state.DataPath, state.Metadata)
 	if err != nil {
 		t.Fatalf("loadCurrentManifests: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestCompactDataFilesWhereFilter(t *testing.T) {
 	var compactedCount int
 	for _, p := range liveDataPaths {
 		switch {
-		case strings.HasPrefix(p, "data/compact-"):
+		case strings.HasPrefix(p, "s3://tb/ns/tbl/data/compact-"):
 			compactedCount++
 		case p == "data/eu-1.parquet", p == "data/eu-2.parquet":
 		default:

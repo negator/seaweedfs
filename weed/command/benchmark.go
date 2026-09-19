@@ -131,7 +131,10 @@ func runBenchmark(cmd *Command, args []string) bool {
 			glog.Fatal(err)
 		}
 		pprof.StartCPUProfile(f)
-		defer pprof.StopCPUProfile()
+		defer func() {
+			pprof.StopCPUProfile()
+			f.Close()
+		}()
 	}
 
 	// Determine what operations to perform
@@ -397,7 +400,7 @@ const (
 	benchBucket     = 1000000000 / benchResolution
 )
 
-// An efficient statics collecting and rendering
+// An efficient statistics collecting and rendering
 type stats struct {
 	data       []int
 	overflow   []int

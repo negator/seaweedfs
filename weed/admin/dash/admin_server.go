@@ -2,12 +2,16 @@ package dash
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/admin/maintenance"
@@ -15,6 +19,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	clustermaintenance "github.com/seaweedfs/seaweedfs/weed/cluster/maintenance"
 	"github.com/seaweedfs/seaweedfs/weed/credential"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -31,7 +36,11 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/seaweedfs/seaweedfs/weed/s3api"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/lifecycle_xml"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/policy_engine"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle/scheduler"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
 	"github.com/seaweedfs/seaweedfs/weed/worker/tasks"
 
@@ -72,6 +81,27 @@ func (s *AdminServer) getFilerConfig() (*FilerConfig, error) {
 	return config, err
 }
 
+// getFilerConf reads filer.conf so callers can inspect per-path rules such as
+// the read-only flag that quota enforcement toggles. A missing filer.conf
+// yields an empty (all-writable) config rather than an error.
+func (s *AdminServer) getFilerConf() (*filer.FilerConf, error) {
+	fc := filer.NewFilerConf()
+	err := s.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+		content, err := filer.ReadInsideFiler(context.Background(), client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName)
+		if err != nil {
+			if errors.Is(err, filer_pb.ErrNotFound) {
+				return nil
+			}
+			return err
+		}
+		if len(content) > 0 {
+			return fc.LoadFromBytes(content)
+		}
+		return nil
+	})
+	return fc, err
+}
+
 // getCollectionName returns the collection name for a bucket, prefixed with filer group if configured
 func getCollectionName(filerGroup, bucketName string) string {
 	if filerGroup != "" {
@@ -84,10 +114,17 @@ type AdminServer struct {
 	masterClient    *wdclient.MasterClient
 	templateFS      http.FileSystem
 	dataDir         string
+	filerGroup      string
 	grpcDialOption  grpc.DialOption
 	cacheExpiration time.Duration
 	lastCacheUpdate time.Time
 	cachedTopology  *ClusterTopology
+
+	// dashSamples is a bounded in-memory ring of recent cluster snapshots that
+	// powers the dashboard's at-a-glance sparklines (see dashboard_metrics.go),
+	// filled on the maintenance-metrics ticker. No Prometheus dependency.
+	dashSamples   []dashSample
+	dashSamplesMu sync.Mutex
 
 	// Filer discovery and caching
 	cachedFilers         []string
@@ -123,17 +160,22 @@ type AdminServer struct {
 
 	s3TablesManager *s3tables.Manager
 	icebergPort     int
+	lancePort       int
+
+	// s3PublicEndpoint is the client-facing S3 address from admin.toml
+	// (s3.public_endpoint); discovered S3 servers are the fallback.
+	s3PublicEndpoint string
 }
 
 // Type definitions moved to types.go
 
-func NewAdminServer(masters string, templateFS http.FileSystem, dataDir string, icebergPort int) *AdminServer {
+func NewAdminServer(masters string, filerGroup string, templateFS http.FileSystem, dataDir string, icebergPort, lancePort int, s3PublicEndpoint string) *AdminServer {
 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.admin")
 
 	// Create master client with multiple master support
 	masterClient := wdclient.NewMasterClient(
 		grpcDialOption,
-		"",      // filerGroup - not needed for admin
+		filerGroup,
 		"admin", // clientType
 		"",      // clientHost - not needed for admin
 		"",      // dataCenter - not needed for admin
@@ -155,6 +197,7 @@ func NewAdminServer(masters string, templateFS http.FileSystem, dataDir string, 
 		masterClient:                  masterClient,
 		templateFS:                    templateFS,
 		dataDir:                       dataDir,
+		filerGroup:                    filerGroup,
 		grpcDialOption:                grpcDialOption,
 		cacheExpiration:               defaultCacheTimeout,
 		filerCacheExpiration:          defaultFilerCacheTimeout,
@@ -162,6 +205,8 @@ func NewAdminServer(masters string, templateFS http.FileSystem, dataDir string, 
 		collectionStatsCacheThreshold: defaultStatsCacheTimeout,
 		s3TablesManager:               newS3TablesManager(),
 		icebergPort:                   icebergPort,
+		lancePort:                     lancePort,
+		s3PublicEndpoint:              normalizeS3PublicEndpoint(s3PublicEndpoint),
 		pluginLock:                    lockManager,
 		adminPresenceLock:             presenceLock,
 		bgCancel:                      bgCancel,
@@ -223,33 +268,25 @@ func NewAdminServer(masters string, templateFS http.FileSystem, dataDir string, 
 			maintenanceConfig = maintenance.DefaultMaintenanceConfig()
 		}
 
-		// Apply new defaults to handle schema changes (like enabling by default)
-		schema := maintenance.GetMaintenanceConfigSchema()
-		if err := schema.ApplyDefaultsToProtobuf(maintenanceConfig); err != nil {
-			glog.Warningf("Failed to apply schema defaults to loaded config: %v", err)
-		}
-
-		// Force enable maintenance system for new default behavior
-		// This handles the case where old configs had Enabled=false as default
-		if !maintenanceConfig.Enabled {
-			glog.V(1).Infof("Enabling maintenance system (new default behavior)")
-			maintenanceConfig.Enabled = true
-		}
-
-		glog.V(1).Infof("Maintenance system initialized with persistent configuration (enabled: %v)", maintenanceConfig.Enabled)
+		glog.V(1).Infof("Maintenance system initialized with persistent configuration (enabled: %v)", maintenanceConfig.GetEnabled())
 	} else {
 		maintenanceConfig = maintenance.DefaultMaintenanceConfig()
-		glog.V(1).Infof("No data directory configured, maintenance system will run in memory-only mode (enabled: %v)", maintenanceConfig.Enabled)
+		glog.V(1).Infof("No data directory configured, maintenance system will run in memory-only mode (enabled: %v)", maintenanceConfig.GetEnabled())
 	}
+
+	// Load saved task configurations from persistence. This has to run before the maintenance
+	// manager is created: creating it applies the maintenance policy to the registered
+	// detectors and schedulers, while this call replaces each task's whole config object, so
+	// running it afterwards would discard what the policy just applied. Both read the same
+	// persisted task config files, so the policy ends up as the last writer and stays
+	// authoritative for the task types it covers.
+	server.loadTaskConfigurationsFromPersistence()
 
 	// Always initialize maintenance manager
 	server.InitMaintenanceManager(maintenanceConfig)
 
-	// Load saved task configurations from persistence
-	server.loadTaskConfigurationsFromPersistence()
-
 	// Start maintenance manager if enabled
-	if maintenanceConfig.Enabled {
+	if maintenanceConfig.GetEnabled() {
 		go func() {
 			// Give master client a bit of time to connect before starting scans
 			time.Sleep(2 * time.Second)
@@ -257,6 +294,8 @@ func NewAdminServer(masters string, templateFS http.FileSystem, dataDir string, 
 				glog.Errorf("Failed to start maintenance manager: %v", err)
 			}
 		}()
+	} else {
+		glog.V(0).Infof("Maintenance system is disabled by configuration, not starting the maintenance manager")
 	}
 
 	pluginOpts := adminplugin.Options{
@@ -284,6 +323,13 @@ func NewAdminServer(masters string, templateFS http.FileSystem, dataDir string, 
 	go server.publishMaintenanceMetrics(bgCtx)
 
 	return server
+}
+
+func (s *AdminServer) listClusterNodesRequest(clientType string) *master_pb.ListClusterNodesRequest {
+	return &master_pb.ListClusterNodesRequest{
+		ClientType: clientType,
+		FilerGroup: s.filerGroup,
+	}
 }
 
 // vacuumToggler abstracts the master's vacuum enable/disable for testing.
@@ -375,17 +421,86 @@ func (s *AdminServer) publishMaintenanceMetrics(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// Seed one sample so the dashboard has something to draw before the first tick.
+	s.recordDashboardSample()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			s.collectMaintenanceMetrics()
+			s.recordDashboardSample()
 		}
 	}
 }
 
+// workerFleetTotals aggregates connected workers and their task slots across
+// BOTH worker registries the admin server keeps: the legacy maintenance-worker
+// registry (workers that register over the worker gRPC stream) and the plugin
+// worker registry (workers started as `weed worker`). Reading only the legacy
+// one reported zero workers on clusters that run the admin and the workers as
+// separate components, where no legacy worker ever registers.
+//
+// A worker can appear in both registries: `weed mini` starts both runtimes from
+// one working directory, so they share the persisted worker ID. Merging by ID
+// keeps such a worker counted once, and its slots are taken from the legacy
+// registry, which is where they were accounted for before.
+func (s *AdminServer) workerFleetTotals() (workers, usedSlots, maxSlots int) {
+	var legacySlots map[string]maintenance.WorkerSlots
+	if s.maintenanceManager != nil {
+		legacySlots = s.maintenanceManager.GetWorkerSlots()
+	}
+	return mergeWorkerFleetTotals(legacySlots, s.GetPluginWorkers())
+}
+
+// mergeWorkerFleetTotals unions the legacy and plugin worker registries by
+// worker ID. Plugin workers report their slots in the heartbeat, so one that
+// has connected but not yet sent a heartbeat adds to the worker count with zero
+// slots until its first heartbeat lands.
+func mergeWorkerFleetTotals(legacySlots map[string]maintenance.WorkerSlots, pluginWorkers []*adminplugin.WorkerSession) (workers, usedSlots, maxSlots int) {
+	for _, slots := range legacySlots {
+		workers++
+		usedSlots += slots.Used
+		maxSlots += slots.Max
+	}
+
+	for _, session := range pluginWorkers {
+		if session == nil {
+			continue
+		}
+		if _, counted := legacySlots[session.WorkerID]; counted {
+			continue
+		}
+		workers++
+		if heartbeat := session.Heartbeat; heartbeat != nil {
+			used := int(heartbeat.DetectionSlotsUsed) + int(heartbeat.ExecutionSlotsUsed)
+			max := int(heartbeat.DetectionSlotsTotal) + int(heartbeat.ExecutionSlotsTotal)
+			// A worker's self-reported slots are untrusted input; a stale or
+			// misbehaving one should not be able to drive the aggregate gauge
+			// negative, matching the same defensiveness as registry.go's own
+			// slot arithmetic.
+			if used < 0 {
+				used = 0
+			}
+			if max < 0 {
+				max = 0
+			}
+			usedSlots += used
+			maxSlots += max
+		}
+	}
+	return
+}
+
 func (s *AdminServer) collectMaintenanceMetrics() {
+	// Published before the maintenanceManager guard below: plugin workers are
+	// tracked independently of the maintenance manager.
+	workers, usedSlots, maxSlots := s.workerFleetTotals()
+	stats_collect.AdminWorkersConnected.Set(float64(workers))
+	stats_collect.AdminWorkerSlots.WithLabelValues("used").Set(float64(usedSlots))
+	stats_collect.AdminWorkerSlots.WithLabelValues("max").Set(float64(maxSlots))
+
 	if s.maintenanceManager == nil {
 		return
 	}
@@ -409,11 +524,6 @@ func (s *AdminServer) collectMaintenanceMetrics() {
 	} else {
 		stats_collect.AdminMaintenanceNextScanTimestampSeconds.Set(0)
 	}
-
-	workers, usedSlots, maxSlots := s.maintenanceManager.GetWorkerSlotTotals()
-	stats_collect.AdminWorkersConnected.Set(float64(workers))
-	stats_collect.AdminWorkerSlots.WithLabelValues("used").Set(float64(usedSlots))
-	stats_collect.AdminWorkerSlots.WithLabelValues("max").Set(float64(maxSlots))
 }
 
 // loadTaskConfigurationsFromPersistence loads saved task configurations from protobuf files
@@ -429,12 +539,16 @@ func (s *AdminServer) loadTaskConfigurationsFromPersistence() {
 }
 
 // enrichConfigDefaults is called by the plugin when bootstrapping a job type's
-// default config from its descriptor. For admin_script, it fetches maintenance
-// scripts from the master and uses them as the script default.
+// default config from its descriptor. It overlays admin.toml maintenance
+// settings, and for admin_script fetches maintenance scripts from the master
+// to use as the script default.
 //
-// MIGRATION: This exists to help users migrate from master.toml [master.maintenance]
-// to the admin script plugin worker. Remove after March 2027.
+// MIGRATION: the admin_script part exists to help users migrate from
+// master.toml [master.maintenance] to the admin script plugin worker.
+// Remove after March 2027.
 func (s *AdminServer) enrichConfigDefaults(cfg *plugin_pb.PersistedJobTypeConfig) *plugin_pb.PersistedJobTypeConfig {
+	applyPluginTomlDefaults(util.GetViper(), cfg)
+
 	if cfg.JobType != "admin_script" {
 		return cfg
 	}
@@ -650,6 +764,12 @@ func (s *AdminServer) GetS3Buckets() ([]S3Bucket, error) {
 		glog.Warningf("Failed to get filer configuration, using defaults: %v", err)
 	}
 
+	// Read filer.conf so we can surface the read-only flag quota enforcement sets
+	fc, err := s.getFilerConf()
+	if err != nil {
+		glog.Warningf("Failed to read filer.conf for bucket read-only state: %v", err)
+	}
+
 	// Now list buckets from the filer and match with collection data
 	err = s.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
 		// Paginate through all buckets in the buckets directory
@@ -748,19 +868,25 @@ func (s *AdminServer) GetS3Buckets() ([]S3Bucket, error) {
 					createdAt = time.Unix(resp.Entry.Attributes.Crtime, 0)
 					lastModified = time.Unix(resp.Entry.Attributes.Mtime, 0)
 				}
+				readOnly := fc.MatchStorageRule(filerConfig.BucketsPath + "/" + bucketName + "/").ReadOnly
+				lifecycleRuleCount, lifecycleEnabledCount := extractLifecycleCountsFromEntry(resp.Entry)
 				bucket := S3Bucket{
-					Name:               bucketName,
-					CreatedAt:          createdAt,
-					LogicalSize:        logicalSize,
-					PhysicalSize:       physicalSize,
-					LastModified:       lastModified,
-					Quota:              quota,
-					QuotaEnabled:       quotaEnabled,
-					VersioningStatus:   versioningStatus,
-					ObjectLockEnabled:  objectLockEnabled,
-					ObjectLockMode:     objectLockMode,
-					ObjectLockDuration: objectLockDuration,
-					Owner:              owner,
+					Name:                  bucketName,
+					CreatedAt:             createdAt,
+					LogicalSize:           logicalSize,
+					PhysicalSize:          physicalSize,
+					LastModified:          lastModified,
+					Quota:                 quota,
+					QuotaEnabled:          quotaEnabled,
+					ReadOnly:              readOnly,
+					VersioningStatus:      versioningStatus,
+					ObjectLockEnabled:     objectLockEnabled,
+					ObjectLockMode:        objectLockMode,
+					ObjectLockDuration:    objectLockDuration,
+					Owner:                 owner,
+					LifecycleRuleCount:    lifecycleRuleCount,
+					LifecycleEnabledCount: lifecycleEnabledCount,
+					PolicyStatementCount:  extractPolicyStatementCountFromEntry(resp.Entry),
 				}
 				buckets = append(buckets, bucket)
 			}
@@ -807,6 +933,13 @@ func (s *AdminServer) GetBucketDetails(bucketName string) (*BucketDetails, error
 	} else if data, ok := stats[collectionName]; ok {
 		details.Bucket.LogicalSize = data.LogicalSize
 		details.Bucket.PhysicalSize = data.PhysicalSize
+	}
+
+	// Surface the read-only flag quota enforcement sets in filer.conf
+	if fc, err := s.getFilerConf(); err != nil {
+		glog.Warningf("Failed to read filer.conf for bucket read-only state: %v", err)
+	} else {
+		details.Bucket.ReadOnly = fc.MatchStorageRule(filerConfig.BucketsPath + "/" + bucketName + "/").ReadOnly
 	}
 
 	err = s.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
@@ -858,6 +991,8 @@ func (s *AdminServer) GetBucketDetails(bucketName string) (*BucketDetails, error
 		details.Bucket.ObjectLockMode = objectLockMode
 		details.Bucket.ObjectLockDuration = objectLockDuration
 		details.Bucket.Owner = owner
+		details.Bucket.LifecycleRuleCount, details.Bucket.LifecycleEnabledCount = extractLifecycleCountsFromEntry(bucketResp.Entry)
+		details.Bucket.PolicyStatementCount = extractPolicyStatementCountFromEntry(bucketResp.Entry)
 
 		return nil
 	})
@@ -867,6 +1002,195 @@ func (s *AdminServer) GetBucketDetails(bucketName string) (*BucketDetails, error
 	}
 
 	return details, nil
+}
+
+// GetBucketLifecycle returns the lifecycle configuration stored on a bucket's filer entry
+func (s *AdminServer) GetBucketLifecycle(bucketName string) (*BucketLifecycle, error) {
+	filerConfig, err := s.getFilerConfig()
+	if err != nil {
+		glog.Warningf("Failed to get filer configuration, using defaults: %v", err)
+	}
+
+	lifecycle := &BucketLifecycle{
+		Bucket: bucketName,
+		Rules:  []BucketLifecycleRule{},
+	}
+
+	err = s.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+		resp, err := client.LookupDirectoryEntry(context.Background(), &filer_pb.LookupDirectoryEntryRequest{
+			Directory: filerConfig.BucketsPath,
+			Name:      bucketName,
+		})
+		if err != nil {
+			return fmt.Errorf("bucket not found: %w", err)
+		}
+
+		xmlBytes := resp.Entry.Extended[scheduler.BucketLifecycleConfigurationXMLKey]
+		if len(xmlBytes) == 0 {
+			return nil
+		}
+		rules, err := lifecycle_xml.ParseCanonical(xmlBytes)
+		if err != nil {
+			return fmt.Errorf("parse lifecycle configuration: %w", err)
+		}
+		lifecycle.XML = string(xmlBytes)
+		for _, rule := range rules {
+			lifecycle.Rules = append(lifecycle.Rules, toBucketLifecycleRule(rule))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return lifecycle, nil
+}
+
+func toBucketLifecycleRule(rule *s3lifecycle.Rule) BucketLifecycleRule {
+	out := BucketLifecycleRule{
+		ID:                              rule.ID,
+		Status:                          rule.Status,
+		Prefix:                          rule.Prefix,
+		Tags:                            rule.FilterTags,
+		SizeGreaterThan:                 rule.FilterSizeGreaterThan,
+		SizeLessThan:                    rule.FilterSizeLessThan,
+		ExpirationDays:                  rule.ExpirationDays,
+		ExpiredObjectDeleteMarker:       rule.ExpiredObjectDeleteMarker,
+		NoncurrentVersionExpirationDays: rule.NoncurrentVersionExpirationDays,
+		NewerNoncurrentVersions:         rule.NewerNoncurrentVersions,
+		AbortMultipartDays:              rule.AbortMPUDaysAfterInitiation,
+	}
+	if !rule.ExpirationDate.IsZero() {
+		out.ExpirationDate = rule.ExpirationDate.Format(time.DateOnly)
+	}
+	return out
+}
+
+// fromBucketLifecycleRule is the inverse of toBucketLifecycleRule, turning a
+// rule edited in the admin UI back into the engine's canonical shape.
+func fromBucketLifecycleRule(rule BucketLifecycleRule) (*s3lifecycle.Rule, error) {
+	out := &s3lifecycle.Rule{
+		ID:                              rule.ID,
+		Status:                          rule.Status,
+		Prefix:                          rule.Prefix,
+		FilterTags:                      rule.Tags,
+		FilterSizeGreaterThan:           rule.SizeGreaterThan,
+		FilterSizeLessThan:              rule.SizeLessThan,
+		ExpirationDays:                  rule.ExpirationDays,
+		ExpiredObjectDeleteMarker:       rule.ExpiredObjectDeleteMarker,
+		NoncurrentVersionExpirationDays: rule.NoncurrentVersionExpirationDays,
+		NewerNoncurrentVersions:         rule.NewerNoncurrentVersions,
+		AbortMPUDaysAfterInitiation:     rule.AbortMultipartDays,
+	}
+	if rule.ExpirationDate != "" {
+		date, err := time.Parse(time.DateOnly, rule.ExpirationDate)
+		if err != nil {
+			return nil, fmt.Errorf("invalid expiration date %q: %w", rule.ExpirationDate, err)
+		}
+		out.ExpirationDate = date
+	}
+	return out, nil
+}
+
+// ErrBucketNotFound reports that the named bucket has no filer entry, so a
+// handler can answer 404 rather than 500.
+var ErrBucketNotFound = errors.New("bucket not found")
+
+// SetBucketLifecycle replaces the lifecycle configuration stored on a
+// bucket's filer entry. An empty rule list clears the configuration
+// entirely, mirroring clearStoredBucketLifecycleConfiguration on the S3 API
+// side. Callers must validate rules before calling this (see
+// validateBucketLifecycleRules) — this only rejects what marshaling itself
+// rejects.
+func (s *AdminServer) SetBucketLifecycle(bucketName string, rules []BucketLifecycleRule) error {
+	canonicalRules := make([]*s3lifecycle.Rule, 0, len(rules))
+	for _, rule := range rules {
+		canonicalRule, err := fromBucketLifecycleRule(rule)
+		if err != nil {
+			return err
+		}
+		canonicalRules = append(canonicalRules, canonicalRule)
+	}
+
+	var lifecycleXML []byte
+	if len(canonicalRules) > 0 {
+		var err error
+		lifecycleXML, err = lifecycle_xml.MarshalCanonical(canonicalRules)
+		if err != nil {
+			return fmt.Errorf("marshal lifecycle configuration: %w", err)
+		}
+		if len(lifecycleXML) > scheduler.MaxBucketLifecycleConfigurationSize {
+			return fmt.Errorf("lifecycle configuration is %d bytes, which exceeds the %d byte limit", len(lifecycleXML), scheduler.MaxBucketLifecycleConfigurationSize)
+		}
+	}
+
+	filerConfig, err := s.getFilerConfig()
+	if err != nil {
+		return fmt.Errorf("get filer configuration: %w", err)
+	}
+	collection := getCollectionName(filerConfig.FilerGroup, bucketName)
+
+	return s.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+		// PATCH_EXTENDED is a no-op on a missing entry, so the existence
+		// check has to happen here rather than fall out of the write.
+		if _, err := filer_pb.LookupEntry(context.Background(), client, &filer_pb.LookupDirectoryEntryRequest{
+			Directory: filerConfig.BucketsPath,
+			Name:      bucketName,
+		}); err != nil {
+			if errors.Is(err, filer_pb.ErrNotFound) {
+				return fmt.Errorf("%w: %s", ErrBucketNotFound, bucketName)
+			}
+			return fmt.Errorf("look up bucket %s: %w", bucketName, err)
+		}
+
+		// Migration: clear any legacy day-TTL filer.conf entries before
+		// writing the new XML, so a failure here leaves the bucket entry
+		// untouched instead of committing the new policy alongside a stale
+		// TTL rule. Same step and ordering as
+		// PutBucketLifecycleConfigurationHandler.
+		if err := filer.ClearBucketLifecycleDayTTLs(context.Background(), client, filerConfig.BucketsPath, bucketName, collection); err != nil {
+			return fmt.Errorf("failed to clear legacy lifecycle TTLs: %w", err)
+		}
+
+		bucketPath := filerConfig.BucketsPath + "/" + bucketName
+		resp, err := client.ObjectTransaction(context.Background(), &filer_pb.ObjectTransactionRequest{
+			LockKey:   bucketPath,
+			RouteKey:  s3_constants.ObjectWriteRouteKeyPrefix + bucketPath,
+			Mutations: []*filer_pb.ObjectMutation{bucketLifecycleMutation(filerConfig.BucketsPath, bucketName, lifecycleXML)},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to update bucket lifecycle: %w", err)
+		}
+		if resp.Error != "" {
+			return fmt.Errorf("failed to update bucket lifecycle: %s", resp.Error)
+		}
+		return nil
+	})
+}
+
+// bucketLifecycleMutation patches the two lifecycle keys rather than writing
+// the whole entry back: the filer re-reads and merges under the bucket path
+// lock, so a concurrent owner/quota/versioning change is preserved instead of
+// being reverted by a stale snapshot. Same mutation the S3 gateway uses for
+// these keys (see patchBucketEntry in s3api_bucket_config.go). Empty XML
+// clears the configuration, transition minimum size included.
+func bucketLifecycleMutation(bucketsPath, bucketName string, lifecycleXML []byte) *filer_pb.ObjectMutation {
+	mutation := &filer_pb.ObjectMutation{
+		Type:      filer_pb.ObjectMutation_PATCH_EXTENDED,
+		Directory: bucketsPath,
+		Name:      bucketName,
+	}
+	if len(lifecycleXML) > 0 {
+		mutation.SetExtended = map[string][]byte{
+			scheduler.BucketLifecycleConfigurationXMLKey: lifecycleXML,
+		}
+		return mutation
+	}
+	mutation.DeleteExtended = []string{
+		scheduler.BucketLifecycleConfigurationXMLKey,
+		scheduler.BucketLifecycleTransitionMinimumObjectSizeKey,
+	}
+	return mutation
 }
 
 // CreateS3Bucket creates a new S3 bucket
@@ -909,14 +1233,8 @@ func (s *AdminServer) DeleteS3Bucket(bucketName string) error {
 	// Then delete bucket directory recursively from filer
 	// Use same parameters as s3.bucket.delete shell command and S3 API
 	return s.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
-		_, err := client.DeleteEntry(ctx, &filer_pb.DeleteEntryRequest{
-			Directory:            filerConfig.BucketsPath,
-			Name:                 bucketName,
-			IsDeleteData:         false, // Collection already deleted, just remove metadata
-			IsRecursive:          true,
-			IgnoreRecursiveError: true, // Same as S3 API and shell command
-		})
-		if err != nil {
+		// The collection is already gone, so this only has to drop the metadata.
+		if err := filer_pb.DoRemove(ctx, client, filerConfig.BucketsPath, bucketName, false, true, true, false, nil); err != nil {
 			return fmt.Errorf("failed to delete bucket: %w", err)
 		}
 
@@ -1023,16 +1341,21 @@ func (s *AdminServer) GetClusterMasters() (*ClusterMastersData, error) {
 	}
 
 	// Then, get additional master information from Raft cluster
+	raftReturnedEmpty := false
 	err = s.WithMasterClient(func(client master_pb.SeaweedClient) error {
 		resp, err := client.RaftListClusterServers(context.Background(), &master_pb.RaftListClusterServersRequest{})
 		if err != nil {
 			return err
 		}
+		raftReturnedEmpty = len(resp.ClusterServers) == 0
 
 		// Process each raft server
 		for _, server := range resp.ClusterServers {
 			// Raft stores gRPC addresses, convert to HTTP address
 			httpAddress := pb.GrpcAddressToServerAddress(server.Address)
+			if httpAddress == "" {
+				continue
+			}
 
 			// Update existing master info or create new one
 			if masterInfo, exists := masterMap[httpAddress]; exists {
@@ -1080,10 +1403,12 @@ func (s *AdminServer) GetClusterMasters() (*ClusterMastersData, error) {
 		if currentMaster != "" {
 			masters = append(masters, MasterInfo{
 				Address:  pb.ServerAddress(currentMaster).ToHttpAddress(),
-				IsLeader: true,
+				IsLeader: raftReturnedEmpty,
 				Suffrage: "Voter",
 			})
-			leaderCount = 1
+			if raftReturnedEmpty {
+				leaderCount = 1
+			}
 		}
 	}
 
@@ -1101,9 +1426,7 @@ func (s *AdminServer) GetClusterFilers() (*ClusterFilersData, error) {
 
 	// Get filer information from master using ListClusterNodes
 	err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
-		resp, err := client.ListClusterNodes(context.Background(), &master_pb.ListClusterNodesRequest{
-			ClientType: cluster.FilerType,
-		})
+		resp, err := client.ListClusterNodes(context.Background(), s.listClusterNodesRequest(cluster.FilerType))
 		if err != nil {
 			return err
 		}
@@ -1148,9 +1471,7 @@ func (s *AdminServer) GetClusterBrokers() (*ClusterBrokersData, error) {
 
 	// Get broker information from master using ListClusterNodes
 	err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
-		resp, err := client.ListClusterNodes(context.Background(), &master_pb.ListClusterNodesRequest{
-			ClientType: cluster.BrokerType,
-		})
+		resp, err := client.ListClusterNodes(context.Background(), s.listClusterNodesRequest(cluster.BrokerType))
 		if err != nil {
 			return err
 		}
@@ -1189,6 +1510,76 @@ func (s *AdminServer) GetClusterBrokers() (*ClusterBrokersData, error) {
 	}, nil
 }
 
+// GetClusterS3Servers retrieves cluster S3 servers data
+func (s *AdminServer) GetClusterS3Servers() (*ClusterS3ServersData, error) {
+	var s3Servers []S3ServerInfo
+
+	// Get S3 server information from master using ListClusterNodes
+	err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
+		resp, err := client.ListClusterNodes(context.Background(), s.listClusterNodesRequest(cluster.S3Type))
+		if err != nil {
+			return err
+		}
+
+		// Process each S3 server node
+		for _, node := range resp.ClusterNodes {
+			createdAt := time.Unix(0, node.CreatedAtNs)
+
+			s3ServerInfo := S3ServerInfo{
+				Address:    pb.ServerAddress(node.Address).ToHttpAddress(),
+				DataCenter: node.DataCenter,
+				Version:    node.Version,
+				CreatedAt:  createdAt,
+			}
+
+			s3Servers = append(s3Servers, s3ServerInfo)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get S3 server nodes from master: %w", err)
+	}
+
+	// Sort S3 servers by address for consistent ordering on page refresh
+	sort.Slice(s3Servers, func(i, j int) bool {
+		return s3Servers[i].Address < s3Servers[j].Address
+	})
+
+	return &ClusterS3ServersData{
+		S3Servers:      s3Servers,
+		TotalS3Servers: len(s3Servers),
+		LastUpdated:    time.Now(),
+	}, nil
+}
+
+// GetS3Endpoint returns the configured address clients reach the S3 gateway
+// at, or "". S3 servers register only their gRPC address with the master, so
+// the client-facing address cannot be discovered and must be configured.
+func (s *AdminServer) GetS3Endpoint() string {
+	return s.s3PublicEndpoint
+}
+
+// normalizeS3PublicEndpoint trims a trailing slash and drops, with a warning,
+// a value that is not a plain absolute http or https URL, so the file browser
+// hides its URL actions instead of copying broken links. Checking the string
+// for "?" and "#" rather than the parsed query and fragment also catches
+// delimiters with nothing after them, which url.Parse stores as empty.
+func normalizeS3PublicEndpoint(endpoint string) string {
+	endpoint = strings.TrimRight(endpoint, "/")
+	if endpoint == "" {
+		return ""
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || strings.ContainsAny(endpoint, "?#") {
+		// the value is not echoed: it may hold credentials in userinfo or a query
+		glog.Warningf("ignoring s3.public_endpoint: expecting an http:// or https:// URL with a host and no credentials, query, or fragment")
+		return ""
+	}
+	return endpoint
+}
+
 // GetAllFilers method moved to client_management.go
 
 // GetVolumeDetails method moved to volume_management.go
@@ -1215,6 +1606,7 @@ func (as *AdminServer) GetConfigInfo(w http.ResponseWriter, r *http.Request) {
 	configInfo["master_address"] = string(currentMaster)
 	configInfo["cache_expiration"] = as.cacheExpiration.String()
 	configInfo["filer_cache_expiration"] = as.filerCacheExpiration.String()
+	configInfo["s3_public_endpoint"] = as.s3PublicEndpoint
 
 	// Add maintenance system info
 	if as.maintenanceManager != nil {
@@ -1231,14 +1623,21 @@ func (as *AdminServer) GetConfigInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// StartWorkerGrpcServer starts the worker gRPC server
-func (s *AdminServer) StartWorkerGrpcServer(grpcPort int) error {
+// StartWorkerGrpcServer starts the worker gRPC server. bindIp is honored when no
+// listener is supplied so the worker gRPC does not wildcard-bind past -ip.
+func (s *AdminServer) StartWorkerGrpcServer(bindIp string, grpcPort int, listener net.Listener) error {
 	if s.workerGrpcServer != nil {
 		return fmt.Errorf("worker gRPC server is already running")
 	}
 
 	s.workerGrpcServer = NewWorkerGrpcServer(s)
-	return s.workerGrpcServer.StartWithTLS(grpcPort)
+	return s.workerGrpcServer.StartWithTLS(bindIp, grpcPort, listener)
+}
+
+// WorkerGrpcMTLSEnabled reports whether the worker gRPC server actually loaded
+// grpc.admin mTLS credentials, not just whether they were configured.
+func (s *AdminServer) WorkerGrpcMTLSEnabled() bool {
+	return s.workerGrpcServer != nil && s.workerGrpcServer.mtlsEnabled
 }
 
 // StopWorkerGrpcServer stops the worker gRPC server
@@ -1362,8 +1761,8 @@ func (s *AdminServer) RunPluginDetectionWithReport(
 
 // DispatchPluginProposals dispatches a batch of proposals using the same
 // capacity-aware dispatch logic as the scheduler loop (executor reservation with
-// backoff, per-job retry on transient errors). The plugin lock must already be
-// held by the caller.
+// backoff, per-job retry on transient errors). The dispatch takes the cluster
+// admin lock around each job itself; callers must not hold it.
 func (s *AdminServer) DispatchPluginProposals(
 	ctx context.Context,
 	jobType string,
@@ -1480,7 +1879,16 @@ func (s *AdminServer) ListPluginSchedulerStates() ([]adminplugin.SchedulerJobTyp
 
 // InitMaintenanceManager initializes the maintenance manager
 func (s *AdminServer) InitMaintenanceManager(config *maintenance.MaintenanceConfig) {
-	s.maintenanceManager = maintenance.NewMaintenanceManager(s, config)
+	// Hand the real config store to the manager so that, if it has to build the maintenance policy
+	// itself, it reads the persisted task configs instead of compiled-in defaults. Only pass it when
+	// a data directory is actually configured: an unconfigured store has nothing to read, and a typed
+	// nil pointer would satisfy the loaders' type assertion and then panic on use.
+	var configPersistence interface{}
+	if s.configPersistence != nil && s.configPersistence.IsConfigured() {
+		configPersistence = s.configPersistence
+	}
+
+	s.maintenanceManager = maintenance.NewMaintenanceManager(s, config, configPersistence)
 
 	// Set up task persistence if config persistence is available
 	if s.configPersistence != nil {
@@ -1495,7 +1903,7 @@ func (s *AdminServer) InitMaintenanceManager(config *maintenance.MaintenanceConf
 		}
 	}
 
-	glog.V(1).Infof("Maintenance manager initialized (enabled: %v)", config.Enabled)
+	glog.V(1).Infof("Maintenance manager initialized (enabled: %v)", config.GetEnabled())
 }
 
 // GetMaintenanceManager returns the maintenance manager
@@ -1585,9 +1993,7 @@ func (s *AdminServer) UpdateTopicRetention(namespace, name string, enabled bool,
 	// Get broker information from master
 	var brokerAddress string
 	err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
-		resp, err := client.ListClusterNodes(context.Background(), &master_pb.ListClusterNodesRequest{
-			ClientType: cluster.BrokerType,
-		})
+		resp, err := client.ListClusterNodes(context.Background(), s.listClusterNodesRequest(cluster.BrokerType))
 		if err != nil {
 			return err
 		}
@@ -1717,6 +2123,39 @@ func extractVersioningFromEntry(entry *filer_pb.Entry) string {
 	return s3api.GetVersioningStatus(entry)
 }
 
+func extractLifecycleCountsFromEntry(entry *filer_pb.Entry) (ruleCount, enabledCount int) {
+	xmlBytes := entry.Extended[scheduler.BucketLifecycleConfigurationXMLKey]
+	if len(xmlBytes) == 0 {
+		return
+	}
+	rules, err := lifecycle_xml.ParseCanonical(xmlBytes)
+	if err != nil {
+		return
+	}
+	for _, rule := range rules {
+		ruleCount++
+		if rule.Status == s3lifecycle.StatusEnabled {
+			enabledCount++
+		}
+	}
+	return
+}
+
+// extractPolicyStatementCountFromEntry returns the number of statements in
+// the bucket's policy, or 0 if it has none or the stored JSON can't be
+// parsed. Forgiving on parse failure, same as extractLifecycleCountsFromEntry.
+func extractPolicyStatementCountFromEntry(entry *filer_pb.Entry) int {
+	policyJSON := entry.Extended[s3api.BUCKET_POLICY_METADATA_KEY]
+	if len(policyJSON) == 0 {
+		return 0
+	}
+	var doc policy_engine.PolicyDocument
+	if err := json.Unmarshal(policyJSON, &doc); err != nil {
+		return 0
+	}
+	return len(doc.Statement)
+}
+
 // GetConfigPersistence returns the config persistence manager
 func (as *AdminServer) GetConfigPersistence() *ConfigPersistence {
 	return as.configPersistence
@@ -1742,9 +2181,20 @@ type ecVolumeCounts struct {
 	deleteCount uint64
 }
 
+// volumeLiveCount is the live chunk count of one regular volume. Replicas
+// mirror each other's needles and their deletes, so the fullest report is the
+// volume's count — dividing each report by the copy count instead would lose
+// a chunk to integer truncation and would halve a volume whose second replica
+// has not reported yet.
+type volumeLiveCount struct {
+	collection string
+	live       uint64
+}
+
 func collectCollectionStats(topologyInfo *master_pb.TopologyInfo) map[string]collectionStats {
 	collectionMap := make(map[string]collectionStats)
 	ecVolumeAgg := make(map[uint32]*ecVolumeCounts)
+	volumeAgg := make(map[uint32]*volumeLiveCount)
 	for _, dc := range topologyInfo.DataCenterInfos {
 		for _, rack := range dc.RackInfos {
 			for _, node := range rack.DataNodeInfos {
@@ -1765,10 +2215,18 @@ func collectCollectionStats(topologyInfo *master_pb.TopologyInfo) map[string]col
 						if volInfo.Size >= volInfo.DeletedByteCount {
 							data.LogicalSize += int64(volInfo.Size-volInfo.DeletedByteCount) / replicaCount
 						}
-						if volInfo.FileCount >= volInfo.DeleteCount {
-							data.FileCount += int64(volInfo.FileCount-volInfo.DeleteCount) / replicaCount
-						}
 						collectionMap[collection] = data
+
+						if volInfo.FileCount >= volInfo.DeleteCount {
+							agg, ok := volumeAgg[volInfo.Id]
+							if !ok {
+								agg = &volumeLiveCount{collection: collection}
+								volumeAgg[volInfo.Id] = agg
+							}
+							if live := volInfo.FileCount - volInfo.DeleteCount; live > agg.live {
+								agg.live = live
+							}
+						}
 					}
 					for _, ecShardInfo := range diskInfo.EcShardInfos {
 						collection := ecShardInfo.Collection
@@ -1778,7 +2236,7 @@ func collectCollectionStats(topologyInfo *master_pb.TopologyInfo) map[string]col
 						shards := erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(ecShardInfo)
 						data := collectionMap[collection]
 						data.PhysicalSize += int64(shards.TotalSize())
-						data.LogicalSize += int64(shards.MinusParityShards().TotalSize())
+						data.LogicalSize += int64(shards.MinusParityShards(erasure_coding.DataShardsCount).TotalSize())
 						collectionMap[collection] = data
 
 						// fileCount is volume-wide (same .ecx on every shard
@@ -1801,6 +2259,14 @@ func collectCollectionStats(topologyInfo *master_pb.TopologyInfo) map[string]col
 		}
 	}
 
+	// Fold the per-volume live counts in, one entry per volume id no matter
+	// how many replicas reported it.
+	for _, agg := range volumeAgg {
+		data := collectionMap[agg.collection]
+		data.FileCount += int64(agg.live)
+		collectionMap[agg.collection] = data
+	}
+
 	// Fold EC per-volume counts into the collection totals. fileCount is
 	// deduped via max across every node reporting shards for the volume;
 	// deleteCount is summed across the same nodes.
@@ -1818,6 +2284,17 @@ func collectCollectionStats(topologyInfo *master_pb.TopologyInfo) map[string]col
 	return collectionMap
 }
 
+// totalCollectionFileCount is the cluster-wide live chunk count: the sum of
+// every collection's deduped count. Volumes and EC volumes are reported by
+// each replica or shard holder, so only this aggregation counts a chunk once.
+func totalCollectionFileCount(topologyInfo *master_pb.TopologyInfo) int64 {
+	var total int64
+	for _, stats := range collectCollectionStats(topologyInfo) {
+		total += stats.FileCount
+	}
+	return total
+}
+
 // getCollectionStats returns current collection statistics with caching
 func (s *AdminServer) getCollectionStats() (map[string]collectionStats, error) {
 	now := time.Now()
@@ -1826,7 +2303,7 @@ func (s *AdminServer) getCollectionStats() (map[string]collectionStats, error) {
 	}
 
 	err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
-		resp, err := client.VolumeList(context.Background(), &master_pb.VolumeListRequest{})
+		resp, err := pb.CollectVolumeList(context.Background(), client, &master_pb.VolumeListRequest{})
 		if err != nil {
 			return err
 		}

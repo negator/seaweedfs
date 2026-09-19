@@ -102,6 +102,95 @@ func TestFromActiveTopology(t *testing.T) {
 	}
 }
 
+// A physically near-full disk must contribute zero free EC slots to the snapshot,
+// even though its slot math (MaxVolumeCount - VolumeCount) says it has room, so
+// the planner never places shards onto it. Mirrors the volume-balance #10160 gate.
+func TestFromActiveTopologySkipsPhysicallyFullDisk(t *testing.T) {
+	const gb = uint64(1) << 30
+	at := topology.NewActiveTopology(10)
+
+	// Both disks look slot-empty; only their physical byte fullness differs.
+	full := &master_pb.DataNodeInfo{
+		Id: "10.0.0.1:8080",
+		DiskInfos: map[string]*master_pb.DiskInfo{
+			"hdd": {DiskId: 0, MaxVolumeCount: 100, VolumeCount: 0, DiskTotalBytes: 1000 * gb, DiskFreeBytes: 40 * gb}, // 96% used
+		},
+	}
+	empty := &master_pb.DataNodeInfo{
+		Id: "10.0.0.2:8080",
+		DiskInfos: map[string]*master_pb.DiskInfo{
+			"hdd": {DiskId: 0, MaxVolumeCount: 100, VolumeCount: 0, DiskTotalBytes: 1000 * gb, DiskFreeBytes: 900 * gb}, // 10% used
+		},
+	}
+	if err := at.UpdateTopology(&master_pb.TopologyInfo{
+		DataCenterInfos: []*master_pb.DataCenterInfo{{
+			Id:        "dc1",
+			RackInfos: []*master_pb.RackInfo{{Id: "rack1", DataNodeInfos: []*master_pb.DataNodeInfo{full, empty}}},
+		}},
+	}); err != nil {
+		t.Fatalf("UpdateTopology: %v", err)
+	}
+
+	topo := FromActiveTopology(at, 0)
+
+	fullNode := topo.nodes["10.0.0.1:8080"]
+	if fullNode == nil {
+		t.Fatal("full node missing")
+	}
+	if fullNode.freeSlots != 0 {
+		t.Errorf("physically full node freeSlots = %d, want 0", fullNode.freeSlots)
+	}
+	if d := fullNode.disks[0]; d == nil || d.freeSlots != 0 {
+		t.Errorf("physically full disk freeSlots = %v, want 0", d)
+	}
+
+	emptyNode := topo.nodes["10.0.0.2:8080"]
+	if emptyNode == nil || emptyNode.freeSlots <= 0 {
+		t.Errorf("physically empty node should keep free slots, got %v", emptyNode)
+	}
+}
+
+// TestFromActiveTopologyGroupsByAddressHost verifies the snapshot derives a node's
+// machine from its address, not its (possibly opaque) id: two volume servers with
+// distinct ids but the same host must land on one machine so EC placement spreads
+// shards across boxes even when explicit node ids are configured.
+func TestFromActiveTopologyGroupsByAddressHost(t *testing.T) {
+	at := topology.NewActiveTopology(10)
+	mk := func(id, addr string) *master_pb.DataNodeInfo {
+		return &master_pb.DataNodeInfo{
+			Id:        id,
+			Address:   addr,
+			DiskInfos: map[string]*master_pb.DiskInfo{"hdd": {DiskId: 0, MaxVolumeCount: 100, VolumeCount: 0}},
+		}
+	}
+	// vs-a and vs-b are two servers on the same physical host; vs-c is another box.
+	nodes := []*master_pb.DataNodeInfo{
+		mk("vs-a", "10.0.0.9:8080"),
+		mk("vs-b", "10.0.0.9:8081"),
+		mk("vs-c", "10.0.0.10:8080"),
+	}
+	if err := at.UpdateTopology(&master_pb.TopologyInfo{
+		DataCenterInfos: []*master_pb.DataCenterInfo{{
+			Id:        "dc1",
+			RackInfos: []*master_pb.RackInfo{{Id: "rack1", DataNodeInfos: nodes}},
+		}},
+	}); err != nil {
+		t.Fatalf("UpdateTopology: %v", err)
+	}
+
+	topo := FromActiveTopology(at, 0)
+	if topo.nodes["vs-a"].host != topo.nodes["vs-b"].host {
+		t.Errorf("vs-a host %q != vs-b host %q; same-machine servers not grouped",
+			topo.nodes["vs-a"].host, topo.nodes["vs-b"].host)
+	}
+	if topo.nodes["vs-a"].host == topo.nodes["vs-c"].host {
+		t.Errorf("vs-a and vs-c share host %q but are different machines", topo.nodes["vs-a"].host)
+	}
+	if got := topo.nodes["vs-a"].host; got != "10.0.0.9" {
+		t.Errorf("vs-a host = %q, want 10.0.0.9", got)
+	}
+}
+
 // TestEcShardSlotsOnDiskRoundsUp covers the mixed-ratio (targetDataShards <
 // existingDataShards) conversion: an existing shard's fractional footprint must
 // round up so it is never floored to zero, which would overstate free capacity.

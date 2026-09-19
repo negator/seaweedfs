@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/credential"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_lifecycle_pb"
@@ -180,7 +181,7 @@ func (c *commandS3LifecycleRunShard) Do(args []string, env *CommandEnv, writer i
 				// integration tests and CI. Fan out across the selected shards
 				// so recovery walks do not serialize 16 shard scans into a 10s
 				// timeout budget.
-				Workers: len(shards),
+				Workers:     len(shards),
 				Walker:      walker,
 				EventBudget: *eventBudget,
 				ClientName:  fmt.Sprintf("shell-lifecycle-%s", formatShardLabel(shards)),
@@ -314,6 +315,7 @@ type lifecycleClientCallable struct {
 }
 
 func (l *lifecycleClientCallable) LifecycleDelete(ctx context.Context, req *s3_lifecycle_pb.LifecycleDeleteRequest) (*s3_lifecycle_pb.LifecycleDeleteResponse, error) {
+	ctx, _ = credential.WithS3InternalAdminAuth(ctx)
 	return l.c.LifecycleDelete(ctx, req)
 }
 

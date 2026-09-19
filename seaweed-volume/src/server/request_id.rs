@@ -29,11 +29,11 @@ impl<S> Layer<S> for GrpcRequestIdLayer {
 
 impl<S, B> Service<http::Request<B>> for GrpcRequestIdService<S>
 where
-    S: Service<http::Request<B>, Response = http::Response<tonic::body::BoxBody>> + Send + 'static,
+    S: Service<http::Request<B>, Response = http::Response<tonic::body::Body>> + Send + 'static,
     S::Future: Send + 'static,
     B: Send + 'static,
 {
-    type Response = http::Response<tonic::body::BoxBody>;
+    type Response = http::Response<tonic::body::Body>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -57,7 +57,7 @@ where
         let future = self.inner.call(request);
 
         Box::pin(async move {
-            let mut response: http::Response<tonic::body::BoxBody> =
+            let mut response: http::Response<tonic::body::Body> =
                 scope_request_id(request_id.clone(), future).await?;
             if let Ok(value) = HeaderValue::from_str(&request_id) {
                 response.headers_mut().insert("x-amz-request-id", value);
@@ -88,13 +88,13 @@ pub fn outgoing_request_id_interceptor(mut request: Request<()>) -> Result<Reque
 }
 
 pub fn generate_http_request_id() -> String {
-    use rand::Rng;
+    use rand::RngExt;
 
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64;
-    let rand_val: u32 = rand::thread_rng().gen();
+    let rand_val: u32 = rand::rng().random();
     format!("{:X}{:08X}", nanos, rand_val)
 }
 

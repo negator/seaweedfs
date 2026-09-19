@@ -26,7 +26,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/iam_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/policy_engine"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
-	. "github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 	"github.com/seaweedfs/seaweedfs/weed/util/request_id"
 	"google.golang.org/protobuf/proto"
@@ -96,6 +95,8 @@ type (
 	iamGetPolicyResponse                = iamlib.GetPolicyResponse
 	iamListPolicyVersionsResponse       = iamlib.ListPolicyVersionsResponse
 	iamGetPolicyVersionResponse         = iamlib.GetPolicyVersionResponse
+	iamCreatePolicyVersionResponse      = iamlib.CreatePolicyVersionResponse
+	iamDeletePolicyVersionResponse      = iamlib.DeletePolicyVersionResponse
 	iamCreateUserResponse               = iamlib.CreateUserResponse
 	iamDeleteUserResponse               = iamlib.DeleteUserResponse
 	iamGetUserResponse                  = iamlib.GetUserResponse
@@ -265,7 +266,8 @@ func (e *EmbeddedIamApi) ReloadConfiguration() error {
 func (e *EmbeddedIamApi) ListUsers(s3cfg *iam_pb.S3ApiConfiguration, values url.Values) *iamListUsersResponse {
 	resp := &iamListUsersResponse{}
 	for _, ident := range s3cfg.Identities {
-		resp.ListUsersResult.Users = append(resp.ListUsersResult.Users, &iam.User{UserName: &ident.Name})
+		user := iamlib.NewUser(ident.Name)
+		resp.ListUsersResult.Users = append(resp.ListUsersResult.Users, &user)
 	}
 	return resp
 }
@@ -313,7 +315,7 @@ func (e *EmbeddedIamApi) CreateUser(s3cfg *iam_pb.S3ApiConfiguration, values url
 		}
 	}
 
-	resp.CreateUserResult.User.UserName = &userName
+	resp.CreateUserResult.User = iamlib.NewUser(userName)
 	s3cfg.Identities = append(s3cfg.Identities, &iam_pb.Identity{Name: userName}) // Disabled defaults to false (enabled)
 	return resp, nil
 }
@@ -353,7 +355,7 @@ func (e *EmbeddedIamApi) GetUser(s3cfg *iam_pb.S3ApiConfiguration, userName stri
 	resp := &iamGetUserResponse{}
 	for _, ident := range s3cfg.Identities {
 		if userName == ident.Name {
-			resp.GetUserResult.User = iam.User{UserName: &ident.Name}
+			resp.GetUserResult.User = iamlib.NewUser(ident.Name)
 			return resp, nil
 		}
 	}
@@ -829,6 +831,87 @@ func (e *EmbeddedIamApi) GetPolicyVersion(ctx context.Context, values url.Values
 	return resp, nil
 }
 
+// CreatePolicyVersion replaces a managed policy's document with a new version.
+// SeaweedFS keeps a single current document per managed policy (no version
+// history), so the new document always becomes version "v1" / the default. This
+// is what the AWS Terraform provider calls to update an aws_iam_policy in place.
+func (e *EmbeddedIamApi) CreatePolicyVersion(ctx context.Context, values url.Values) (*iamCreatePolicyVersionResponse, *iamError) {
+	resp := &iamCreatePolicyVersionResponse{}
+	policyName, err := iamPolicyNameFromArn(values.Get("PolicyArn"))
+	if err != nil {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: err}
+	}
+	policyDocumentString := values.Get("PolicyDocument")
+	if policyDocumentString == "" {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("PolicyDocument is required")}
+	}
+	// SeaweedFS stores a single, always-default managed policy version. On AWS,
+	// SetAsDefault=false stages a non-default version without activating it; we
+	// can't honor that, so reject it rather than silently changing permissions.
+	if !strings.EqualFold(values.Get("SetAsDefault"), "true") {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("SetAsDefault must be true: SeaweedFS stores a single managed policy version")}
+	}
+	if e.credentialManager == nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: fmt.Errorf("credential manager not configured")}
+	}
+	policyDocument, err := e.GetPolicyDocument(&policyDocumentString)
+	if err != nil {
+		return resp, &iamError{Code: iam.ErrCodeMalformedPolicyDocumentException, Error: err}
+	}
+	if _, err := e.getActions(&policyDocument); err != nil {
+		return resp, &iamError{Code: iam.ErrCodeMalformedPolicyDocumentException, Error: err}
+	}
+	existing, err := e.credentialManager.GetPolicy(ctx, policyName)
+	if err != nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: err}
+	}
+	if existing == nil {
+		return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf("policy %s not found", policyName)}
+	}
+	if err := e.credentialManager.UpdatePolicy(ctx, policyName, policyDocument); err != nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: err}
+	}
+
+	versionID := "v1"
+	isDefaultVersion := true
+	document := policyDocumentString
+	resp.CreatePolicyVersionResult.PolicyVersion = iam.PolicyVersion{
+		VersionId:        &versionID,
+		IsDefaultVersion: &isDefaultVersion,
+		Document:         &document,
+	}
+	return resp, nil
+}
+
+// DeletePolicyVersion is accepted for API completeness. With a single stored
+// version that is always the default, the only valid responses are NoSuchEntity
+// (unknown version) and the AWS "cannot delete the default version" conflict.
+func (e *EmbeddedIamApi) DeletePolicyVersion(ctx context.Context, values url.Values) (*iamDeletePolicyVersionResponse, *iamError) {
+	resp := &iamDeletePolicyVersionResponse{}
+	policyName, err := iamPolicyNameFromArn(values.Get("PolicyArn"))
+	if err != nil {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: err}
+	}
+	versionID := values.Get("VersionId")
+	if versionID == "" {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("VersionId is required")}
+	}
+	if e.credentialManager == nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: fmt.Errorf("credential manager not configured")}
+	}
+	policy, err := e.credentialManager.GetPolicy(ctx, policyName)
+	if err != nil {
+		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: err}
+	}
+	if policy == nil {
+		return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf("policy %s not found", policyName)}
+	}
+	if versionID == "v1" {
+		return resp, &iamError{Code: iam.ErrCodeDeleteConflictException, Error: fmt.Errorf("cannot delete the default version of policy %s", policyName)}
+	}
+	return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf("policy version %s not found", versionID)}
+}
+
 func iamPolicyNameFromArn(policyArn string) (string, error) {
 	const policyPathDelimiter = ":policy/"
 	idx := strings.Index(policyArn, policyPathDelimiter)
@@ -905,15 +988,11 @@ func (e *EmbeddedIamApi) getActions(policy *policy_engine.PolicyDocument) ([]str
 					// Bucket-level or bucket/* - use just bucket name
 					actions = append(actions, fmt.Sprintf("%s:%s", statementAction, bucket))
 				} else {
-					// Path-specific: bucket/path/* -> Action:bucket/path
-					// Remove trailing /* if present for cleaner action format
-					objectPath = strings.TrimSuffix(objectPath, "/*")
-					objectPath = strings.TrimSuffix(objectPath, "*")
-					if objectPath == "" {
-						actions = append(actions, fmt.Sprintf("%s:%s", statementAction, bucket))
-					} else {
-						actions = append(actions, fmt.Sprintf("%s:%s/%s", statementAction, bucket, objectPath))
-					}
+					// Path-specific: preserve the object path, including any
+					// trailing wildcard, so CanDo can match objects under the
+					// prefix. Stripping the wildcard yielded a non-wildcard
+					// action that only matched at bucket level.
+					actions = append(actions, fmt.Sprintf("%s:%s/%s", statementAction, bucket, objectPath))
 				}
 			}
 		}
@@ -2013,8 +2092,8 @@ func (e *EmbeddedIamApi) GetGroup(s3cfg *iam_pb.S3ApiConfiguration, values url.V
 		if g.Name == groupName {
 			resp.GetGroupResult.Group.GroupName = &g.Name
 			for _, member := range g.Members {
-				memberName := member
-				resp.GetGroupResult.Users = append(resp.GetGroupResult.Users, &iam.User{UserName: &memberName})
+				user := iamlib.NewUser(member)
+				resp.GetGroupResult.Users = append(resp.GetGroupResult.Users, &user)
 			}
 			return resp, nil
 		}
@@ -2395,14 +2474,68 @@ func iamRequiresAdminForOthers(action string) bool {
 	return iamSelfServiceActions[action]
 }
 
-// AuthIam provides IAM-specific authentication that allows self-service operations.
-// Users can manage their own access keys without admin rights, but need admin for operations on other users.
-// The action parameter is accepted for interface compatibility with cb.Limit but is not used
-// since IAM permission checking is done based on the IAM Action parameter in the request.
-func (e *EmbeddedIamApi) AuthIam(f http.HandlerFunc, _ Action) http.HandlerFunc {
+// iamSelfTargetActions require an explicit iam:<Action> grant, but a non-admin
+// grant holder may only target their own identity. The target parameter is
+// action-specific (UserName for most, ParentUser for CreateServiceAccount).
+var iamSelfTargetActions = map[string]bool{
+	"CreateServiceAccount": true,
+}
+
+func iamRequiresSelfTarget(action string) bool {
+	return iamSelfTargetActions[action]
+}
+
+// iamTargetUserName returns the request's target identity for authorization.
+// Most IAM actions target UserName; CreateServiceAccount targets ParentUser.
+// Both IAM dispatch surfaces (AuthIamManagement and UnifiedPostHandler) use
+// this so the authorized target and the acted-on target cannot differ.
+func iamTargetUserName(action string, r *http.Request) string {
+	if action == "CreateServiceAccount" {
+		return r.PostForm.Get("ParentUser")
+	}
+	return r.PostForm.Get("UserName")
+}
+
+// AuthorizeIamAction authorizes an IAM management action for identity, with
+// targetUserName taken from the request's target parameter (UserName, or
+// ParentUser for CreateServiceAccount).
+//
+// IAM management is not part of the S3 data plane, so the grant is checked as
+// iam:<Action>. A coarse S3 action would instead be matched by an ordinary
+// data-plane policy, which says nothing about administering the credential
+// store.
+//
+// Users may run self-service actions against their own identity without any
+// IAM grant, matching AWS.
+func (iam *IdentityAccessManagement) AuthorizeIamAction(r *http.Request, identity *Identity, action, targetUserName string) s3err.ErrorCode {
+	// The anonymous identity has no user of its own, so every self-service
+	// action it names would run against someone else's.
+	if identity == nil || identity.Name == s3_constants.AccountAnonymousId {
+		return s3err.ErrAccessDenied
+	}
+	if iamRequiresAdminForOthers(action) && (targetUserName == "" || targetUserName == identity.Name) {
+		return s3err.ErrNone
+	}
+	if identity.isAdmin() {
+		return s3err.ErrNone
+	}
+	if errCode := iam.VerifyActionPermission(r, identity, Action("iam:"+action), "arn:aws:iam:::*", ""); errCode != s3err.ErrNone {
+		return errCode
+	}
+	if iamRequiresSelfTarget(action) && targetUserName != "" && targetUserName != identity.Name {
+		return s3err.ErrAccessDenied
+	}
+	return s3err.ErrNone
+}
+
+// AuthIamManagement authenticates an IAM management request and authorizes the
+// action it carries. It is the entry point for both IAM API surfaces — the
+// embedded one on the S3 port and the standalone `weed iam` server — so the two
+// cannot drift apart.
+func (iam *IdentityAccessManagement) AuthIamManagement(f http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// If auth is not enabled, allow all
-		if !e.iam.isEnabled() {
+		if !iam.isEnabled() {
 			f(w, r)
 			return
 		}
@@ -2412,7 +2545,7 @@ func (e *EmbeddedIamApi) AuthIam(f http.HandlerFunc, _ Action) http.HandlerFunc 
 		// needs to hash the body for IAM requests (service != "s3").
 		// The streamHashRequestBody function in auth_signature_v4.go preserves the body
 		// after reading it, so ParseForm() will work correctly after authentication.
-		identity, errCode := e.iam.AuthSignatureOnly(r)
+		identity, errCode := iam.AuthSignatureOnly(r)
 		if errCode != s3err.ErrNone {
 			s3err.WriteErrorResponse(w, r, errCode)
 			return
@@ -2424,50 +2557,28 @@ func (e *EmbeddedIamApi) AuthIam(f http.HandlerFunc, _ Action) http.HandlerFunc 
 			return
 		}
 
+		// UserName comes from the body only, the same place the handlers read it
+		// from, so the authorized target and the acted-on target cannot differ.
 		action := r.Form.Get("Action")
-		targetUserName := r.PostForm.Get("UserName")
-
-		// IAM API requests must be authenticated - reject nil identity
-		// (can happen for authTypePostPolicy or authTypeStreamingUnsigned)
-		if identity == nil {
-			s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+		if errCode := iam.AuthorizeIamAction(r, identity, action, iamTargetUserName(action, r)); errCode != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, errCode)
 			return
 		}
 
-		// Store identity in context
-		if identity != nil && identity.Name != "" {
-			ctx := SetIdentityNameInContext(r.Context(), identity.Name)
-			ctx = SetIdentityInContext(ctx, identity)
-			r = r.WithContext(ctx)
-		}
-
-		// Check permissions based on action type
-		if iamRequiresAdminForOthers(action) {
-			// Self-service action: allow if operating on own resources or no target specified
-			if targetUserName == "" || targetUserName == identity.Name {
-				// Self-service: allowed
-				f(w, r)
-				return
-			}
-			// Operating on another user: require admin or permission
-			if !identity.isAdmin() {
-				if e.iam.VerifyActionPermission(r, identity, Action("iam:"+action), "arn:aws:iam:::*", "") != s3err.ErrNone {
-					s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
-					return
-				}
-			}
-		} else {
-			// All other IAM actions require admin or permission
-			if !identity.isAdmin() {
-				if e.iam.VerifyActionPermission(r, identity, Action("iam:"+action), "arn:aws:iam:::*", "") != s3err.ErrNone {
-					s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
-					return
-				}
-			}
+		if identity.Name != "" {
+			r = r.WithContext(recordIdentityInContext(r, identity))
 		}
 
 		f(w, r)
 	}
+}
+
+// AuthIam provides IAM-specific authentication that allows self-service operations.
+// Users can manage their own access keys without admin rights, but need admin for operations on other users.
+// The action parameter is accepted for interface compatibility with cb.Limit but is not used
+// since IAM permission checking is done based on the IAM Action parameter in the request.
+func (e *EmbeddedIamApi) AuthIam(f http.HandlerFunc, _ Action) http.HandlerFunc {
+	return e.iam.AuthIamManagement(f)
 }
 
 // ExecuteAction executes an IAM action with the given values.
@@ -2680,6 +2791,21 @@ func (e *EmbeddedIamApi) ExecuteAction(ctx context.Context, values url.Values, s
 			return nil, iamErr
 		}
 		changed = false
+	case "CreatePolicyVersion":
+		var iamErr *iamError
+		response, iamErr = e.CreatePolicyVersion(ctx, values)
+		if iamErr != nil {
+			glog.Errorf("CreatePolicyVersion: %+v", iamErr.Error)
+			return nil, iamErr
+		}
+		changed = false
+	case "DeletePolicyVersion":
+		var iamErr *iamError
+		response, iamErr = e.DeletePolicyVersion(ctx, values)
+		if iamErr != nil {
+			return nil, iamErr
+		}
+		changed = false
 	case "SetUserStatus":
 		var iamErr *iamError
 		response, iamErr = e.SetUserStatus(s3cfg, values)
@@ -2832,7 +2958,7 @@ func (e *EmbeddedIamApi) ExecuteAction(ctx context.Context, values url.Values, s
 			glog.Errorf("Failed to reload IAM configuration after mutation: %v", err)
 			// Don't fail the request since the persistent save succeeded
 		}
-	} else if action == "AttachUserPolicy" || action == "DetachUserPolicy" || action == "CreatePolicy" || action == "DeletePolicy" || action == "CreateUser" || action == "PutGroupPolicy" || action == "DeleteGroupPolicy" {
+	} else if action == "AttachUserPolicy" || action == "DetachUserPolicy" || action == "CreatePolicy" || action == "CreatePolicyVersion" || action == "DeletePolicy" || action == "CreateUser" || action == "PutGroupPolicy" || action == "DeleteGroupPolicy" {
 		// Even if changed=false (persisted via credentialManager), we should still reload
 		// if we are utilizing the local in-memory cache for speed
 		if err := e.ReloadConfiguration(); err != nil {
@@ -2854,7 +2980,7 @@ func (e *EmbeddedIamApi) DoActions(w http.ResponseWriter, r *http.Request) {
 
 	// Handle implicit username for HTTP requests
 	switch r.Form.Get("Action") {
-	case "ListAccessKeys", "CreateAccessKey", "DeleteAccessKey", "UpdateAccessKey", "ListUserPolicies":
+	case "ListAccessKeys", "CreateAccessKey", "DeleteAccessKey", "UpdateAccessKey", "ListUserPolicies", "GetUser":
 		e.handleImplicitUsername(r, values)
 	case "CreateServiceAccount":
 		createdBy := s3_constants.GetIdentityNameFromContext(r)

@@ -3,14 +3,15 @@ package s3api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"io"
-	"math"
 	"net/http"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +32,21 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
+)
+
+// A bucket creation lists collections, and a bucket deletion deletes one.
+// Neither RPC carried a deadline, so a transient failure anywhere down the chain
+// -- gateway to filer, filer to master, master to volume server -- held the S3
+// request open until the client gave up on it. Both budgets are taken outside
+// the filer failover walk, so they cover the whole walk rather than granting
+// each filer a fresh one.
+//
+// The delete is the shorter of the two: the filer has already spent its own
+// budget on this collection, under the bucket entry's delete inside s3a.rm, and
+// this call is the follow-up for when that did not happen.
+const (
+	collectionListTimeout   = 15 * time.Second
+	collectionDeleteTimeout = 10 * time.Second
 )
 
 func (s3a *S3ApiServer) ListBucketsHandler(w http.ResponseWriter, r *http.Request) {
@@ -62,68 +78,141 @@ func (s3a *S3ApiServer) ListBucketsHandler(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	var response ListAllMyBucketsResult
-
-	entries, _, err := s3a.list(s3a.option.BucketsPath, "", "", false, math.MaxInt32)
-
-	if err != nil {
-		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+	maxBuckets, prefix, startAfter, errCode := getListBucketsArgs(r.URL.Query())
+	if errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
 		return
 	}
 
-	var listBuckets ListAllMyBucketsList
-	for _, entry := range entries {
-		if entry.IsDirectory {
-			if strings.HasPrefix(entry.Name, ".") {
-				continue
-			}
-			// Unauthenticated users should not see any buckets
-			if identity == nil {
-				continue
-			}
-
-			// Check if bucket should be visible to this identity
-			// A bucket is visible if the user owns it OR has explicit permission to list it
-			isOwner := isBucketOwnedByIdentity(entry, identity)
-
-			// Skip permission check if user is already the owner (optimization)
-			if !isOwner {
-				if errCode := s3a.iam.VerifyActionPermission(r, identity, s3_constants.ACTION_LIST, entry.Name, ""); errCode != s3err.ErrNone {
-					continue
-				}
-			}
-
-			listBuckets.Bucket = append(listBuckets.Bucket, ListAllMyBucketsEntry{
-				Name:         entry.Name,
-				CreationDate: time.Unix(entry.Attributes.Crtime, 0).UTC(),
-			})
+	var buckets []ListAllMyBucketsEntry
+	var nextToken string
+	// Unauthenticated users should not see any buckets
+	if identity != nil {
+		var err error
+		if fromIndex, granted := s3a.iam.canListBucketsFromOwnerIndex(r, identity); fromIndex && s3a.bucketOwnerIndexReady() {
+			buckets, nextToken, err = s3a.listBucketsFromOwnerIndex(r, identity, granted, prefix, startAfter, maxBuckets)
+		} else {
+			buckets, nextToken, err = s3a.scanVisibleBuckets(r, identity, prefix, startAfter, maxBuckets)
+		}
+		if err != nil {
+			glog.Errorf("ListBucketsHandler: %v", err)
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+			return
 		}
 	}
 
-	response = ListAllMyBucketsResult{
+	response := ListAllMyBucketsResult{
 		Owner: CanonicalUser{
 			ID:          identityId,
 			DisplayName: identityId,
 		},
-		Buckets: listBuckets,
+		Buckets:           ListAllMyBucketsList{Bucket: buckets},
+		ContinuationToken: nextToken,
+		Prefix:            prefix,
 	}
 
 	glog.V(3).Infof("ListBucketsHandler response: %+v", response)
 	writeSuccessResponseXML(w, r, response)
 }
 
-// isBucketOwnedByIdentity checks if a bucket entry is owned by the given identity.
-// Returns true if the identity owns the bucket, false otherwise.
+const (
+	// maxBucketsPerPage caps a single ListBuckets response, matching AWS.
+	maxBucketsPerPage = 10000
+	// bucketScanPageSize is the filer page size while scanning /buckets.
+	bucketScanPageSize = 1000
+)
+
+func getListBucketsArgs(values url.Values) (maxBuckets int, prefix string, startAfter string, errCode s3err.ErrorCode) {
+	maxBuckets = maxBucketsPerPage
+	if v := values.Get("max-buckets"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > maxBucketsPerPage {
+			return 0, "", "", s3err.ErrInvalidMaxBuckets
+		}
+		maxBuckets = n
+	}
+	prefix = values.Get("prefix")
+	if v := values.Get("continuation-token"); v != "" {
+		name, err := decodeContinuationToken(v)
+		if err != nil {
+			return 0, "", "", s3err.ErrInvalidContinuationToken
+		}
+		startAfter = name
+	}
+	return maxBuckets, prefix, startAfter, s3err.ErrNone
+}
+
+// The continuation token is the last returned bucket name, base64-encoded so
+// clients treat it as opaque per the S3 API contract.
+func encodeContinuationToken(bucket string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(bucket))
+}
+
+func decodeContinuationToken(token string) (string, error) {
+	name, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil || len(name) == 0 {
+		return "", fmt.Errorf("invalid continuation token %q", token)
+	}
+	return string(name), nil
+}
+
+// bucketVisibleToIdentity reports whether ListBuckets should include the bucket:
+// the identity owns it or has explicit permission to list it.
+func (s3a *S3ApiServer) bucketVisibleToIdentity(r *http.Request, bucket, owner string, identity *Identity) bool {
+	if isBucketOwnedByIdentity(owner, identity) {
+		return true
+	}
+	return s3a.iam.VerifyActionPermission(r, identity, s3_constants.ACTION_LIST, bucket, "") == s3err.ErrNone
+}
+
+// scanVisibleBuckets pages through /buckets and collects up to maxBuckets
+// entries visible to the identity, returning a continuation token when more
+// remain. It never buffers the full bucket set.
+func (s3a *S3ApiServer) scanVisibleBuckets(r *http.Request, identity *Identity, prefix, startAfter string, maxBuckets int) (buckets []ListAllMyBucketsEntry, nextToken string, err error) {
+	startFrom := startAfter
+	for len(buckets) <= maxBuckets {
+		entries, isLast, listErr := s3a.list(s3a.option.BucketsPath, prefix, startFrom, false, bucketScanPageSize)
+		if listErr != nil {
+			return nil, "", listErr
+		}
+		if len(entries) == 0 {
+			break
+		}
+		for _, entry := range entries {
+			startFrom = entry.Name
+			if !entry.IsDirectory || strings.HasPrefix(entry.Name, ".") {
+				continue
+			}
+			if !s3a.bucketVisibleToIdentity(r, entry.Name, bucketEntryOwner(entry), identity) {
+				continue
+			}
+			buckets = append(buckets, ListAllMyBucketsEntry{
+				Name:         entry.Name,
+				CreationDate: time.Unix(entry.Attributes.Crtime, 0).UTC(),
+			})
+			if len(buckets) > maxBuckets {
+				break
+			}
+		}
+		if isLast || len(buckets) > maxBuckets {
+			break
+		}
+	}
+	if len(buckets) > maxBuckets {
+		buckets = buckets[:maxBuckets]
+		nextToken = encodeContinuationToken(buckets[maxBuckets-1].Name)
+	}
+	return buckets, nextToken, nil
+}
+
+// isBucketOwnedByIdentity checks if a bucket with the given owner id (its
+// AmzIdentityId metadata) is owned by the given identity.
 //
 // Ownership rules:
 // - Admin users: considered owners of all buckets
-// - Non-admin users: own buckets where AmzIdentityId matches identity.Name
+// - Non-admin users: own buckets whose owner id matches identity.Name
 // - Buckets without owner metadata are not owned by anyone (except admins)
-func isBucketOwnedByIdentity(entry *filer_pb.Entry, identity *Identity) bool {
-	if !entry.IsDirectory {
-		return false
-	}
-
+func isBucketOwnedByIdentity(owner string, identity *Identity) bool {
 	if identity == nil {
 		return false
 	}
@@ -135,17 +224,7 @@ func isBucketOwnedByIdentity(entry *filer_pb.Entry, identity *Identity) bool {
 
 	// Non-admin users with no name cannot own buckets.
 	// This prevents misconfigured identities from matching buckets with empty owner IDs.
-	if identity.Name == "" {
-		return false
-	}
-
-	// Check ownership via AmzIdentityId metadata
-	id, ok := entry.Extended[s3_constants.AmzIdentityId]
-	if !ok || string(id) != identity.Name {
-		return false
-	}
-
-	return true
+	return identity.Name != "" && identity.Name == owner
 }
 
 func (s3a *S3ApiServer) PutBucketHandler(w http.ResponseWriter, r *http.Request) {
@@ -165,18 +244,41 @@ func (s3a *S3ApiServer) PutBucketHandler(w http.ResponseWriter, r *http.Request)
 	// Get authenticated identity from context (secure, cannot be spoofed)
 	currentIdentityId := s3_constants.GetIdentityNameFromContext(r)
 
+	// Parse any requested bucket ACL (canned ACL or grant headers) up front so it
+	// can be validated, persisted on creation, and factored into the already-exists
+	// response. A "private" canned ACL is the default and counts as no explicit ACL.
+	requestHasACL := hasExplicitBucketACL(r)
+	var aclGrantsBytes []byte
+	if requestHasACL {
+		accountId := getAccountId(r)
+		_, grants, errCode := ParseAndValidateAclHeaders(r, s3a.iam, "", accountId, accountId, false)
+		if errCode != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, errCode)
+			return
+		}
+		if len(grants) > 0 {
+			grantsBytes, err := json.Marshal(grants)
+			if err != nil {
+				glog.Errorf("PutBucketHandler: marshal ACL grants for %s: %v", bucket, err)
+				s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+				return
+			}
+			aclGrantsBytes = grantsBytes
+		}
+	}
+
 	// Check collection existence first
 	collectionExists := false
 	if s3a.isTableBucket(bucket) {
 		s3err.WriteErrorResponse(w, r, s3err.ErrBucketAlreadyExists)
 		return
 	}
-	if err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		if resp, err := client.CollectionList(context.Background(), &filer_pb.CollectionListRequest{
+	listCtx, cancelList := context.WithTimeout(r.Context(), collectionListTimeout)
+	if err := s3a.withFilerClient(listCtx, false, func(client filer_pb.SeaweedFilerClient) error {
+		if resp, err := client.CollectionList(listCtx, &filer_pb.CollectionListRequest{
 			IncludeEcVolumes:     true,
 			IncludeNormalVolumes: true,
 		}); err != nil {
-			glog.Errorf("list collection: %v", err)
 			return fmt.Errorf("list collections: %w", err)
 		} else {
 			for _, c := range resp.Collections {
@@ -188,58 +290,23 @@ func (s3a *S3ApiServer) PutBucketHandler(w http.ResponseWriter, r *http.Request)
 		}
 		return nil
 	}); err != nil {
-		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-		return
+		// Advisory: the answer decides nothing below except whether to log that a
+		// leftover collection is being reused. s3a.exists is what decides whether
+		// the bucket already exists, so a listing that failed is no reason to
+		// refuse the creation.
+		glog.Warningf("PutBucketHandler: list collections for %s: %v", bucket, err)
 	}
+	cancelList()
 
-	// Check bucket directory existence and get metadata
+	// Bucket already exists: report whether the caller already owns it or the
+	// name is taken / the request conflicts.
 	if exist, err := s3a.exists(s3a.option.BucketsPath, bucket, true); err == nil && exist {
-		// Bucket exists, check ownership and settings
-		if entry, err := s3a.getEntry(s3a.option.BucketsPath, bucket); err == nil {
-			// Get existing bucket owner
-			var existingOwnerId string
-			if entry.Extended != nil {
-				if id, ok := entry.Extended[s3_constants.AmzIdentityId]; ok {
-					existingOwnerId = string(id)
-				}
-			}
-
-			// Check ownership
-			if existingOwnerId != "" && existingOwnerId != currentIdentityId {
-				// Different owner - always fail with BucketAlreadyExists
-				glog.V(3).Infof("PutBucketHandler: bucket %s owned by %s, requested by %s", bucket, existingOwnerId, currentIdentityId)
-				s3err.WriteErrorResponse(w, r, s3err.ErrBucketAlreadyExists)
-				return
-			}
-
-			// Same owner or no owner set - check for conflicting settings
-			objectLockRequested := strings.EqualFold(r.Header.Get(s3_constants.AmzBucketObjectLockEnabled), "true")
-
-			// Get current bucket configuration
-			bucketConfig, errCode := s3a.getBucketConfig(bucket)
-			if errCode != s3err.ErrNone {
-				glog.Errorf("PutBucketHandler: failed to get bucket config for %s: %v", bucket, errCode)
-				// If we can't get config, assume no conflict and allow recreation
-			} else {
-				// Check for Object Lock conflict
-				currentObjectLockEnabled := bucketConfig.ObjectLockConfig != nil &&
-					bucketConfig.ObjectLockConfig.ObjectLockEnabled == s3_constants.ObjectLockEnabled
-
-				if objectLockRequested != currentObjectLockEnabled {
-					// Conflicting Object Lock settings - fail with BucketAlreadyExists
-					glog.V(3).Infof("PutBucketHandler: bucket %s has conflicting Object Lock settings (requested: %v, current: %v)",
-						bucket, objectLockRequested, currentObjectLockEnabled)
-					s3err.WriteErrorResponse(w, r, s3err.ErrBucketAlreadyExists)
-					return
-				}
-			}
-
-			// Bucket already exists - always return BucketAlreadyExists per S3 specification
-			// The S3 tests expect BucketAlreadyExists in all cases, not BucketAlreadyOwnedByYou
-			glog.V(3).Infof("PutBucketHandler: bucket %s already exists", bucket)
-			s3err.WriteErrorResponse(w, r, s3err.ErrBucketAlreadyExists)
-			return
+		errCode := s3a.existingBucketError(r, bucket, currentIdentityId, requestHasACL)
+		if errCode == s3err.ErrBucketAlreadyOwnedByYou {
+			s3a.healBucketOwnerIndex(bucket, currentIdentityId)
 		}
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
 	}
 
 	// If collection exists but bucket directory doesn't, this is an inconsistent state
@@ -261,9 +328,21 @@ func (s3a *S3ApiServer) PutBucketHandler(w http.ResponseWriter, r *http.Request)
 	// Create the folder for bucket with all settings atomically
 	// This ensures Object Lock configuration is set in the same CreateEntry call,
 	// preventing race conditions where the bucket exists without Object Lock enabled
+	var bucketCrtime int64
 	if err := s3a.mkdir(s3a.option.BucketsPath, bucket, func(entry *filer_pb.Entry) {
+		bucketCrtime = entry.Attributes.Crtime
+
 		// Set bucket owner
 		setBucketOwner(r)(entry)
+
+		// Persist a requested non-default ACL so GetBucketAcl and idempotent
+		// recreation observe it (private is the default and is not stored).
+		if len(aclGrantsBytes) > 0 {
+			if entry.Extended == nil {
+				entry.Extended = make(map[string][]byte)
+			}
+			entry.Extended[s3_constants.ExtAmzAclKey] = aclGrantsBytes
+		}
 
 		// Set Object Lock configuration atomically during bucket creation
 		if objectLockEnabled {
@@ -290,10 +369,14 @@ func (s3a *S3ApiServer) PutBucketHandler(w http.ResponseWriter, r *http.Request)
 		}
 	}); err != nil {
 		// If mkdir failed because another request created the bucket concurrently,
-		// return BucketAlreadyExists instead of InternalError.
+		// return the appropriate already-exists error instead of InternalError.
 		if exist, checkErr := s3a.exists(s3a.option.BucketsPath, bucket, true); checkErr == nil && exist {
 			glog.V(3).Infof("PutBucketHandler: bucket %s was created concurrently", bucket)
-			s3err.WriteErrorResponse(w, r, s3err.ErrBucketAlreadyExists)
+			errCode := s3a.existingBucketError(r, bucket, currentIdentityId, requestHasACL)
+			if errCode == s3err.ErrBucketAlreadyOwnedByYou {
+				s3a.healBucketOwnerIndex(bucket, currentIdentityId)
+			}
+			s3err.WriteErrorResponse(w, r, errCode)
 			return
 		}
 		glog.Errorf("PutBucketHandler mkdir: %v", err)
@@ -305,7 +388,7 @@ func (s3a *S3ApiServer) PutBucketHandler(w http.ResponseWriter, r *http.Request)
 	// This ensures we don't leave a bucket without the requested Object Lock configuration
 	if objectLockSetupError != nil {
 		glog.Errorf("PutBucketHandler: rolling back bucket %s creation due to Object Lock setup failure: %v", bucket, objectLockSetupError)
-		if deleteErr := s3a.rm(s3a.option.BucketsPath, bucket, true, true); deleteErr != nil {
+		if deleteErr := s3a.rm(context.Background(), s3a.option.BucketsPath, bucket, true, true); deleteErr != nil {
 			glog.Errorf("PutBucketHandler: failed to rollback bucket %s after Object Lock setup failure: %v", bucket, deleteErr)
 		}
 		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
@@ -317,14 +400,41 @@ func (s3a *S3ApiServer) PutBucketHandler(w http.ResponseWriter, r *http.Request)
 		s3a.bucketConfigCache.RemoveNegativeCache(bucket)
 	}
 
+	// Index the bucket under its owner; the metadata subscription would catch
+	// up eventually, but writing here keeps ListBuckets read-your-writes.
+	if currentIdentityId != "" {
+		if err := s3a.addBucketToOwnerIndex(currentIdentityId, bucket, bucketCrtime); err != nil {
+			glog.Warningf("PutBucketHandler: owner index add %s/%s: %v", currentIdentityId, bucket, err)
+		}
+	}
+
 	w.Header().Set("Location", "/"+bucket)
 	writeSuccessResponseEmpty(w, r)
+}
+
+// healBucketOwnerIndex re-creates the owner index entry for a bucket the
+// caller owns, repairing holes left by crashes between bucket creation and
+// index write.
+func (s3a *S3ApiServer) healBucketOwnerIndex(bucket, identityId string) {
+	if identityId == "" {
+		return
+	}
+	config, errCode := s3a.getBucketConfig(bucket)
+	if errCode != s3err.ErrNone || config.IdentityId != identityId {
+		return
+	}
+	if err := s3a.addBucketToOwnerIndex(identityId, bucket, config.Crtime); err != nil {
+		glog.V(1).Infof("owner index heal %s/%s: %v", identityId, bucket, err)
+	}
 }
 
 func (s3a *S3ApiServer) DeleteBucketHandler(w http.ResponseWriter, r *http.Request) {
 
 	bucket, _ := s3_constants.GetBucketAndObject(r)
 	glog.V(3).Infof("DeleteBucketHandler %s", bucket)
+	// The teardown below retries, and a failover walk repeats it once per
+	// filer, so the backoff comes out of one allowance held here.
+	r = r.WithContext(withFilerRetryBudget(r.Context(), filerRetryRequestBudget))
 
 	if s3a.isTableBucket(bucket) {
 		s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
@@ -374,29 +484,46 @@ func (s3a *S3ApiServer) DeleteBucketHandler(w http.ResponseWriter, r *http.Reque
 	// the "collection exists but bucket directory missing" inconsistency that blocks
 	// bucket recreation. An orphaned collection is harmless and will be cleaned up
 	// or reused when the bucket is recreated.
-	err := s3a.rm(s3a.option.BucketsPath, bucket, false, true)
+	err := s3a.rm(r.Context(), s3a.option.BucketsPath, bucket, false, true)
 	if err != nil {
 		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 		return
 	}
 
-	err = s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+	if owner := bucketConfig.IdentityId; owner != "" {
+		if err := s3a.removeBucketFromOwnerIndex(owner, bucket); err != nil {
+			glog.Warningf("DeleteBucketHandler: owner index remove %s/%s: %v", owner, bucket, err)
+		}
+	}
+
+	// Bounded on a background context: the bucket directory is already gone, so
+	// this follow-up must survive a client disconnect, but it must not outlive the
+	// client by an unbounded amount either.
+	deleteCtx, cancelDelete := context.WithTimeout(context.Background(), collectionDeleteTimeout)
+	err = s3a.withFilerClient(deleteCtx, false, func(client filer_pb.SeaweedFilerClient) error {
 		deleteCollectionRequest := &filer_pb.DeleteCollectionRequest{
 			Collection: s3a.getCollectionName(bucket),
 		}
 
 		glog.V(1).Infof("delete collection: %v", deleteCollectionRequest)
-		if _, err := client.DeleteCollection(context.Background(), deleteCollectionRequest); err != nil {
+		if _, err := client.DeleteCollection(deleteCtx, deleteCollectionRequest); err != nil {
 			return fmt.Errorf("delete collection %s: %v", bucket, err)
 		}
 
 		return nil
 	})
+	timedOut := deleteCtx.Err() != nil
+	cancelDelete()
 
 	if err != nil {
 		// Log but don't fail — the bucket directory is already removed, so the bucket
 		// is effectively deleted. The orphaned collection will be cleaned up or reused.
-		glog.Errorf("DeleteBucketHandler: failed to delete collection for bucket %s: %v", bucket, err)
+		if timedOut {
+			// Our own budget, not a refusal: the master carries on deleting once asked.
+			glog.Warningf("DeleteBucketHandler: stopped waiting for the collection delete for bucket %s: %v", bucket, err)
+		} else {
+			glog.Errorf("DeleteBucketHandler: failed to delete collection for bucket %s: %v", bucket, err)
+		}
 	}
 
 	// Clean up bucket-related caches, locks, and metrics after successful deletion
@@ -466,8 +593,13 @@ func (s3a *S3ApiServer) HeadBucketHandler(w http.ResponseWriter, r *http.Request
 	bucket, _ := s3_constants.GetBucketAndObject(r)
 	glog.V(3).Infof("HeadBucketHandler %s", bucket)
 
-	if entry, err := s3a.getBucketEntry(bucket); entry == nil || errors.Is(err, filer_pb.ErrNotFound) {
-		s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+	if _, err := s3a.getBucketEntry(bucket); err != nil {
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+			return
+		}
+		glog.Errorf("HeadBucketHandler: failed to get bucket entry for %s: %v", bucket, err)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 		return
 	}
 
@@ -485,7 +617,7 @@ func (s3a *S3ApiServer) checkBucket(r *http.Request, bucket string) s3err.ErrorC
 	if s3a.iam.isEnabled() {
 		return s3err.ErrNone
 	}
-	if !s3a.hasAccess(r, config.Entry) {
+	if !s3a.hasAccess(r, config.IdentityId) {
 		return s3err.ErrAccessDenied
 	}
 	return s3err.ErrNone
@@ -494,18 +626,98 @@ func (s3a *S3ApiServer) checkBucket(r *http.Request, bucket string) s3err.ErrorC
 // ErrAutoCreatePermissionDenied is returned when a user lacks permission to auto-create buckets
 var ErrAutoCreatePermissionDenied = errors.New("permission denied - requires Admin permission")
 
+// ErrAutoCreateDisabled is returned when bucket auto-creation is disabled by configuration
+var ErrAutoCreateDisabled = errors.New("bucket auto-creation is disabled")
+
 // ErrInvalidBucketName is returned when a bucket name doesn't meet S3 naming requirements
 var ErrInvalidBucketName = errors.New("invalid bucket name")
+
+// existingBucketError returns the error for a PutBucket whose target bucket
+// already exists: BucketAlreadyOwnedByYou for an idempotent recreate by the
+// owner, or BucketAlreadyExists when the name is owned by someone else or the
+// request conflicts with the existing bucket (a different Object Lock setting,
+// or an ACL on the request or the existing bucket).
+func (s3a *S3ApiServer) existingBucketError(r *http.Request, bucket, currentIdentityId string, requestHasACL bool) s3err.ErrorCode {
+	entry, err := s3a.getEntry(s3a.option.BucketsPath, bucket)
+	if err != nil {
+		// We just observed the bucket exists but can't read it; report it as taken.
+		glog.Errorf("PutBucketHandler: failed to read existing bucket %s: %v", bucket, err)
+		return s3err.ErrBucketAlreadyExists
+	}
+
+	var existingOwnerId string
+	if entry.Extended != nil {
+		if id, ok := entry.Extended[s3_constants.AmzIdentityId]; ok {
+			existingOwnerId = string(id)
+		}
+	}
+
+	// Different owner: the name is taken in the shared namespace.
+	if existingOwnerId != "" && existingOwnerId != currentIdentityId {
+		glog.V(3).Infof("PutBucketHandler: bucket %s owned by %s, requested by %s", bucket, existingOwnerId, currentIdentityId)
+		return s3err.ErrBucketAlreadyExists
+	}
+
+	// Same owner (or an unowned bucket the caller can claim). Recreating your own
+	// bucket is idempotent and returns BucketAlreadyOwnedByYou, unless the request
+	// conflicts with the existing bucket: a different Object Lock setting, or an ACL
+	// on the request or the existing bucket.
+	// (s3-tests: test_bucket_create_exists vs test_bucket_recreate_*_acl.)
+	if requestHasACL {
+		return s3err.ErrBucketAlreadyExists
+	}
+
+	objectLockRequested := strings.EqualFold(r.Header.Get(s3_constants.AmzBucketObjectLockEnabled), "true")
+	bucketConfig, errCode := s3a.getBucketConfig(bucket)
+	if errCode != s3err.ErrNone {
+		// Can't read the existing bucket's settings, so we can't tell whether this
+		// recreate conflicts; surface the failure instead of assuming idempotency.
+		glog.Errorf("PutBucketHandler: failed to get bucket config for %s: %v", bucket, errCode)
+		return errCode
+	}
+	currentObjectLockEnabled := bucketConfig.ObjectLockConfig != nil &&
+		bucketConfig.ObjectLockConfig.ObjectLockEnabled == s3_constants.ObjectLockEnabled
+	if objectLockRequested != currentObjectLockEnabled || len(bucketConfig.ACL) > 0 {
+		glog.V(3).Infof("PutBucketHandler: bucket %s already exists", bucket)
+		return s3err.ErrBucketAlreadyExists
+	}
+
+	glog.V(3).Infof("PutBucketHandler: bucket %s already owned by requester", bucket)
+	return s3err.ErrBucketAlreadyOwnedByYou
+}
+
+// hasExplicitBucketACL reports whether the request carries an explicit, non-default
+// bucket ACL via a canned ACL header (other than "private") or grant headers.
+func hasExplicitBucketACL(r *http.Request) bool {
+	if canned := r.Header.Get(s3_constants.AmzCannedAcl); canned != "" && !strings.EqualFold(canned, s3_constants.CannedAclPrivate) {
+		return true
+	}
+	for _, h := range []string{s3_constants.AmzAclFullControl, s3_constants.AmzAclRead, s3_constants.AmzAclReadAcp, s3_constants.AmzAclWrite, s3_constants.AmzAclWriteAcp} {
+		if r.Header.Get(h) != "" {
+			return true
+		}
+	}
+	return false
+}
 
 // setBucketOwner creates a function that sets the bucket owner from the request context
 func setBucketOwner(r *http.Request) func(entry *filer_pb.Entry) {
 	currentIdentityId := s3_constants.GetIdentityNameFromContext(r)
+	// Record the canonical account id too so GetBucketAcl can report the bucket
+	// owner instead of whoever is reading (e.g. an admin or another account).
+	accountId := r.Header.Get(s3_constants.AmzAccountId)
 	return func(entry *filer_pb.Entry) {
+		if currentIdentityId == "" && accountId == "" {
+			return
+		}
+		if entry.Extended == nil {
+			entry.Extended = make(map[string][]byte)
+		}
 		if currentIdentityId != "" {
-			if entry.Extended == nil {
-				entry.Extended = make(map[string][]byte)
-			}
 			entry.Extended[s3_constants.AmzIdentityId] = []byte(currentIdentityId)
+		}
+		if accountId != "" {
+			entry.Extended[s3_constants.ExtAmzOwnerKey] = []byte(accountId)
 		}
 	}
 }
@@ -518,12 +730,21 @@ func (s3a *S3ApiServer) autoCreateBucket(r *http.Request, bucket string) error {
 		return fmt.Errorf("auto-create bucket %s: %w", bucket, errors.Join(ErrInvalidBucketName, err))
 	}
 
+	if !s3a.option.AutoCreateBucket {
+		return fmt.Errorf("auto-create bucket %s: %w", bucket, ErrAutoCreateDisabled)
+	}
+
 	// Check if user has admin permissions
 	if !s3a.isUserAdmin(r) {
 		return fmt.Errorf("auto-create bucket %s: %w", bucket, ErrAutoCreatePermissionDenied)
 	}
 
-	if err := s3a.mkdir(s3a.option.BucketsPath, bucket, setBucketOwner(r)); err != nil {
+	identityId := s3_constants.GetIdentityNameFromContext(r)
+	var bucketCrtime int64
+	if err := s3a.mkdir(s3a.option.BucketsPath, bucket, func(entry *filer_pb.Entry) {
+		bucketCrtime = entry.Attributes.Crtime
+		setBucketOwner(r)(entry)
+	}); err != nil {
 		// In case of a race condition where another request created the bucket
 		// in the meantime, check for existence before returning an error.
 		if exist, err2 := s3a.exists(s3a.option.BucketsPath, bucket, true); err2 != nil {
@@ -541,6 +762,11 @@ func (s3a *S3ApiServer) autoCreateBucket(r *http.Request, bucket string) error {
 						glog.Warningf("autoCreateBucket: failed to set owner for existing bucket %s: %v", bucket, updateErr)
 					} else {
 						glog.V(1).Infof("Set owner for existing bucket %s (created by concurrent request)", bucket)
+						if owner := bucketEntryOwner(entry); owner != "" {
+							if indexErr := s3a.addBucketToOwnerIndex(owner, bucket, entry.Attributes.Crtime); indexErr != nil {
+								glog.Warningf("autoCreateBucket: owner index add %s/%s: %v", owner, bucket, indexErr)
+							}
+						}
 					}
 				}
 			} else {
@@ -560,6 +786,12 @@ func (s3a *S3ApiServer) autoCreateBucket(r *http.Request, bucket string) error {
 		s3a.bucketConfigCache.RemoveNegativeCache(bucket)
 	}
 
+	if identityId != "" {
+		if err := s3a.addBucketToOwnerIndex(identityId, bucket, bucketCrtime); err != nil {
+			glog.Warningf("autoCreateBucket: owner index add %s/%s: %v", identityId, bucket, err)
+		}
+	}
+
 	glog.V(1).Infof("Auto-created bucket %s", bucket)
 	return nil
 }
@@ -570,7 +802,9 @@ func (s3a *S3ApiServer) handleAutoCreateBucket(w http.ResponseWriter, r *http.Re
 	if err := s3a.autoCreateBucket(r, bucket); err != nil {
 		glog.Warningf("%s: %v", handlerName, err)
 		// Check for specific errors to return appropriate S3 error codes
-		if errors.Is(err, ErrInvalidBucketName) {
+		if errors.Is(err, ErrAutoCreateDisabled) {
+			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+		} else if errors.Is(err, ErrInvalidBucketName) {
 			s3err.WriteErrorResponse(w, r, s3err.ErrInvalidBucketName)
 		} else if errors.Is(err, ErrAutoCreatePermissionDenied) {
 			s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
@@ -582,23 +816,23 @@ func (s3a *S3ApiServer) handleAutoCreateBucket(w http.ResponseWriter, r *http.Re
 	return true
 }
 
-func (s3a *S3ApiServer) hasAccess(r *http.Request, entry *filer_pb.Entry) bool {
+// hasAccess checks the caller against the identity recorded at bucket
+// creation; buckets with no recorded identity are open to any caller.
+func (s3a *S3ApiServer) hasAccess(r *http.Request, bucketIdentityId string) bool {
 	// Check if user is properly authenticated as admin through IAM system
 	if s3a.isUserAdmin(r) {
 		return true
 	}
 
-	if entry.Extended == nil {
+	if bucketIdentityId == "" {
 		return true
 	}
 
 	// Get authenticated identity from context (secure, cannot be spoofed)
 	identityId := s3_constants.GetIdentityNameFromContext(r)
-	if id, ok := entry.Extended[s3_constants.AmzIdentityId]; ok {
-		if identityId != string(id) {
-			glog.V(3).Infof("hasAccess: %s != %s (entry.Extended = %v)", identityId, id, entry.Extended)
-			return false
-		}
+	if identityId != bucketIdentityId {
+		glog.V(3).Infof("hasAccess: %s != %s", identityId, bucketIdentityId)
+		return false
 	}
 	return true
 }
@@ -606,6 +840,16 @@ func (s3a *S3ApiServer) hasAccess(r *http.Request, entry *filer_pb.Entry) bool {
 // isUserAdmin securely checks if the authenticated user is an admin
 // This validates admin status through proper IAM authentication, not spoofable headers
 func (s3a *S3ApiServer) isUserAdmin(r *http.Request) bool {
+	// Reuse the identity the Auth middleware stored; re-authenticating here would
+	// fail once the request body has been read.
+	if identityObj := s3_constants.GetIdentityFromContext(r); identityObj != nil {
+		if identity, ok := identityObj.(*Identity); ok {
+			return identity != nil && identity.isAdmin()
+		}
+	}
+	if s3a.iam == nil {
+		return false
+	}
 	// Use a minimal admin action to authenticate and check admin status
 	adminAction := Action("Admin")
 	identity, errCode := s3a.iam.authRequest(r, adminAction)
@@ -722,23 +966,25 @@ func (s3a *S3ApiServer) GetBucketAclHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	amzAccountId := r.Header.Get(s3_constants.AmzAccountId)
-	amzDisplayName := s3a.iam.GetAccountNameById(amzAccountId)
+	// Report the bucket's owner (recorded at creation or by PutBucketAcl), not the
+	// caller; fall back to the caller only when no owner was persisted. Likewise
+	// return any stored ACL, defaulting to the owner's full-control grant.
+	ownerId := r.Header.Get(s3_constants.AmzAccountId)
+	var storedGrants []*s3.Grant
+	if bucketConfig, errCode := s3a.getBucketConfig(bucket); errCode == s3err.ErrNone {
+		storedGrants = parseAclGrants(bucketConfig.ACL)
+		if bucketConfig.Owner != "" {
+			ownerId = bucketConfig.Owner
+		}
+	}
+	ownerDisplayName := s3a.iam.GetAccountNameById(ownerId)
 	response := AccessControlPolicy{
 		Owner: CanonicalUser{
-			ID:          amzAccountId,
-			DisplayName: amzDisplayName,
+			ID:          ownerId,
+			DisplayName: ownerDisplayName,
 		},
+		AccessControlList: buildAccessControlList(s3a.iam, storedGrants, ownerId, ownerDisplayName),
 	}
-	response.AccessControlList.Grant = append(response.AccessControlList.Grant, Grant{
-		Grantee: Grantee{
-			ID:          amzAccountId,
-			DisplayName: amzDisplayName,
-			Type:        "CanonicalUser",
-			XMLXSI:      "CanonicalUser",
-			XMLNS:       "http://www.w3.org/2001/XMLSchema-instance"},
-		Permission: s3.PermissionFullControl,
-	})
 	writeSuccessResponseXML(w, r, response)
 }
 
@@ -883,12 +1129,10 @@ func (s3a *S3ApiServer) PutBucketLifecycleConfigurationHandler(w http.ResponseWr
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxBucketLifecycleConfigurationSize)
-	lifecycleXML, err := io.ReadAll(r.Body)
+	lifecycleXML, err := readRequestBody(r, maxBucketLifecycleConfigurationSize)
 	if err != nil {
 		glog.Warningf("PutBucketLifecycleConfigurationHandler read body: %s", err)
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
+		if errors.Is(err, errRequestBodyTooLarge) {
 			s3err.WriteErrorResponse(w, r, s3err.ErrEntityTooLarge)
 			return
 		}
@@ -923,41 +1167,35 @@ func (s3a *S3ApiServer) PutBucketLifecycleConfigurationHandler(w http.ResponseWr
 	// (volume server expires under the old rule) or contradict the new
 	// XML after a rule change. The add path is gone — this loop only
 	// shrinks the conf, never grows it.
-	fc, err := filer.ReadFilerConfFromFilers(s3a.option.Filers, s3a.option.GrpcDialOption, nil)
-	if err != nil {
-		glog.Errorf("PutBucketLifecycleConfigurationHandler read filer config: %s", err)
+	if err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		return filer.ClearBucketLifecycleDayTTLs(context.Background(), client, s3a.option.BucketsPath, bucket, s3a.getCollectionName(bucket))
+	}); err != nil {
+		glog.Errorf("PutBucketLifecycleConfigurationHandler clear legacy day-TTLs: %s", err)
 		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 		return
 	}
-	collectionTtls := fc.GetCollectionTtls(s3a.getCollectionName(bucket))
-	changed := false
-	bucketPrefix := fmt.Sprintf("%s/%s/", s3a.option.BucketsPath, bucket)
-	for prefix, ttl := range collectionTtls {
-		if !strings.HasPrefix(prefix, bucketPrefix) || !strings.HasSuffix(ttl, "d") {
-			continue
-		}
-		fc.DeleteLocationConf(prefix)
-		changed = true
-	}
 
-	if changed {
-		var buf bytes.Buffer
-		if err := fc.ToText(&buf); err != nil {
-			glog.Errorf("PutBucketLifecycleConfigurationHandler save config to text: %s", err)
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-		}
-		if err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-			return filer.SaveInsideFiler(context.Background(), client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName, buf.Bytes())
-		}); err != nil {
-			glog.Errorf("PutBucketLifecycleConfigurationHandler save config inside filer: %s", err)
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-			return
-		}
+	// The per-write TTL fast path stamps a volume TTL at write time that
+	// can't be taken back. If it's active on this bucket, warn when the new
+	// config removes or lengthens a rule: objects already written keep their
+	// baked-in TTL and won't be rescued by this change (unlike the default
+	// worker path, which re-evaluates the current rules each pass).
+	// Compute the reason before storing, but emit only after the store
+	// succeeds so a failed mutation never carries a warning for a change
+	// that was not applied.
+	var fastpathWarnReason string
+	if cfg, _ := s3a.getBucketConfig(bucket); cfg != nil && cfg.LifecycleTTL != nil {
+		fastpathWarnReason = fastpathConfigChangeLeavesStampedObjects(cfg.LifecycleXML, lifecycleXML)
 	}
 
 	if errCode := s3a.storeBucketLifecycleConfiguration(bucket, lifecycleXML, r.Header.Get(bucketLifecycleTransitionMinimumObjectSizeHeader)); errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)
 		return
+	}
+
+	if fastpathWarnReason != "" {
+		glog.Warningf("PutBucketLifecycleConfigurationHandler %s: %s", bucket, fastpathWarnReason)
+		w.Header().Set(fastpathWarningHeader, fastpathWarnReason)
 	}
 
 	writeSuccessResponseEmpty(w, r)
@@ -975,41 +1213,34 @@ func (s3a *S3ApiServer) DeleteBucketLifecycleHandler(w http.ResponseWriter, r *h
 		return
 	}
 
-	fc, err := filer.ReadFilerConfFromFilers(s3a.option.Filers, s3a.option.GrpcDialOption, nil)
-	if err != nil {
-		glog.Errorf("DeleteBucketLifecycleHandler read filer config: %s", err)
+	// Same legacy day-TTL migration as the PUT handler.
+	if err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		return filer.ClearBucketLifecycleDayTTLs(context.Background(), client, s3a.option.BucketsPath, bucket, s3a.getCollectionName(bucket))
+	}); err != nil {
+		glog.Errorf("DeleteBucketLifecycleHandler clear legacy day-TTLs: %s", err)
 		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 		return
 	}
-	collectionTtls := fc.GetCollectionTtls(s3a.getCollectionName(bucket))
-	changed := false
-	bucketPrefix := fmt.Sprintf("%s/%s/", s3a.option.BucketsPath, bucket)
-	for prefix, ttl := range collectionTtls {
-		if !strings.HasPrefix(prefix, bucketPrefix) || !strings.HasSuffix(ttl, "d") {
-			continue
-		}
-		fc.DeleteLocationConf(prefix)
-		changed = true
-	}
 
-	if changed {
-		var buf bytes.Buffer
-		if err := fc.ToText(&buf); err != nil {
-			glog.Errorf("DeleteBucketLifecycleHandler save config to text: %s", err)
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-		}
-		if err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-			return filer.SaveInsideFiler(context.Background(), client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName, buf.Bytes())
-		}); err != nil {
-			glog.Errorf("DeleteBucketLifecycleHandler save config inside filer: %s", err)
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-			return
-		}
+	// If the per-write TTL fast path is active, every previously-stamped
+	// object keeps its baked-in volume TTL after the config is removed —
+	// deleting the rules does not rescue them (unlike the default worker
+	// path). Compute the reason before clearing, but emit only after the
+	// clear succeeds so a failed mutation never carries a warning for a
+	// change that was not applied.
+	var fastpathWarnReason string
+	if cfg, _ := s3a.getBucketConfig(bucket); cfg != nil && cfg.LifecycleTTL != nil {
+		fastpathWarnReason = fastpathConfigChangeLeavesStampedObjects(cfg.LifecycleXML, nil)
 	}
 
 	if errCode := s3a.clearStoredBucketLifecycleConfiguration(bucket); errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)
 		return
+	}
+
+	if fastpathWarnReason != "" {
+		glog.Warningf("DeleteBucketLifecycleHandler %s: %s", bucket, fastpathWarnReason)
+		w.Header().Set(fastpathWarningHeader, fastpathWarnReason)
 	}
 
 	s3err.WriteEmptyResponse(w, r, http.StatusNoContent)
@@ -1019,6 +1250,11 @@ func (s3a *S3ApiServer) DeleteBucketLifecycleHandler(w http.ResponseWriter, r *h
 // https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketLocation.html
 func (s3a *S3ApiServer) GetBucketLocationHandler(w http.ResponseWriter, r *http.Request) {
 	bucket, _ := s3_constants.GetBucketAndObject(r)
+
+	if err := s3bucket.VerifyS3BucketName(bucket); err != nil {
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidBucketName)
+		return
+	}
 
 	if err := s3a.checkBucket(r, bucket); err != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, err)
@@ -1076,19 +1312,10 @@ func (s3a *S3ApiServer) PutBucketOwnershipControls(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Check if ownership needs to be updated
-	currentOwnership, errCode := s3a.getBucketOwnership(bucket)
-	if errCode != s3err.ErrNone {
+	// Persist even when it matches the implicit default, so a later delete has something to remove.
+	if errCode := s3a.setBucketOwnership(bucket, ownership); errCode != s3err.ErrNone {
 		s3err.WriteErrorResponse(w, r, errCode)
 		return
-	}
-
-	if currentOwnership != ownership {
-		errCode = s3a.setBucketOwnership(bucket, ownership)
-		if errCode != s3err.ErrNone {
-			s3err.WriteErrorResponse(w, r, errCode)
-			return
-		}
 	}
 
 	if printOwnership {

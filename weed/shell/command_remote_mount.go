@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -50,6 +51,8 @@ func (c *commandRemoteMount) Help() string {
 	remote.mount -dir=/xxx -remote=cloud1/bucket/dir1
 	# mount with on-demand directory listing cached for 5 minutes
 	remote.mount -dir=/xxx -remote=cloud1/bucket -listingCacheTTL=300
+	# mount as a streaming source: reads go to the remote instead of waiting for the local cache
+	remote.mount -dir=/xxx -remote=cloud1/bucket -cacheWait=0
 
 	# after mount, start a separate process to write updates to remote storage
 	weed filer.remote.sync -filer=<filerHost>:<filerPort> -dir=/xxx
@@ -70,6 +73,7 @@ func (c *commandRemoteMount) Do(args []string, commandEnv *CommandEnv, writer io
 	metadataStrategy := remoteMountCommand.String("metadataStrategy", string(MetadataCacheEager), "lazy: skip upfront metadata pull; eager: full metadata pull (default)")
 	remote := remoteMountCommand.String("remote", "", "a directory in remote storage, ex. <storageName>/<bucket>/path/to/dir")
 	listingCacheTTL := remoteMountCommand.Int("listingCacheTTL", 0, "seconds to cache remote directory listings (0 = disabled)")
+	cacheWait := remoteMountCommand.Duration("cacheWait", -1, "how long a read of an uncached object waits for the local cache, ex. 0 or 500ms (default: by object size)")
 
 	if err = remoteMountCommand.Parse(args); err != nil {
 		return nil
@@ -91,6 +95,17 @@ func (c *commandRemoteMount) Do(args []string, commandEnv *CommandEnv, writer io
 		return err
 	}
 	remoteStorageLocation.ListingCacheTtlSeconds = int32(*listingCacheTTL)
+	if *cacheWait >= 0 {
+		waitMs := cacheWait.Milliseconds()
+		if waitMs > math.MaxInt32 {
+			return fmt.Errorf("cacheWait %v is too long", *cacheWait)
+		}
+		// truncating to 0 would read as "never wait" instead of the asked-for wait
+		if waitMs == 0 && *cacheWait > 0 {
+			return fmt.Errorf("cacheWait %v is shorter than 1ms", *cacheWait)
+		}
+		remoteStorageLocation.CacheWaitMs = proto.Int32(int32(waitMs))
+	}
 
 	strategy := MetadataCacheStrategy(strings.ToLower(*metadataStrategy))
 	if strategy != MetadataCacheLazy && strategy != MetadataCacheEager {
@@ -102,7 +117,7 @@ func (c *commandRemoteMount) Do(args []string, commandEnv *CommandEnv, writer io
 	}
 
 	if strategy == MetadataCacheEager {
-		if err = pullMetadata(commandEnv, writer, util.FullPath(*dir), remoteStorageLocation, util.FullPath(*dir), remoteConf); err != nil {
+		if err = pullMetadata(commandEnv, writer, util.FullPath(*dir), remoteStorageLocation, util.FullPath(*dir), remoteConf, false, false); err != nil {
 			return fmt.Errorf("cache metadata: %w", err)
 		}
 	}
@@ -203,6 +218,7 @@ func doSaveRemoteEntry(client filer_pb.SeaweedFilerClient, localDir string, exis
 	existingEntry.Attributes.Mtime = remoteEntry.RemoteMtime
 	existingEntry.Attributes.Md5 = nil
 	existingEntry.Attributes.TtlSec = 0 // Remote entries should not have TTL
+	existingEntry.Extended = filer.MergeRemoteContentEncoding(remoteEntry, existingEntry.Extended)
 	existingEntry.Chunks = nil
 	existingEntry.Content = nil
 	_, updateErr := client.UpdateEntry(context.Background(), &filer_pb.UpdateEntryRequest{

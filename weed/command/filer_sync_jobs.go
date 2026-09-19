@@ -5,10 +5,14 @@ import (
 	"path"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	statsCollect "github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
@@ -50,9 +54,23 @@ const (
 )
 
 type syncJobPaths struct {
-	path    util.FullPath
-	newPath util.FullPath // empty for non-renames
-	kind    jobKind
+	path     util.FullPath
+	newPath  util.FullPath // empty for non-renames
+	kind     jobKind
+	dataSize int64
+}
+
+// syncStreamMetrics holds the metric children for one sync stream, curried
+// once so per-event updates skip the label lookup.
+type syncStreamMetrics struct {
+	received       prometheus.Counter
+	processed      prometheus.Counter
+	failed         prometheus.Counter
+	inFlight       prometheus.Gauge
+	receivedBytes  prometheus.Counter
+	processedBytes prometheus.Counter
+	failedBytes    prometheus.Counter
+	inFlightBytes  prometheus.Gauge
 }
 
 type MetadataProcessor struct {
@@ -86,6 +104,15 @@ type MetadataProcessor struct {
 	// tsHeap is a min-heap of active job timestamps with lazy deletion,
 	// used for O(log n) amortized watermark tracking.
 	tsHeap tsMinHeap
+
+	// oldestFailedTsNs is the timestamp of the oldest event whose job returned
+	// an error, or 0 when none has. The watermark is never advanced to it or
+	// past it, so the persisted sync offset stays behind the failure and a
+	// restart replays the event instead of skipping it forever.
+	oldestFailedTsNs int64
+
+	// metrics is nil for callers that do not report per-event metrics.
+	metrics *syncStreamMetrics
 }
 
 func NewMetadataProcessor(fn pb.ProcessMetadataFunc, concurrency int, offsetTsNs int64) *MetadataProcessor {
@@ -101,6 +128,29 @@ func NewMetadataProcessor(fn pb.ProcessMetadataFunc, concurrency int, offsetTsNs
 	t.processedTsWatermark.Store(offsetTsNs)
 	t.activeJobsCond = sync.NewCond(&t.activeJobsLock)
 	return t
+}
+
+// SetMetrics enables per-event metrics for this stream, labeled the same way
+// as the existing sync_offset gauge.
+func (t *MetadataProcessor) SetMetrics(sourceFiler, targetFiler, clientName, path string) {
+	t.metrics = &syncStreamMetrics{
+		received:       statsCollect.FilerSyncEventsReceivedCounter.WithLabelValues(sourceFiler, targetFiler, clientName, path),
+		processed:      statsCollect.FilerSyncEventsProcessedCounter.WithLabelValues(sourceFiler, targetFiler, clientName, path),
+		failed:         statsCollect.FilerSyncEventsFailedCounter.WithLabelValues(sourceFiler, targetFiler, clientName, path),
+		inFlight:       statsCollect.FilerSyncInFlightJobsGauge.WithLabelValues(sourceFiler, targetFiler, clientName, path),
+		receivedBytes:  statsCollect.FilerSyncReceivedBytesCounter.WithLabelValues(sourceFiler, targetFiler, clientName, path),
+		processedBytes: statsCollect.FilerSyncProcessedBytesCounter.WithLabelValues(sourceFiler, targetFiler, clientName, path),
+		failedBytes:    statsCollect.FilerSyncFailedBytesCounter.WithLabelValues(sourceFiler, targetFiler, clientName, path),
+		inFlightBytes:  statsCollect.FilerSyncInFlightBytesGauge.WithLabelValues(sourceFiler, targetFiler, clientName, path),
+	}
+}
+
+// OldestFailedTsNs returns the timestamp of the oldest permanently failed
+// event, or 0 when none is pinning the watermark.
+func (t *MetadataProcessor) OldestFailedTsNs() int64 {
+	t.activeJobsLock.Lock()
+	defer t.activeJobsLock.Unlock()
+	return t.oldestFailedTsNs
 }
 
 // pathAncestors returns all proper ancestor directories of p.
@@ -234,6 +284,15 @@ func (t *MetadataProcessor) AddSyncJob(resp *filer_pb.SubscribeMetadataResponse)
 		return
 	}
 
+	dataSize := eventDataSize(resp)
+
+	// counted before the admission wait: received-processed-failed is the
+	// number of events read off the stream but not yet done
+	if t.metrics != nil {
+		t.metrics.received.Inc()
+		t.metrics.receivedBytes.Add(float64(dataSize))
+	}
+
 	t.activeJobsLock.Lock()
 	defer t.activeJobsLock.Unlock()
 
@@ -242,31 +301,56 @@ func (t *MetadataProcessor) AddSyncJob(resp *filer_pb.SubscribeMetadataResponse)
 	}
 
 	p, newPath, kind := extractJobInfo(resp)
-	jobPaths := &syncJobPaths{path: p, newPath: newPath, kind: kind}
+	jobPaths := &syncJobPaths{path: p, newPath: newPath, kind: kind, dataSize: dataSize}
 
 	t.activeJobs[resp.TsNs] = jobPaths
 	t.addPathToIndex(p, kind)
 	if newPath != "" {
 		t.addPathToIndex(newPath, kind)
 	}
+	// Inc/Dec rather than Set from local state: after a subscription retry a
+	// new processor shares these children with the old one's still-draining
+	// jobs, and each job accounting for itself keeps the total truthful.
+	if t.metrics != nil {
+		t.metrics.inFlight.Inc()
+		t.metrics.inFlightBytes.Add(float64(dataSize))
+	}
 
 	heap.Push(&t.tsHeap, resp.TsNs)
 
 	go func() {
 
-		if err := util.Retry("metadata processor", func() error {
+		jobErr := util.Retry("metadata processor", func() error {
 			return t.fn(resp)
-		}); err != nil {
-			glog.Errorf("process %v: %v", resp, err)
-		}
+		})
 
 		t.activeJobsLock.Lock()
 		defer t.activeJobsLock.Unlock()
+
+		if jobErr != nil {
+			if t.oldestFailedTsNs == 0 || resp.TsNs < t.oldestFailedTsNs {
+				t.oldestFailedTsNs = resp.TsNs
+				glog.Errorf("process %v: %v; holding sync offset at %v so this event is replayed on restart", resp, jobErr, time.Unix(0, resp.TsNs))
+			} else {
+				glog.Errorf("process %v: %v", resp, jobErr)
+			}
+		}
 
 		delete(t.activeJobs, resp.TsNs)
 		t.removePathFromIndex(jobPaths.path, jobPaths.kind)
 		if jobPaths.newPath != "" {
 			t.removePathFromIndex(jobPaths.newPath, jobPaths.kind)
+		}
+		if t.metrics != nil {
+			if jobErr != nil {
+				t.metrics.failed.Inc()
+				t.metrics.failedBytes.Add(float64(jobPaths.dataSize))
+			} else {
+				t.metrics.processed.Inc()
+				t.metrics.processedBytes.Add(float64(jobPaths.dataSize))
+			}
+			t.metrics.inFlight.Dec()
+			t.metrics.inFlightBytes.Sub(float64(jobPaths.dataSize))
 		}
 
 		// Lazy-clean stale entries from heap top (already-completed jobs).
@@ -277,12 +361,35 @@ func (t *MetadataProcessor) AddSyncJob(resp *filer_pb.SubscribeMetadataResponse)
 			}
 			heap.Pop(&t.tsHeap)
 		}
-		// If this was the oldest job, advance the watermark.
+		// If this was the oldest job, advance the watermark, but never to or
+		// past an event that failed: the offset is the durable resume point,
+		// and moving it over a failure drops that event for good.
 		if t.tsHeap.Len() == 0 || resp.TsNs < t.tsHeap[0] {
-			t.processedTsWatermark.Store(resp.TsNs)
+			if t.oldestFailedTsNs == 0 || resp.TsNs < t.oldestFailedTsNs {
+				t.processedTsWatermark.Store(resp.TsNs)
+			}
 		}
 		t.activeJobsCond.Signal()
 	}()
+}
+
+// eventDataSize is the chunk data this event will copy: chunks on the new
+// entry that the old entry does not already have. Deletes, renames, and
+// attribute-only updates all come out zero, so byte rates reflect data
+// movement rather than metadata churn.
+func eventDataSize(resp *filer_pb.SubscribeMetadataResponse) (size int64) {
+	message := resp.EventNotification
+	if message.NewEntry == nil {
+		return 0
+	}
+	newChunks := message.NewEntry.GetChunks()
+	if message.OldEntry != nil {
+		newChunks = filer.DoMinusChunks(newChunks, message.OldEntry.GetChunks())
+	}
+	for _, chunk := range newChunks {
+		size += int64(chunk.Size)
+	}
+	return size
 }
 
 // extractJobInfo derives the conflict-detection path(s) and job kind for a

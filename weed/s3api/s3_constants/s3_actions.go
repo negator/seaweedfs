@@ -16,9 +16,14 @@ const (
 	ACTION_PUT_OBJECT_LEGAL_HOLD         = "PutObjectLegalHold"
 	ACTION_GET_BUCKET_OBJECT_LOCK_CONFIG = "GetBucketObjectLockConfiguration"
 	ACTION_PUT_BUCKET_OBJECT_LOCK_CONFIG = "PutBucketObjectLockConfiguration"
+	ACTION_PUT_BUCKET_POLICY             = "PutBucketPolicy"
+	ACTION_DELETE_BUCKET_POLICY          = "DeleteBucketPolicy"
+	ACTION_PUT_BUCKET_QUOTA              = "PutBucketQuota"
+	ACTION_GET_BUCKET_QUOTA              = "GetBucketQuota"
 
 	SeaweedStorageDestinationHeader = "x-seaweedfs-destination"
 	MultipartUploadsFolder          = ".uploads"
 	VersionsFolder                  = ".versions"
 	FolderMimeType                  = "httpd/unix-directory"
+	DirectoryMimeType               = "application/x-directory"
 )

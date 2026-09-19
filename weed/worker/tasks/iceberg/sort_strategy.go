@@ -13,6 +13,9 @@ import (
 type compactionRewritePlan struct {
 	strategy   string
 	sortFields []compactionSortField
+	// Carried on the plan so the merge does not need the whole Config.
+	bufferRows int64
+	spillDir   string
 }
 
 type compactionSortField struct {
@@ -29,6 +32,16 @@ func resolveCompactionRewritePlan(config Config, meta table.Metadata) (*compacti
 	if strategy == defaultRewriteStrategy {
 		return &compactionRewritePlan{strategy: defaultRewriteStrategy}, nil
 	}
+	// "auto" sorts tables that declare a usable sort order and bin-packs the
+	// rest, so an unsorted table is not an error the way an explicit "sort" is.
+	if strategy == rewriteStrategyAuto {
+		sortFields, err := resolveCompactionSortFields(meta)
+		if err != nil {
+			glog.V(2).Infof("iceberg compact: auto strategy falling back to binpack: %v", err)
+			return &compactionRewritePlan{strategy: defaultRewriteStrategy}, nil
+		}
+		return newSortPlan(config, sortFields), nil
+	}
 	if strategy != "sort" {
 		return nil, fmt.Errorf("unsupported rewrite strategy %q", config.RewriteStrategy)
 	}
@@ -42,10 +55,18 @@ func resolveCompactionRewritePlan(config Config, meta table.Metadata) (*compacti
 		return nil, err
 	}
 
+	return newSortPlan(config, sortFields), nil
+}
+
+// newSortPlan pairs the resolved sort fields with the settings the sorted
+// merge needs while writing.
+func newSortPlan(config Config, sortFields []compactionSortField) *compactionRewritePlan {
 	return &compactionRewritePlan{
-		strategy:   strategy,
+		strategy:   "sort",
 		sortFields: sortFields,
-	}, nil
+		bufferRows: config.SortBufferRows,
+		spillDir:   config.SortSpillDir,
+	}
 }
 
 var errUnsupportedTableSortOrder = fmt.Errorf("unsupported table sort order")
@@ -63,20 +84,20 @@ func resolveCompactionSortFields(meta table.Metadata) ([]compactionSortField, er
 	schema := meta.CurrentSchema()
 	seen := make(map[string]struct{})
 	fields := make([]compactionSortField, 0, sortOrder.Len())
-	for sortField := range sortOrder.Fields() {
+	for _, sortField := range sortOrder.Fields() {
 		if _, ok := sortField.Transform.(iceberg.IdentityTransform); !ok {
 			return nil, errUnsupportedTableSortOrder
 		}
 
-		field, ok := schema.FindFieldByID(sortField.SourceID)
+		field, ok := schema.FindFieldByID(sortField.SourceID())
 		if !ok {
-			return nil, fmt.Errorf("table sort field %d not found in schema", sortField.SourceID)
+			return nil, fmt.Errorf("table sort field %d not found in schema", sortField.SourceID())
 		}
 		if _, ok := field.Type.(iceberg.PrimitiveType); !ok {
 			return nil, fmt.Errorf("table sort field %q is not a primitive column", field.Name)
 		}
 
-		columnPath, ok := schema.FindColumnName(sortField.SourceID)
+		columnPath, ok := schema.FindColumnName(sortField.SourceID())
 		if !ok {
 			columnPath = field.Name
 		}

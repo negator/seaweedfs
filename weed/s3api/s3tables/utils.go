@@ -15,17 +15,25 @@ import (
 
 const (
 	bucketNamePatternStr     = `[a-z0-9-]+`
-	tableNamespacePatternStr = `[a-z0-9_.]+`
-	tableNamePatternStr      = `[a-z0-9_]+`
+	tableNamespacePatternStr = `[a-z0-9_.-]+`
+	tableNamePatternStr      = `[a-z0-9_-]+`
 )
 
 const (
 	tableObjectRootDirName = ".objects"
 )
 
+// ARNPartitionPatternStr matches any AWS partition, not just the commercial
+// one: aws-cn and aws-us-gov ARNs are valid and must reach the handlers.
+const ARNPartitionPatternStr = `aws[-a-z0-9]*`
+
+// ARNPrefixPatternStr is the leading, partition-tolerant part of every S3
+// Tables ARN. The HTTP router shares it so routes and parsing agree.
+const ARNPrefixPatternStr = `arn:` + ARNPartitionPatternStr + `:s3tables`
+
 var (
-	bucketARNPattern = regexp.MustCompile(`^arn:aws:s3tables:[^:]*:[^:]*:bucket/(` + bucketNamePatternStr + `)$`)
-	tableARNPattern  = regexp.MustCompile(`^arn:aws:s3tables:[^:]*:[^:]*:bucket/(` + bucketNamePatternStr + `)/table/(` + tableNamespacePatternStr + `)/(` + tableNamePatternStr + `)$`)
+	bucketARNPattern = regexp.MustCompile(`^` + ARNPrefixPatternStr + `:[^:]*:[^:]*:bucket/(` + bucketNamePatternStr + `)$`)
+	tableARNPattern  = regexp.MustCompile(`^` + ARNPrefixPatternStr + `:[^:]*:[^:]*:bucket/(` + bucketNamePatternStr + `)/table/(` + tableNamespacePatternStr + `)/(` + tableNamePatternStr + `)$`)
 	tagPattern       = regexp.MustCompile(`^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`)
 )
 
@@ -48,6 +56,11 @@ func parseBucketNameFromARN(arn string) (string, error) {
 // ParseBucketNameFromARN is a wrapper to validate bucket ARN for other packages.
 func ParseBucketNameFromARN(arn string) (string, error) {
 	return parseBucketNameFromARN(arn)
+}
+
+// IsValidBucketName is a wrapper to validate a table bucket name for other packages.
+func IsValidBucketName(name string) bool {
+	return isValidBucketName(name)
 }
 
 // parseTableFromARN extracts bucket name, namespace, and table name from ARN
@@ -97,6 +110,74 @@ func GetTablePath(bucketName, namespace, tableName string) string {
 	return path.Join(TablesPath, bucketName, namespace, tableName)
 }
 
+// TableDataDirFromMetadataLocation maps a table's s3:// metadata location to the
+// filer directory holding its data. A renamed table is catalog-only, so its data
+// stays at the original location while its catalog entry moves; this lets a drop
+// purge the real data instead of the now-empty catalog path.
+func TableDataDirFromMetadataLocation(metadataLocation string) string {
+	loc := strings.TrimSuffix(metadataLocation, "/")
+	if idx := strings.LastIndex(loc, "/metadata/"); idx != -1 {
+		loc = loc[:idx]
+	}
+	loc = strings.TrimPrefix(loc, "s3://")
+	if loc == "" {
+		return ""
+	}
+	return path.Join(TablesPath, loc)
+}
+
+// ValidateMetadataLocation checks that an s3:// metadata location stays within
+// the authorized table bucket and rejects traversal segments that path.Join
+// would collapse to escape the bucket directory. Empty locations are allowed
+// (the catalog derives one). A non-empty location must include a table path so
+// its metadata directory is table-specific, not shared at the bucket level.
+func ValidateMetadataLocation(metadataLocation, bucketName string) error {
+	if metadataLocation == "" {
+		return nil
+	}
+	bucket, tablePath, err := parseS3Location(metadataLocation)
+	if err != nil {
+		return err
+	}
+	if bucket != bucketName {
+		return fmt.Errorf("metadata location must be within bucket %s", bucketName)
+	}
+	hasSegment := false
+	for _, segment := range strings.Split(tablePath, "/") {
+		if segment == "" {
+			continue
+		}
+		if segment == "." || segment == ".." || strings.ContainsAny(segment, "\\\x00") {
+			return fmt.Errorf("invalid metadata location path")
+		}
+		hasSegment = true
+	}
+	if !hasSegment {
+		return fmt.Errorf("metadata location must include a table path")
+	}
+	return nil
+}
+
+func parseS3Location(location string) (bucket, tablePath string, err error) {
+	if !strings.HasPrefix(location, "s3://") {
+		return "", "", fmt.Errorf("unsupported location: %s", location)
+	}
+	trimmed := strings.TrimPrefix(location, "s3://")
+	trimmed = strings.TrimSuffix(trimmed, "/")
+	if trimmed == "" {
+		return "", "", fmt.Errorf("invalid location: %s", location)
+	}
+	parts := strings.SplitN(trimmed, "/", 2)
+	bucket = parts[0]
+	if bucket == "" {
+		return "", "", fmt.Errorf("invalid location bucket: %s", location)
+	}
+	if len(parts) == 2 {
+		tablePath = parts[1]
+	}
+	return bucket, tablePath, nil
+}
+
 // GetTableObjectRootDir returns the root path for table bucket object storage
 func GetTableObjectRootDir() string {
 	return path.Join(TablesPath, tableObjectRootDirName)
@@ -113,6 +194,7 @@ type tableBucketMetadata struct {
 	Name           string    `json:"name"`
 	CreatedAt      time.Time `json:"createdAt"`
 	OwnerAccountID string    `json:"ownerAccountId"`
+	Format         string    `json:"format,omitempty"`
 }
 
 // namespaceMetadata stores metadata for a namespace
@@ -144,6 +226,19 @@ func IsTableBucketEntry(entry *filer_pb.Entry) bool {
 	}
 	_, ok := entry.Extended[ExtendedKeyTableBucket]
 	return ok
+}
+
+// EntryType returns the entry-type marker for a catalog entry. Tables and views
+// share the same on-disk layout; the marker distinguishes them. An absent marker
+// means table for back-compat.
+func EntryType(extended map[string][]byte) string {
+	if extended == nil {
+		return EntryTypeTable
+	}
+	if v, ok := extended[ExtendedKeyEntryType]; ok && len(v) > 0 {
+		return string(v)
+	}
+	return EntryTypeTable
 }
 
 // Utility functions
@@ -244,7 +339,30 @@ func BuildTableARN(region, accountID, bucketName, namespace, tableName string) (
 }
 
 func buildARN(region, accountID, resourcePath string) string {
-	return fmt.Sprintf("arn:aws:s3tables:%s:%s:%s", region, accountID, resourcePath)
+	return fmt.Sprintf("arn:%s:s3tables:%s:%s:%s", arnPartitionForRegion(region), region, accountID, resourcePath)
+}
+
+// arnPartitionForRegion returns the ARN partition a region belongs to, so an
+// ARN this handler emits round-trips through a client in that partition.
+func arnPartitionForRegion(region string) string {
+	switch {
+	case strings.HasPrefix(region, "cn-"):
+		return "aws-cn"
+	case strings.HasPrefix(region, "us-gov-"):
+		return "aws-us-gov"
+	case strings.HasPrefix(region, "us-iso-"):
+		return "aws-iso"
+	case strings.HasPrefix(region, "us-isob-"):
+		return "aws-iso-b"
+	case strings.HasPrefix(region, "eu-isoe-"):
+		return "aws-iso-e"
+	case strings.HasPrefix(region, "us-isof-"):
+		return "aws-iso-f"
+	case strings.HasPrefix(region, "eusc-"):
+		return "aws-eusc"
+	default:
+		return "aws"
+	}
 }
 
 // ValidateTags validates tags for S3 Tables.
@@ -315,12 +433,12 @@ func validateNamespacePart(name string) error {
 		return fmt.Errorf("namespace name must end with a letter or digit")
 	}
 
-	// Allowed characters: a-z, 0-9, _
+	// Allowed characters: a-z, 0-9, _, - (hyphen interior; start/end checked above)
 	for _, ch := range name {
-		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' {
+		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' {
 			continue
 		}
-		return fmt.Errorf("invalid namespace name: only 'a-z', '0-9', and '_' are allowed")
+		return fmt.Errorf("invalid namespace name: only 'a-z', '0-9', '_', and '-' are allowed")
 	}
 
 	// Reserved prefix
@@ -382,12 +500,12 @@ func validateTableName(name string) (string, error) {
 		return "", fmt.Errorf("table name must start with a letter or digit")
 	}
 
-	// Allowed characters: a-z, 0-9, _
+	// Allowed characters: a-z, 0-9, _, - (start checked above)
 	for _, ch := range name {
-		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' {
+		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' {
 			continue
 		}
-		return "", fmt.Errorf("invalid table name: only 'a-z', '0-9', and '_' are allowed")
+		return "", fmt.Errorf("invalid table name: only 'a-z', '0-9', '_', and '-' are allowed")
 	}
 	return name, nil
 }

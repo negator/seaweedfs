@@ -48,6 +48,7 @@ type MasterOption struct {
 	Master                     pb.ServerAddress
 	MetaFolder                 string
 	VolumeSizeLimitMB          uint32
+	FileSizeLimitMB            int
 	VolumePreallocate          bool
 	MaxParallelVacuumPerServer int
 	// PulseSeconds            int
@@ -81,6 +82,9 @@ type MasterServer struct {
 	grpcDialOption grpc.DialOption
 
 	topologyIdGenLock sync.Mutex
+
+	// masters currently being admitted into the raft quorum, keyed by raft id
+	raftPeerAdmissions sync.Map
 
 	MasterClient *wdclient.MasterClient
 
@@ -169,6 +173,8 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 	ms.guard = security.NewGuard(append(ms.option.WhiteList, whiteList...), signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
 
 	handleStaticResources2(r)
+	r.HandleFunc("/healthz", requestIDMiddleware(ms.healthzHandler)).Methods(http.MethodGet, http.MethodHead)
+	r.HandleFunc("/readyz", requestIDMiddleware(ms.readyzHandler)).Methods(http.MethodGet, http.MethodHead)
 	r.HandleFunc("/", ms.proxyToLeader(requestIDMiddleware(ms.uiStatusHandler)))
 	r.HandleFunc("/ui/index.html", requestIDMiddleware(ms.uiStatusHandler))
 	if !ms.option.DisableHttp {
@@ -206,6 +212,32 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 
 	stats.MasterStartTimeSeconds.Set(float64(time.Now().Unix()))
 	return ms
+}
+
+func (ms *MasterServer) healthzHandler(w http.ResponseWriter, r *http.Request) {
+	// Liveness: process is alive. Keep this fast and simple.
+	w.WriteHeader(http.StatusOK)
+}
+
+func (ms *MasterServer) readyzHandler(w http.ResponseWriter, r *http.Request) {
+	// Readiness: check we can serve traffic. Answer from what raft knows now
+	// rather than waiting out an election, so the probe's own timeout decides.
+	leader, err := ms.Topo.MaybeLeader()
+	if err != nil || leader == "" {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	if ms.option.Master.Equals(leader) {
+		isLocked, err := ms.Topo.IsChildLocked()
+		if err != nil {
+			glog.Errorf("readyzHandler: %+v", err)
+		}
+		if isLocked {
+			w.WriteHeader(http.StatusLocked)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (ms *MasterServer) SetRaftServer(raftServer *RaftServer) {
@@ -442,6 +474,11 @@ func processEachCmd(reg *regexp.Regexp, line string, commandEnv *shell.CommandEn
 				continue
 			}
 			glog.V(0).Infof("executing: %s %v", cmd, args)
+			// noLock belongs to the invocation that set it, not to the
+			// CommandEnv this loop reuses for every line of the script. Without
+			// this, a dry run earlier in the script leaves the mutations after
+			// it unlocked.
+			commandEnv.SetNoLock(false)
 			if err := c.Do(args, commandEnv, os.Stdout); err != nil {
 				glog.V(0).Infof("error: %v", err)
 			}
@@ -472,64 +509,139 @@ func (ms *MasterServer) createSequencer(option *MasterOption) sequence.Sequencer
 }
 
 func (ms *MasterServer) OnPeerUpdate(update *master_pb.ClusterNodeUpdate, startFrom time.Time) {
-	ms.Topo.RaftServerAccessLock.RLock()
-	defer ms.Topo.RaftServerAccessLock.RUnlock()
-
-	if update.NodeType != cluster.MasterType || ms.Topo.HashicorpRaft == nil {
+	if update.NodeType != cluster.MasterType {
 		return
 	}
 	glog.V(4).Infof("OnPeerUpdate: %+v", update)
 
 	peerAddress := pb.ServerAddress(update.Address)
-	peerName := raftServerID(peerAddress)
-	if ms.Topo.HashicorpRaft.State() != hashicorpRaft.Leader {
+	if update.IsAdd {
+		ms.AdmitRaftPeer(peerAddress)
 		return
 	}
-	if update.IsAdd {
-		raftServerFound := false
-		for _, server := range ms.Topo.HashicorpRaft.GetConfiguration().Configuration().Servers {
-			if string(server.ID) == peerName {
-				raftServerFound = true
-			}
-		}
-		if !raftServerFound {
-			glog.V(0).Infof("adding new raft server: %s", peerName)
-			ms.Topo.HashicorpRaft.AddVoter(
-				hashicorpRaft.ServerID(peerName),
-				hashicorpRaft.ServerAddress(peerAddress.ToGrpcAddress()), 0, 0)
-		}
-	} else {
-		pb.WithMasterClient(false, peerAddress, ms.grpcDialOption, true, func(client master_pb.SeaweedClient) error {
-			ctx, cancel := context.WithTimeout(context.TODO(), 15*time.Second)
-			defer cancel()
-			if _, err := client.Ping(ctx, &master_pb.PingRequest{Target: string(peerAddress), TargetType: cluster.MasterType}); err != nil {
-				glog.V(0).Infof("master %s didn't respond to pings. remove raft server", peerName)
-				if err := ms.MasterClient.WithClient(false, func(client master_pb.SeaweedClient) error {
-					_, err := client.RaftRemoveServer(context.Background(), &master_pb.RaftRemoveServerRequest{
-						Id:    peerName,
-						Force: false,
-					})
-					return err
-				}); err != nil {
-					glog.Warningf("failed removing old raft server: %v", err)
-					return err
-				}
-			} else {
-				glog.V(0).Infof("master %s successfully responded to ping", peerName)
-			}
-			return nil
-		})
+
+	ms.Topo.RaftServerAccessLock.RLock()
+	defer ms.Topo.RaftServerAccessLock.RUnlock()
+
+	// goraft rebuilds its peer set from -peers on every start, so a departed
+	// master is already out of the list there and would come back on the next
+	// restart anyway; only hashicorp raft carries membership across restarts.
+	if ms.Topo.HashicorpRaft == nil || ms.Topo.HashicorpRaft.State() != hashicorpRaft.Leader {
+		return
 	}
+	// A master that is merely down is still a member: -peers is what declares
+	// membership, and updatePeers reconciles the configuration against it on
+	// every leadership change. Evicting one here would shrink the quorum behind
+	// the operator's back, and a restart then races the eviction — the master
+	// gets re-admitted, the removal lands after it, and it is left out of the
+	// configuration with nobody left to vote it back in.
+	for _, peer := range ms.MasterClient.GetMasters(context.Background()) {
+		if peer.ToHttpAddress() == peerAddress.ToHttpAddress() {
+			return
+		}
+	}
+
+	peerName := raftServerID(peerAddress)
+	pb.WithMasterClient(context.Background(), false, peerAddress, ms.grpcDialOption, true, func(client master_pb.SeaweedClient) error {
+		ctx, cancel := context.WithTimeout(context.TODO(), 15*time.Second)
+		defer cancel()
+		if _, err := client.Ping(ctx, &master_pb.PingRequest{Target: string(peerAddress), TargetType: cluster.MasterType}); err != nil {
+			glog.V(0).Infof("master %s didn't respond to pings. remove raft server", peerName)
+			// We are the leader here, so drop the dead peer through the local
+			// raft handle instead of dialing our own RaftRemoveServer RPC.
+			if err := ms.Topo.HashicorpRaft.RemoveServer(hashicorpRaft.ServerID(peerName), 0, 0).Error(); err != nil {
+				glog.Warningf("failed removing old raft server: %v", err)
+				return err
+			}
+		} else {
+			glog.V(0).Infof("master %s successfully responded to ping", peerName)
+		}
+		return nil
+	})
+}
+
+// AdmitRaftPeer pulls a master into the raft quorum, if we are the leader and
+// do not have it yet. A master that starts with no raft state cannot campaign
+// under either implementation, so this is its only way in.
+func (ms *MasterServer) AdmitRaftPeer(peerAddress pb.ServerAddress) {
+	if peerAddress.ToHttpAddress() == ms.option.Master.ToHttpAddress() {
+		return
+	}
+
+	peerName, ok := ms.missingRaftPeerName(peerAddress)
+	if !ok {
+		return
+	}
+	if _, alreadyAdmitting := ms.raftPeerAdmissions.LoadOrStore(peerName, struct{}{}); alreadyAdmitting {
+		return
+	}
+	glog.V(0).Infof("adding new raft server: %s", peerName)
+	// The join commits through raft, which waits on the other peers, so keep it
+	// off the caller: this runs on the peer update stream and on the grpc
+	// handler that a joining master is still blocked in.
+	go func() {
+		defer ms.raftPeerAdmissions.Delete(peerName)
+		if err := ms.raftAddServer(peerName, peerAddress.ToGrpcAddress(), true); err != nil {
+			glog.Warningf("failed adding raft server %s: %v", peerName, err)
+		}
+	}()
+}
+
+// missingRaftPeerName returns the raft id to admit peerAddress under, and
+// whether this master is the leader and is missing that peer.
+func (ms *MasterServer) missingRaftPeerName(peerAddress pb.ServerAddress) (string, bool) {
+	ms.Topo.RaftServerAccessLock.RLock()
+	defer ms.Topo.RaftServerAccessLock.RUnlock()
+
+	if ms.Topo.RaftServer != nil {
+		if ms.Topo.RaftServer.State() != raft.Leader {
+			return "", false
+		}
+		// Peers are keyed by the name a master calls itself, which carries the
+		// grpc port; match on the http address so a peer already known under
+		// another spelling is not added twice.
+		for name := range ms.Topo.RaftServer.Peers() {
+			if pb.ServerAddress(name).ToHttpAddress() == peerAddress.ToHttpAddress() {
+				return "", false
+			}
+		}
+		return string(peerAddress), true
+	}
+
+	if ms.Topo.HashicorpRaft == nil || ms.Topo.HashicorpRaft.State() != hashicorpRaft.Leader {
+		return "", false
+	}
+	peerName := raftServerID(peerAddress)
+	for _, server := range ms.Topo.HashicorpRaft.GetConfiguration().Configuration().Servers {
+		if string(server.ID) == peerName {
+			return "", false
+		}
+	}
+	return peerName, true
 }
 
 func (ms *MasterServer) Shutdown() {
-	if ms.Topo == nil || ms.Topo.HashicorpRaft == nil {
+	if ms.Topo == nil {
 		return
 	}
-	if ms.Topo.HashicorpRaft.State() == hashicorpRaft.Leader {
-		ms.Topo.HashicorpRaft.LeadershipTransfer()
+	ms.Topo.RaftServerAccessLock.RLock()
+	raftServer := ms.Topo.RaftServer
+	hashRaft := ms.Topo.HashicorpRaft
+	ms.Topo.RaftServerAccessLock.RUnlock()
+
+	if hashRaft != nil {
+		if hashRaft.State() == hashicorpRaft.Leader {
+			hashRaft.LeadershipTransfer()
+		}
+		hashRaft.Shutdown()
 	}
-	ms.Topo.HashicorpRaft.Shutdown()
+	// Stop the goraft server too. Without this, the raft event loop
+	// goroutine (leaderLoop/followerLoop) keeps running after the master
+	// shuts down, leaking goroutines across test runs and occasionally
+	// processing stale events that trigger safety assertions.
+	if raftServer != nil {
+		raftServer.Stop()
+	}
 }
 
 func (ms *MasterServer) Reload() {
@@ -539,5 +651,11 @@ func (ms *MasterServer) Reload() {
 	v := util.GetViper()
 	ms.guard.UpdateWhiteList(append(ms.option.WhiteList,
 		util.StringSplit(v.GetString("guard.white_list"), ",")...),
+	)
+	ms.guard.UpdateSigningKeys(
+		v.GetString("jwt.signing.key"),
+		v.GetInt("jwt.signing.expires_after_seconds"),
+		v.GetString("jwt.signing.read.key"),
+		v.GetInt("jwt.signing.read.expires_after_seconds"),
 	)
 }

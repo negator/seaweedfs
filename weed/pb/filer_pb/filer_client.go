@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,7 +26,11 @@ type FilerClient interface {
 	GetDataCenter() string
 }
 
-func GetEntry(ctx context.Context, filerClient FilerClient, fullFilePath util.FullPath) (entry *Entry, err error) {
+// GetEntry returns the entry together with the log position the filer stamped
+// for it and the signature of the filer that stamped it — positions are only
+// comparable within one filer's clock. Both are zero against a filer that does
+// not stamp them.
+func GetEntry(ctx context.Context, filerClient FilerClient, fullFilePath util.FullPath) (entry *Entry, logTsNs int64, logSignature int32, err error) {
 
 	dir, name := fullFilePath.DirAndName()
 
@@ -49,11 +54,18 @@ func GetEntry(ctx context.Context, filerClient FilerClient, fullFilePath util.Fu
 		}
 
 		entry = resp.Entry
+		logTsNs = resp.LogTsNs
+		logSignature = resp.LogSignature
 		return nil
 	})
 
 	return
 }
+
+// ListSnapshotTsNsTrailerKey carries the listing snapshot in the ListEntries
+// stream trailer, so empty listings can convey it without a response older
+// consumers would mistake for an entry.
+const ListSnapshotTsNsTrailerKey = "sw-list-snapshot-ts-ns"
 
 type EachEntryFunction func(entry *Entry, isLast bool) error
 
@@ -79,8 +91,14 @@ func ReadDirAllEntriesWithSnapshot(ctx context.Context, filerClient FilerClient,
 
 	for counter == paginationLimit {
 		counter = 0
+		lastStartFrom := startFrom
 		if _, err = doListWithSnapshot(ctx, filerClient, fullDirPath, prefix, counterFunc, startFrom, false, paginationLimit, snapshotTsNs); err != nil {
 			return snapshotTsNs, err
+		}
+		// A full page that ends on the name it started from would loop forever;
+		// a store whose ordering does not advance past the cursor causes this.
+		if counter == paginationLimit && startFrom == lastStartFrom {
+			return snapshotTsNs, fmt.Errorf("list %s: pagination stuck at %q", fullDirPath, startFrom)
 		}
 	}
 
@@ -127,6 +145,7 @@ func DoSeaweedListWithSnapshot(ctx context.Context, client SeaweedFilerClient, f
 		Limit:              redLimit,
 		InclusiveStartFrom: inclusive,
 		SnapshotTsNs:       snapshotTsNs,
+		OmitChunks:         ChunksOmitted(ctx),
 	}
 
 	// Preserve the caller-requested snapshot so pagination uses the same
@@ -142,7 +161,9 @@ func DoSeaweedListWithSnapshot(ctx context.Context, client SeaweedFilerClient, f
 	defer cancel()
 	stream, err := client.ListEntries(ctx, request)
 	if err != nil {
-		return actualSnapshotTsNs, fmt.Errorf("list %s: %v", fullDirPath, err)
+		// fullDirPath is the caller's bucket and prefix; keep the status the filer
+		// sent so a retry is decided on that rather than on this message
+		return actualSnapshotTsNs, fmt.Errorf("list %s: %w", fullDirPath, err)
 	}
 
 	var prevEntry *Entry
@@ -154,6 +175,16 @@ func DoSeaweedListWithSnapshot(ctx context.Context, client SeaweedFilerClient, f
 				if prevEntry != nil {
 					if err := fn(prevEntry, true); err != nil {
 						return actualSnapshotTsNs, err
+					}
+				}
+				// An empty listing carries no in-band snapshot (a snapshot-only
+				// response would be read as an entry by older consumers); newer
+				// filers send it in the stream trailer instead.
+				if actualSnapshotTsNs == 0 {
+					if values := stream.Trailer().Get(ListSnapshotTsNsTrailerKey); len(values) > 0 {
+						if trailerTsNs, parseErr := strconv.ParseInt(values[0], 10, 64); parseErr == nil {
+							actualSnapshotTsNs = trailerTsNs
+						}
 					}
 				}
 				break
@@ -171,7 +202,7 @@ func DoSeaweedListWithSnapshot(ctx context.Context, client SeaweedFilerClient, f
 		}
 		prevEntry = resp.Entry
 		count++
-		if count > int(limit) && limit != 0 {
+		if limit != 0 && uint64(count) > uint64(limit) {
 			prevEntry = nil
 		}
 	}
@@ -238,7 +269,7 @@ func DoMkdir(ctx context.Context, client SeaweedFilerClient, parentDirectoryPath
 	glog.V(1).InfofCtx(ctx, "mkdir: %v", request)
 	if err := CreateEntry(ctx, client, request); err != nil {
 		glog.V(0).InfofCtx(ctx, "mkdir %v: %v", request, err)
-		return fmt.Errorf("mkdir %s/%s: %v", parentDirectoryPath, dirName, err)
+		return fmt.Errorf("mkdir %s/%s: %w", parentDirectoryPath, dirName, err)
 	}
 
 	return nil
@@ -272,7 +303,7 @@ func MkFile(ctx context.Context, filerClient FilerClient, parentDirectoryPath st
 		glog.V(1).InfofCtx(ctx, "create file: %s/%s", parentDirectoryPath, fileName)
 		if err := CreateEntry(ctx, client, request); err != nil {
 			glog.V(0).InfofCtx(ctx, "create file %v:%v", request, err)
-			return fmt.Errorf("create file %s/%s: %v", parentDirectoryPath, fileName, err)
+			return fmt.Errorf("create file %s/%s: %w", parentDirectoryPath, fileName, err)
 		}
 
 		return nil

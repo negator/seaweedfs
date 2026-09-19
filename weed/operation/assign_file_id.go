@@ -38,6 +38,9 @@ type AssignResult struct {
 	Error     string              `json:"error,omitempty"`
 	Auth      security.EncodedJwt `json:"auth,omitempty"`
 	Replicas  []Location          `json:"replicas,omitempty"`
+	// Fsync carries the storage rule's fsync decision for the assigned path,
+	// so the upload request to the volume server can set ?fsync=true.
+	Fsync bool `json:"fsync,omitempty"`
 }
 
 func Assign(ctx context.Context, masterFn GetMasterFn, grpcDialOption grpc.DialOption, primaryRequest *VolumeAssignRequest, alternativeRequests ...*VolumeAssignRequest) (*AssignResult, error) {
@@ -74,7 +77,9 @@ func Assign(ctx context.Context, masterFn GetMasterFn, grpcDialOption grpc.DialO
 					return false
 				}
 				switch st.Code() {
-				case codes.Unavailable:
+				case codes.Unavailable, codes.ResourceExhausted:
+					// ResourceExhausted: the master is shedding because volume growth
+					// is in flight; retry so we pick up the new volume once it lands.
 					return true
 				case codes.Canceled, codes.DeadlineExceeded:
 					// A stale cached gRPC channel (e.g., master restart behind
@@ -91,7 +96,10 @@ func Assign(ctx context.Context, masterFn GetMasterFn, grpcDialOption grpc.DialO
 				// Per-attempt timeout to prevent a single slow RPC from consuming the entire retry budget
 				attemptCtx, attemptCancel := context.WithTimeout(deadlineCtx, 10*time.Second)
 				defer attemptCancel()
-				return WithMasterServerClient(false, masterFn(attemptCtx), grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
+				// Pass attemptCtx so its expiry is not mistaken for a dead shared
+				// connection: invalidating it would cancel every other in-flight
+				// assign with "the client connection is closing".
+				return WithMasterServerClient(attemptCtx, false, masterFn(attemptCtx), grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
 					req := &master_pb.AssignRequest{
 						Count:               request.Count,
 						Replication:         request.Replication,
@@ -151,7 +159,7 @@ func Assign(ctx context.Context, masterFn GetMasterFn, grpcDialOption grpc.DialO
 
 func LookupJwt(master pb.ServerAddress, grpcDialOption grpc.DialOption, fileId string) (token security.EncodedJwt) {
 
-	WithMasterServerClient(false, master, grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
+	WithMasterServerClient(context.Background(), false, master, grpcDialOption, func(masterClient master_pb.SeaweedClient) error {
 
 		resp, grpcErr := masterClient.LookupVolume(context.Background(), &master_pb.LookupVolumeRequest{
 			VolumeOrFileIds: []string{fileId},

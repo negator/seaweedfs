@@ -13,6 +13,11 @@ import (
 type EncodedJwt string
 type SigningKey []byte
 
+// BearerPrefix is the RFC 6750 Authorization header scheme prefix for bearer
+// tokens. Used when constructing "Authorization: Bearer <token>" headers; the
+// scheme name itself is matched case-insensitively when parsing (see GetJwt).
+const BearerPrefix = "Bearer "
+
 // SeaweedFileIdClaims is created by Master server(s) and consumed by Volume server(s),
 // restricting the access this JWT allows to only a single file.
 type SeaweedFileIdClaims struct {
@@ -26,6 +31,9 @@ type SeaweedFileIdClaims struct {
 type SeaweedFilerClaims struct {
 	AllowedPrefixes []string `json:"allowed_prefixes,omitempty"`
 	AllowedMethods  []string `json:"allowed_methods,omitempty"`
+	// SessionId is present only on STS session tokens; a token carrying it is
+	// an S3 session credential, not a filer API credential.
+	SessionId string `json:"sid,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -39,6 +47,9 @@ type SeaweedFilerClaims struct {
 // RegisteredClaims. Extra JSON fields in the payload are silently ignored by
 // encoding/json, which is the desired behaviour here (forward-compat).
 type SeaweedFilerAdminClaims struct {
+	// SessionId is present only on STS session tokens; a token carrying it is
+	// an S3 session credential, not a filer admin credential.
+	SessionId string `json:"sid,omitempty"`
 	jwt.RegisteredClaims
 }
 

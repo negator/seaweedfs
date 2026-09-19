@@ -13,6 +13,9 @@ service SeaweedFiler {
     rpc LookupDirectoryEntry (LookupDirectoryEntryRequest) returns (LookupDirectoryEntryResponse) {
     }
 
+    rpc LookupDirectoryEntries (LookupDirectoryEntriesRequest) returns (LookupDirectoryEntriesResponse) {
+    }
+
     rpc ListEntries (ListEntriesRequest) returns (stream ListEntriesResponse) {
     }
 
@@ -78,6 +81,11 @@ service SeaweedFiler {
     rpc SubscribeLocalMetadata (SubscribeMetadataRequest) returns (stream SubscribeMetadataResponse) {
     }
 
+    // List the metadata subscribers currently connected to this filer
+    // (FUSE mounts, S3, filer.sync, peer filers, ...).
+    rpc ListMetadataSubscribers (ListMetadataSubscribersRequest) returns (ListMetadataSubscribersResponse) {
+    }
+
     rpc KvGet (KvGetRequest) returns (KvGetResponse) {
     }
 
@@ -116,6 +124,12 @@ message LookupDirectoryEntryRequest {
 
 message LookupDirectoryEntryResponse {
     Entry entry = 1;
+    // filer log position stamped before the entry read: every event at or
+    // below it is reflected in the returned entry
+    int64 log_ts_ns = 2;
+    // signature of the filer whose clock stamped log_ts_ns; positions are
+    // only comparable with events that filer logged
+    int32 log_signature = 3;
 }
 
 message ListEntriesRequest {
@@ -125,6 +139,10 @@ message ListEntriesRequest {
     bool inclusiveStartFrom = 4;
     uint32 limit = 5;
     int64 snapshot_ts_ns = 6;
+    // Leave the chunk list out of every entry in the response. The attributes
+    // still carry the file size, so a listing that only reads attributes can
+    // ask for this and skip the largest part of the payload.
+    bool omit_chunks = 7;
 }
 
 message ListEntriesResponse {
@@ -138,6 +156,9 @@ message RemoteEntry {
     string remote_e_tag = 3;
     int64 remote_mtime = 4;
     int64 remote_size = 5;
+    // unset when the remote listing does not report encodings (S3);
+    // empty when the remote object authoritatively has none
+    optional string remote_content_encoding = 6;
 }
 message Entry {
     string name = 1;
@@ -232,9 +253,11 @@ message CreateEntryRequest {
     repeated int32 signatures = 5;
     bool skip_check_parent_directory = 6;
     // Optional precondition evaluated against the current entry atomically with
-    // the write, under the filer's per-path lock. The caller must route the
-    // key's writes to this entry's owner filer for the check to be authoritative.
+    // the write, under the filer's per-path lock.
     WriteCondition condition = 7;
+    // Set on a create a filer forwarded to the entry's ring owner, so the owner
+    // applies it locally instead of forwarding again. Clients leave it unset.
+    bool is_moved = 8;
 }
 
 // WriteCondition is the precondition the filer evaluates against the existing
@@ -257,6 +280,7 @@ message WriteCondition {
         IF_MODIFIED_SINCE     = 6; // fail if present and mtime <= unix_time
         IF_EXTENDED_NOT_EQUAL = 7; // fail if present and extended[ext_key] == ext_value
         IF_EXTENDED_TIME_ELAPSED = 8; // fail if present and extended[ext_key] (unix seconds) is in the future
+        IF_CHUNKS_EQUAL       = 9; // fail unless the stored chunk fid multiset equals fids (absent entry = no chunks)
     }
     // Clause is one primitive comparison. IF_ETAG_MATCH holds when the current
     // entry's ETag equals any value in etags; IF_ETAG_NOT_MATCH holds when it
@@ -270,6 +294,11 @@ message WriteCondition {
     // clock). The caller composes these and, for governance-bypass, simply omits
     // the retention clause when the bypass is authorized — the filer makes no
     // authorization decision.
+    //
+    // IF_CHUNKS_EQUAL guards a chunk-preserving read-modify-write: the stored
+    // chunk fid set must still equal what the caller read, so a stale write
+    // cannot resurrect needles that a concurrent update already diffed away
+    // and queued for deletion. An empty fids list expects no chunks.
     message Clause {
         Kind kind = 1;
         repeated string etags = 2; // ETag set for IF_ETAG_* kinds
@@ -279,6 +308,7 @@ message WriteCondition {
         string ext_value = 6;      // blocking value for IF_EXTENDED_NOT_EQUAL
         string gate_key = 7;       // IF_EXTENDED_TIME_ELAPSED: only enforce when extended[gate_key] == gate_value
         string gate_value = 8;     // gate value (e.g. retention mode COMPLIANCE for governance bypass)
+        repeated string fids = 9;  // chunk fid strings for IF_CHUNKS_EQUAL
     }
     repeated Clause clauses = 1;   // all must hold (logical AND)
 }
@@ -320,6 +350,7 @@ message ObjectMutation {
     bool set_content = 10;                 // PATCH_EXTENDED: replace Entry.content with content
     bytes content = 11;                    // PATCH_EXTENDED: new Entry.content when set_content
     bool touch_mtime = 12;                 // PATCH_EXTENDED: set the entry's Mtime to now (e.g. a metadata-replace copy)
+    bool remove_empty_parent = 13;         // DELETE: also remove the parent directory when the delete leaves it empty (best-effort)
 }
 
 // Recompute re-derives a pointer entry (directory/name on the mutation) from the
@@ -430,6 +461,10 @@ message CreateEntryResponse {
     string error = 1;                          // kept for human readability + backward compat
     SubscribeMetadataResponse metadata_event = 2;
     FilerError error_code = 3;                 // machine-readable error code
+    // filer log position stamped under the path lock before the write:
+    // every event at or below it is reflected in the acknowledged state
+    int64 log_ts_ns = 4;
+    int32 log_signature = 5; // filer whose clock stamped log_ts_ns
 }
 
 message UpdateEntryRequest {
@@ -438,9 +473,17 @@ message UpdateEntryRequest {
     bool is_from_other_cluster = 3;
     repeated int32 signatures = 4;
     map<string, bytes> expected_extended = 5;
+    // Optional precondition evaluated against the current entry atomically with
+    // the write, under the filer's per-path lock. The caller must route the
+    // key's writes to this entry's owner filer for the check to be authoritative.
+    WriteCondition condition = 6;
 }
 message UpdateEntryResponse {
     SubscribeMetadataResponse metadata_event = 1;
+    // filer log position stamped under the path lock before the write:
+    // every event at or below it is reflected in the acknowledged state
+    int64 log_ts_ns = 2;
+    int32 log_signature = 3; // filer whose clock stamped log_ts_ns
 }
 
 message TouchAccessTimeRequest {
@@ -522,6 +565,10 @@ message AssignVolumeResponse {
     string replication = 7;
     string error = 8;
     Location location = 9;
+    repeated Location replicas = 10;
+    // fsync is the storage rule's fsync decision for the assigned path, so the
+    // client can carry it onto the volume server upload request.
+    bool fsync = 11;
 }
 
 message LookupVolumeRequest {
@@ -537,6 +584,7 @@ message Location {
     string public_url = 2;
     uint32 grpc_port = 3;
     string data_center = 4;
+    bool data_in_remote = 5;
 }
 message LookupVolumeResponse {
     map<string, Locations> locations_map = 1;
@@ -569,6 +617,9 @@ message StatisticsResponse {
     uint64 total_size = 4;
     uint64 used_size = 5;
     uint64 file_count = 6;
+    // sizes counting one copy of the data, as reported by the master
+    uint64 logical_total_size = 7;
+    uint64 logical_used_size = 8;
 }
 
 message PingRequest {
@@ -620,6 +671,23 @@ message SubscribeMetadataResponse {
     int64 ts_ns = 3;
     repeated SubscribeMetadataResponse events = 4; // batch of additional events (backlog catch-up)
     repeated LogFileChunkRef log_file_refs = 5;    // log file chunk refs for client direct-read
+    int64 flushed_ts_ns = 6; // local log-buffer flush watermark: everything at or below it is on disk
+}
+message ListMetadataSubscribersRequest {
+    repeated string client_types = 1; // optional filter by client type, e.g. "mount"; empty = all
+}
+message ListMetadataSubscribersResponse {
+    repeated MetadataSubscriber subscribers = 1;
+}
+message MetadataSubscriber {
+    string client_name = 1;     // "<type>@<address>"
+    string client_type = 2;     // e.g. "mount", "sw-vfs", "s3", "filer:<addr>"
+    string address = 3;         // client peer address
+    string path_prefix = 4;     // subscribed path prefix
+    int32 client_id = 5;
+    int32 client_epoch = 6;
+    int64 connected_at_ns = 7;
+    string filer_address = 8;   // the filer this subscriber is connected to
 }
 // A persisted log file that the client can read directly from volume servers.
 // The file format is: [4-byte size | protobuf LogEntry] repeated.
@@ -707,7 +775,8 @@ message FilerConf {
         string data_node = 11;
         uint32 max_file_name_length = 12;
         bool disable_chunk_deletion = 13;
-        bool worm = 14;
+        // unset inherits from the enclosing path rule, set overrides it
+        optional bool worm = 14;
         uint64 worm_grace_period_seconds = 15;
         uint64 worm_retention_time_seconds = 16;
     }
@@ -726,6 +795,10 @@ message CacheRemoteObjectToLocalClusterRequest {
 message CacheRemoteObjectToLocalClusterResponse {
     Entry entry = 1;
     SubscribeMetadataResponse metadata_event = 2;
+    // filer log position stamped before the entry read: every event at or
+    // below it is reflected in the returned entry
+    int64 log_ts_ns = 3;
+    int32 log_signature = 4; // filer whose clock stamped log_ts_ns
 }
 
 /////////////////////////
@@ -842,4 +915,41 @@ message MountInfo {
     string rack = 2;
     int64 last_seen_ns = 3;
     string data_center = 4;
+}
+
+// LookupDirectoryEntriesRequest batches independent exact-path lookups into
+// one bounded RPC. Results preserve this order. Empty batches and batches over
+// 4096 requests are rejected. Declared last to keep generated message indices
+// stable.
+message LookupDirectoryEntriesRequest {
+    repeated LookupDirectoryEntryRequest requests = 1;
+    // Cache callers may treat an Entry whose Volume the master no longer
+    // reports as a miss. A lookup the filer could not complete still marks the
+    // Entry with an error. Ordinary filesystem callers keep the fail-closed
+    // error in both cases.
+    bool unavailable_volume_is_miss = 2;
+}
+
+message LookupDirectoryEntryResult {
+    // found reports metadata presence. An error makes this item unusable even
+    // when entry is present, for example when a chunk volume cannot be located.
+    bool found = 1;
+    Entry entry = 2;
+    string error = 3;
+    // Per-entry read fence. Every filer event at or below this position is
+    // reflected in found/entry/error for this item.
+    int64 log_ts_ns = 4;
+    int32 log_signature = 5;
+}
+
+message LookupDirectoryEntriesResponse {
+    repeated LookupDirectoryEntryResult results = 1;
+    // One deduplicated location set for every volume referenced by returned
+    // Entry.chunks. A missing/unavailable volume has an empty Locations value
+    // and marks each affected result with an error.
+    map<string, Locations> locations_map = 2;
+    // Short-lived, exact-FID read capabilities. Direct data-plane clients must
+    // present the matching token to a Volume instead of treating a shared
+    // service credential as authority to read arbitrary needles.
+    map<string, string> read_auth = 3;
 }

@@ -6,12 +6,15 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
 	"github.com/seaweedfs/seaweedfs/weed/storage/idx"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
@@ -35,14 +38,22 @@ type EcVolume struct {
 	Shards                    []*EcVolumeShard
 	ShardLocations            map[ShardId][]pb.ServerAddress
 	ShardLocationsRefreshTime time.Time
-	ShardLocationsLock        sync.RWMutex
-	Version                   needle.Version
-	ecjFile                   *os.File
-	ecjFileAccessLock         sync.Mutex
-	diskType                  types.DiskType
-	datFileSize               int64
-	ExpireAtSec               uint64     //ec volume destroy time, calculated from the ec volume was created
-	ECContext                 *ECContext // EC encoding parameters
+	// ShardLocationsStale marks the map for a prompt re-check: a read that failed
+	// against a cached location has disproved what the map claims, and the normal
+	// freshness window is far too long to serve from a map known to be wrong.
+	ShardLocationsStale bool
+	ShardLocationsLock  sync.RWMutex
+	Version             needle.Version
+	ecjFile             *os.File
+	ecjFileAccessLock   sync.Mutex
+	diskType            types.DiskType
+	datFileSize         int64
+	ExpireAtSec         uint64     //ec volume destroy time, calculated from the ec volume was created
+	ECContext           *ECContext // EC encoding parameters
+
+	// EncodeTsNs is the encode time (unix nanos) loaded from .vif; reads carry it
+	// so a shard from a different encode run is rejected. 0 for pre-upgrade volumes.
+	EncodeTsNs int64
 
 	// ecjFileSize mirrors the on-disk size of the .ecj deletion journal and
 	// is maintained under ecjFileAccessLock. It is only used by IO helpers
@@ -59,6 +70,78 @@ type EcVolume struct {
 	// Seeded from .ecj in NewEcVolume and updated under deletedNeedlesLock.
 	deletedNeedlesLock sync.RWMutex
 	deletedNeedles     map[types.NeedleId]struct{}
+
+	// Bitrot checksum sidecar for the active generation (optional). bitrot is
+	// nil unless bitrotStatus == BitrotOn, and is loaded at mount. Guarded by
+	// bitrotLock.
+	bitrotLock   sync.RWMutex
+	bitrot       *volume_server_pb.EcBitrotProtection
+	bitrotStatus BitrotStatus
+
+	lastIoError        error
+	lastIoErrorCount   int32
+	ioErrorQuarantined bool
+	lastIoErrorLock    sync.RWMutex
+}
+
+func (ev *EcVolume) CheckReadWriteError(err error) {
+	if err == nil {
+		ev.clearIoError()
+		return
+	}
+	if errors.Is(err, syscall.EIO) {
+		ev.noteIoError(err)
+		return
+	}
+	ev.clearIoError()
+}
+
+func (ev *EcVolume) noteIoError(err error) {
+	ev.lastIoErrorLock.Lock()
+	defer ev.lastIoErrorLock.Unlock()
+	ev.lastIoError = err
+	ev.lastIoErrorCount++
+	stats.VolumeServerStorageIoErrorCounter.Inc()
+}
+
+func (ev *EcVolume) clearIoError() {
+	ev.lastIoErrorLock.Lock()
+	defer ev.lastIoErrorLock.Unlock()
+	ev.lastIoError = nil
+	ev.lastIoErrorCount = 0
+}
+
+func (ev *EcVolume) ResetIoErrorState() {
+	ev.lastIoErrorLock.Lock()
+	defer ev.lastIoErrorLock.Unlock()
+	ev.lastIoError = nil
+	ev.lastIoErrorCount = 0
+	ev.ioErrorQuarantined = false
+}
+
+func (ev *EcVolume) MarkIoQuarantined() {
+	ev.lastIoErrorLock.Lock()
+	defer ev.lastIoErrorLock.Unlock()
+	ev.ioErrorQuarantined = true
+}
+
+func (ev *EcVolume) GetIoErrorState() (error, int32, bool) {
+	ev.lastIoErrorLock.RLock()
+	defer ev.lastIoErrorLock.RUnlock()
+	return ev.lastIoError, ev.lastIoErrorCount, ev.ioErrorQuarantined
+}
+
+// statEcxSize returns the size of an .ecx file, os.ErrNotExist when it is absent
+// (or a directory), so the resolver can prefer a non-empty copy.
+func statEcxSize(path string) (int64, error) {
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return 0, statErr
+	}
+	if info.IsDir() {
+		return 0, os.ErrNotExist
+	}
+	return info.Size(), nil
 }
 
 func NewEcVolume(diskType types.DiskType, dir string, dirIdx string, collection string, vid needle.VolumeId) (ev *EcVolume, err error) {
@@ -76,25 +159,36 @@ func NewEcVolume(diskType types.DiskType, dir string, dirIdx string, collection 
 	// stream is indistinguishable from that empty case by file size alone;
 	// preventing such stubs is the receiver-side cleanup in writeToFile's
 	// job, not this open path.
-	ev.ecxActualDir = dirIdx
-	if ev.ecxFile, err = os.OpenFile(indexBaseFileName+".ecx", os.O_RDWR, 0644); err != nil {
-		if dirIdx != dir && os.IsNotExist(err) {
-			// fall back to data directory if idx directory does not have the .ecx file
-			firstErr := err
-			glog.V(1).Infof("ecx file not found at %s.ecx, falling back to %s.ecx", indexBaseFileName, dataBaseFileName)
-			if ev.ecxFile, err = os.OpenFile(dataBaseFileName+".ecx", os.O_RDWR, 0644); err != nil {
-				if os.IsNotExist(err) {
-					return nil, fmt.Errorf("open ecx index %s.ecx (fallback %s.ecx): %w", indexBaseFileName, dataBaseFileName, os.ErrNotExist)
-				}
-				return nil, fmt.Errorf("open ecx index %s.ecx: %v; fallback %s.ecx: %w", indexBaseFileName, firstErr, dataBaseFileName, err)
-			}
-			indexBaseFileName = dataBaseFileName
-			ev.ecxActualDir = dir
-		} else if os.IsNotExist(err) {
-			return nil, fmt.Errorf("cannot open ec volume index %s.ecx: %w", indexBaseFileName, os.ErrNotExist)
-		} else {
-			return nil, fmt.Errorf("cannot open ec volume index %s.ecx: %w", indexBaseFileName, err)
-		}
+	// Resolve the .ecx, preferring the copy co-located with the shard data on
+	// this disk — where a move or reconstruct leaves it — then the caller's
+	// index directory. That directory is either the shared -dir.idx dir or a
+	// sibling disk that owns the .ecx when this disk holds only a 0-byte stub
+	// left by an interrupted copy (#9212). A 0-byte .ecx is a legitimate empty
+	// index, so the local copy yields only to a *non-empty* copy elsewhere,
+	// never to a mere absence: prefer a non-empty .ecx local-first, then fall
+	// back to whichever exists at all.
+	localBaseFileName := dataBaseFileName
+	sharedBaseFileName := indexBaseFileName
+	localSize, localErr := statEcxSize(localBaseFileName + ".ecx")
+	sharedSize, sharedErr := int64(0), os.ErrNotExist
+	if dirIdx != dir {
+		sharedSize, sharedErr = statEcxSize(sharedBaseFileName + ".ecx")
+	}
+	switch {
+	case localErr == nil && localSize > 0:
+		indexBaseFileName, ev.ecxActualDir = localBaseFileName, dir
+	case sharedErr == nil && sharedSize > 0:
+		indexBaseFileName, ev.ecxActualDir = sharedBaseFileName, dirIdx
+		glog.V(1).Infof("ecx not local at %s.ecx, using %s.ecx", localBaseFileName, sharedBaseFileName)
+	case localErr == nil: // local exists but is a 0-byte empty index
+		indexBaseFileName, ev.ecxActualDir = localBaseFileName, dir
+	case sharedErr == nil: // only a 0-byte copy in the index dir
+		indexBaseFileName, ev.ecxActualDir = sharedBaseFileName, dirIdx
+	default:
+		return nil, fmt.Errorf("cannot open ec volume index %s.ecx (or %s.ecx): %w", localBaseFileName, sharedBaseFileName, os.ErrNotExist)
+	}
+	if ev.ecxFile, err = backend.OpenVolumeFile(indexBaseFileName+".ecx", os.O_RDWR); err != nil {
+		return nil, fmt.Errorf("cannot open ec volume index %s.ecx: %w", indexBaseFileName, err)
 	}
 	ecxFi, statErr := ev.ecxFile.Stat()
 	if statErr != nil {
@@ -105,7 +199,7 @@ func NewEcVolume(diskType types.DiskType, dir string, dirIdx string, collection 
 	ev.ecxCreatedAt = ecxFi.ModTime()
 
 	// open ecj file and seed the in-memory deleted set from it.
-	if ev.ecjFile, err = os.OpenFile(indexBaseFileName+".ecj", os.O_RDWR|os.O_CREATE, 0644); err != nil {
+	if ev.ecjFile, err = backend.OpenVolumeFile(indexBaseFileName+".ecj", os.O_RDWR|os.O_CREATE); err != nil {
 		return nil, fmt.Errorf("cannot open ec volume journal %s.ecj: %v", indexBaseFileName, err)
 	}
 	if ecjFi, statErr := ev.ecjFile.Stat(); statErr == nil {
@@ -134,7 +228,16 @@ func NewEcVolume(diskType types.DiskType, dir string, dirIdx string, collection 
 		}
 	}
 	ev.Version = needle.Version3
-	if volumeInfo, _, found, _ := volume_info.MaybeLoadVolumeInfo(vifFileName); found {
+	// A present-but-unreadable or malformed .vif FAILS the mount: every new
+	// encode records a positive uniform block size there, and defaulting to
+	// the legacy layout would serve those shards with the wrong offset math.
+	// Absent stays legal — legacy volumes predate the sidecar.
+	volumeInfo, _, found, vifErr := volume_info.MaybeLoadVolumeInfo(vifFileName)
+	if vifErr != nil {
+		ev.Close()
+		return nil, fmt.Errorf("ec volume %d: load %s: %w", vid, vifFileName, vifErr)
+	}
+	if found {
 		ev.Version = needle.Version(volumeInfo.Version)
 		ev.datFileSize = volumeInfo.DatFileSize
 		ev.ExpireAtSec = volumeInfo.ExpireAtSec
@@ -143,39 +246,130 @@ func NewEcVolume(diskType types.DiskType, dir string, dirIdx string, collection 
 		if volumeInfo.EcShardConfig != nil {
 			ds := int(volumeInfo.EcShardConfig.DataShards)
 			ps := int(volumeInfo.EcShardConfig.ParityShards)
+			ev.EncodeTsNs = volumeInfo.EcShardConfig.GetEncodeTsNs()
 
-			// Validate shard counts to prevent zero or invalid values
-			if ds <= 0 || ps <= 0 || ds+ps > MaxShardCount {
-				glog.Warningf("Invalid EC config in VolumeInfo for volume %d (data=%d, parity=%d), using defaults", vid, ds, ps)
-				ev.ECContext = NewDefaultECContext(collection, vid)
+			// A config that is PRESENT but records an impossible ratio is not
+			// a volume to fall back on: substituting the default 10+4 with the
+			// legacy layout would read uniform shards with the wrong offset
+			// math and answer with the wrong bytes. Only an ENTIRELY absent
+			// config means "this predates the record", which the else-branch
+			// below serves with the legacy defaults.
+			if !ValidEcShardCounts(volumeInfo.EcShardConfig.DataShards, volumeInfo.EcShardConfig.ParityShards) {
+				ev.Close()
+				return nil, fmt.Errorf("ec volume %d: %s records invalid shard counts %d+%d",
+					vid, vifFileName, volumeInfo.EcShardConfig.DataShards, volumeInfo.EcShardConfig.ParityShards)
+			} else if blockErr := ValidateBlockSize(volumeInfo.EcShardConfig.GetBlockSize()); blockErr != nil {
+				// A recorded block size that no encoder could have produced maps
+				// every read to the wrong shard offset. Refuse the mount rather
+				// than serve those bytes or silently pick a layout.
+				ev.Close()
+				return nil, fmt.Errorf("ec volume %d: %s: %w", vid, vifFileName, blockErr)
 			} else {
 				ev.ECContext = &ECContext{
 					Collection:   collection,
 					VolumeId:     vid,
 					DataShards:   ds,
 					ParityShards: ps,
+					BlockSize:    volumeInfo.EcShardConfig.GetBlockSize(),
 				}
 				glog.V(1).Infof("Loaded EC config from VolumeInfo for volume %d: %s", vid, ev.ECContext.String())
 			}
 		} else {
-			ev.ECContext = NewDefaultECContext(collection, vid)
+			// A vif that carries no ecShardConfig answers nothing about the
+			// layout — it is no more informative than an absent one, so it
+			// must not skip the sidecar. Going straight to the defaults here
+			// read a uniform volume with the legacy offset math.
+			cfg, sidecarFound, sidecarErr := layoutFromSidecar(dataBaseFileName, indexBaseFileName)
+			if sidecarErr != nil {
+				ev.Close()
+				return nil, fmt.Errorf("ec volume %d: %s records no EC config and the bitrot sidecar cannot establish the layout: %w", vid, vifFileName, sidecarErr)
+			}
+			if sidecarFound {
+				ev.ECContext = &ECContext{
+					Collection:   collection,
+					VolumeId:     vid,
+					DataShards:   int(cfg.GetDataShards()),
+					ParityShards: int(cfg.GetParityShards()),
+					BlockSize:    cfg.GetBlockSize(),
+				}
+				ev.EncodeTsNs = cfg.GetEncodeTsNs()
+				glog.V(0).Infof("ec volume %d: .vif records no EC config; took it from the bitrot sidecar: %s",
+					vid, ev.ECContext.String())
+			} else {
+				ev.ECContext = NewDefaultECContext(collection, vid)
+			}
 		}
 	} else {
-		glog.Warningf("vif file not found,volumeId:%d, filename:%s", vid, vifFileName)
-		volume_info.SaveVolumeInfo(dataBaseFileName+".vif", &volume_server_pb.VolumeInfo{Version: uint32(ev.Version)})
+		// Don't fabricate a stub .vif here: a version-only stub implies the
+		// default 10+4 ratio with DatFileSize=0 and no encode identity, which
+		// the custom-ratio resolver and the startup credibility checks must not
+		// mistake for an authoritative config. Mount with in-memory defaults and
+		// leave the real .vif to the encoder or a recovery tool (the Rust volume
+		// server already behaves this way).
+		//
+		// The bitrot sidecar records the same EC config at encode time, so when
+		// it is present it answers the layout question the missing .vif cannot:
+		// defaulting a uniform-layout volume to the legacy block sizes maps
+		// every read to the wrong shard offset. `weed fix -ecx` reads the
+		// sidecar for the same reason.
 		ev.ECContext = NewDefaultECContext(collection, vid)
+		cfg, sidecarFound, sidecarErr := layoutFromSidecar(dataBaseFileName, indexBaseFileName)
+		if sidecarErr != nil {
+			// With no .vif the sidecar is the ONLY record of this volume's
+			// layout. Present but unusable is not "assume legacy" — that
+			// answers reads with the wrong shard offsets, which is worse than
+			// not answering at all.
+			ev.Close()
+			return nil, fmt.Errorf("ec volume %d: no .vif and the bitrot sidecar cannot establish the layout: %w", vid, sidecarErr)
+		}
+		if sidecarFound {
+			ev.ECContext = &ECContext{
+				Collection:   collection,
+				VolumeId:     vid,
+				DataShards:   int(cfg.GetDataShards()),
+				ParityShards: int(cfg.GetParityShards()),
+				BlockSize:    cfg.GetBlockSize(),
+			}
+			ev.EncodeTsNs = cfg.GetEncodeTsNs()
+			glog.V(0).Infof("ec volume %d: .vif missing; took EC config from the bitrot sidecar: %s",
+				vid, ev.ECContext.String())
+		} else {
+			// Only now are the defaults what the volume actually mounted on;
+			// logging this after the sidecar answered would send an operator
+			// triaging wrong bytes after the legacy layout instead.
+			glog.Warningf("vif file not found, using defaults, volumeId:%d, filename:%s", vid, vifFileName)
+		}
 	}
 
 	ev.ShardLocations = make(map[ShardId][]pb.ServerAddress)
 
+	// Load the active-generation bitrot checksum sidecar (optional).
+	if err := ev.loadActiveBitrotSidecar(); err != nil {
+		ev.Close()
+		return nil, err
+	}
+
 	return
 }
 
-func (ev *EcVolume) AddEcVolumeShard(ecVolumeShard *EcVolumeShard) bool {
+func (ev *EcVolume) AddEcVolumeShard(ecVolumeShard *EcVolumeShard) (bool, error) {
 	for _, s := range ev.Shards {
 		if s.ShardId == ecVolumeShard.ShardId {
-			return false
+			return false, nil
 		}
+	}
+	// A 0-byte shard file beside an index with entries is residue of a
+	// failed copy or a truncation, not a mountable shard: registering it
+	// would advertise a size-0 claim that serves nothing and, since
+	// placement pins re-copies to the owning disk, would keep attracting
+	// repairs to a file that was never valid. A 0-byte shard beside a
+	// 0-byte index is different — that is the legitimate layout of a
+	// volume encoded with no live needles, and it must keep mounting.
+	// The startup scan already skips 0-byte shard files; this covers the
+	// mount RPC path, which opens the file directly.
+	if ecVolumeShard.Size() == 0 && ev.ecxFileSize > 0 {
+		return false, fmt.Errorf("ec volume %d shard %d: shard file is empty (0 bytes) but the index has %d entries: residue of a failed copy, not a mountable shard",
+			ev.VolumeId, ecVolumeShard.ShardId, ev.ecxFileSize/types.NeedleMapEntrySize)
 	}
 	ev.Shards = append(ev.Shards, ecVolumeShard)
 	slices.SortFunc(ev.Shards, func(a, b *EcVolumeShard) int {
@@ -184,7 +378,7 @@ func (ev *EcVolume) AddEcVolumeShard(ecVolumeShard *EcVolumeShard) bool {
 		}
 		return int(a.ShardId - b.ShardId)
 	})
-	return true
+	return true, nil
 }
 
 func (ev *EcVolume) DeleteEcVolumeShard(shardId ShardId) (ecVolumeShard *EcVolumeShard, deleted bool) {
@@ -217,16 +411,19 @@ func (ev *EcVolume) Close() {
 	for _, s := range ev.Shards {
 		s.Close()
 	}
+	ev.ecjFileAccessLock.Lock()
 	if ev.ecjFile != nil {
-		ev.ecjFileAccessLock.Lock()
 		_ = ev.ecjFile.Close()
 		ev.ecjFile = nil
-		ev.ecjFileAccessLock.Unlock()
 	}
+	ev.ecjFileAccessLock.Unlock()
 	if ev.ecxFile != nil {
 		_ = ev.ecxFile.Sync()
+		// Do NOT nil ecxFile: LocateEcShardNeedle reads it without the
+		// ecVolumesLock after the resolving lookup released it, so a concurrent
+		// eviction that nils the field would race that read. A closed-but-set fd
+		// yields a clean read error (recovered from parity) and no data race.
 		_ = ev.ecxFile.Close()
-		ev.ecxFile = nil
 	}
 }
 
@@ -234,13 +431,13 @@ func (ev *EcVolume) Close() {
 // This ensures that deletions made via DeleteNeedleFromEcx are visible
 // to other processes/file handles that may read these files.
 func (ev *EcVolume) Sync() {
+	ev.ecjFileAccessLock.Lock()
 	if ev.ecjFile != nil {
-		ev.ecjFileAccessLock.Lock()
 		if err := ev.ecjFile.Sync(); err != nil {
 			glog.Warningf("failed to sync ecj file for volume %d: %v", ev.VolumeId, err)
 		}
-		ev.ecjFileAccessLock.Unlock()
 	}
+	ev.ecjFileAccessLock.Unlock()
 	if ev.ecxFile != nil {
 		if err := ev.ecxFile.Sync(); err != nil {
 			glog.Warningf("failed to sync ecx file for volume %d: %v", ev.VolumeId, err)
@@ -254,9 +451,34 @@ func (ev *EcVolume) Destroy() {
 	for _, s := range ev.Shards {
 		s.Destroy()
 	}
-	os.Remove(ev.FileName(".ecx"))
-	os.Remove(ev.FileName(".ecj"))
+	// Sweep the EC-only index files from BOTH the data directory and the shared
+	// index directory. A move or reconstruct can leave a copy in whichever
+	// directory is not ecxActualDir; removing only the active one leaves a stale
+	// index that a later reload could pick up and re-mount as a phantom EC
+	// volume. .ecx/.ecj are EC-specific, so removing both copies is safe.
+	for _, base := range ev.ecIndexBaseNames() {
+		os.Remove(base + ".ecx")
+		os.Remove(base + ".ecj")
+	}
+	// The .vif is shared with a coexisting normal volume (e.g. mid-decode), so
+	// only remove the active copy, not both.
 	os.Remove(ev.FileName(".vif"))
+	// Remove the bitrot checksum sidecar(s) so a later volume reuse cannot load
+	// stale protection. Search both the data and index bases.
+	RemoveBitrotSidecars(ev.DataBaseFileName())
+	if ev.IndexBaseFileName() != ev.DataBaseFileName() {
+		RemoveBitrotSidecars(ev.IndexBaseFileName())
+	}
+}
+
+// ecIndexBaseNames returns the base paths for the volume's EC index files in
+// both the data and index directories, deduplicated when they coincide.
+func (ev *EcVolume) ecIndexBaseNames() []string {
+	bases := []string{ev.DataBaseFileName()}
+	if ev.IndexBaseFileName() != ev.DataBaseFileName() {
+		bases = append(bases, ev.IndexBaseFileName())
+	}
+	return bases
 }
 
 // DiskType returns the disk type the EC volume currently reports under.
@@ -346,6 +568,7 @@ func (ev *EcVolume) ToVolumeEcShardInformationMessage(diskId uint32) (messages [
 				DiskId:      diskId,
 				FileCount:   fileCount,
 				DeleteCount: deleteCount,
+				EncodeTsNs:  ev.EncodeTsNs,
 			}
 			ecInfoPerVolume[s.VolumeId] = m
 		}
@@ -451,17 +674,24 @@ func (ev *EcVolume) LocateEcShardNeedleInterval(version needle.Version, offset i
 		shardSize = shard.ecdFileSize - 1
 	}
 	// calculate the locations in the ec shards
-	intervals = LocateData(ErasureCodingLargeBlockSize, ErasureCodingSmallBlockSize, shardSize, offset, types.Size(needle.GetActualSize(size, version)))
+	intervals = LocateData(ev.ECContext.LargeBlockSize(), ev.ECContext.SmallBlockSize(), shardSize, offset, types.Size(needle.GetActualSize(size, version)))
 
 	return
+}
+
+// IntervalToShardIdAndOffset resolves an interval against this volume's shard
+// block layout.
+func (ev *EcVolume) IntervalToShardIdAndOffset(interval Interval) (ShardId, int64) {
+	return interval.ToShardIdAndOffset(ev.ECContext.LargeBlockSize(), ev.ECContext.SmallBlockSize())
 }
 
 func (ev *EcVolume) FindNeedleFromEcx(needleId types.NeedleId) (offset types.Offset, size types.Size, err error) {
 	offset, size, err = SearchNeedleFromSortedIndex(ev.ecxFile, ev.ecxFileSize, needleId, nil)
 	if err != nil {
+		ev.CheckReadWriteError(err)
 		return
 	}
-	// Apply runtime deletion state on top of the sealed .ecx lookup.
+	ev.CheckReadWriteError(nil)
 	if ev.IsNeedleDeleted(needleId) {
 		size = types.TombstoneFileSize
 	}
@@ -476,7 +706,7 @@ func SearchNeedleFromSortedIndex(ecxFile *os.File, ecxFileSize int64, needleId t
 		m := (l + h) / 2
 		if n, err := ecxFile.ReadAt(buf, m*types.NeedleMapEntrySize); err != nil {
 			if n != types.NeedleMapEntrySize {
-				return types.Offset{}, types.TombstoneFileSize, fmt.Errorf("ecx file %d read at %d: %v", ecxFileSize, m*types.NeedleMapEntrySize, err)
+				return types.Offset{}, types.TombstoneFileSize, fmt.Errorf("ecx file %d read at %d: %w", ecxFileSize, m*types.NeedleMapEntrySize, err)
 			}
 		}
 		key, offset, size = idx.IdxFileEntry(buf)

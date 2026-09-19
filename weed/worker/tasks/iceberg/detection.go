@@ -1,8 +1,8 @@
 package iceberg
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"strings"
@@ -69,6 +69,11 @@ func (h *Handler) scanTablesForMaintenance(
 		if !wildcard.MatchesAnyWildcard(bucketMatchers, bucketName) {
 			continue
 		}
+		bucketMaintenance, err := parseMaintenanceConfiguration(bucketEntry.Extended, bucketName)
+		if err != nil {
+			glog.Warningf("iceberg maintenance: skipping bucket %s: %v", bucketName, err)
+			continue
+		}
 
 		// List namespaces within the bucket
 		bucketPath := path.Join(bucketsPath, bucketName)
@@ -120,14 +125,34 @@ func (h *Handler) scanTablesForMaintenance(
 					continue
 				}
 
-				icebergMeta, metadataFileName, planningIndex, err := parseTableMetadataEnvelope(metadataBytes)
+				tablePath := path.Join(nsName, tblName)
+				state, err := parseTableMetadataEnvelope(metadataBytes, bucketName, tablePath)
 				if err != nil {
-					glog.V(2).Infof("iceberg maintenance: skipping %s/%s/%s: cannot parse iceberg metadata: %v", bucketName, nsName, tblName, err)
+					if errors.Is(err, errForeignFormat) {
+						glog.V(3).Infof("iceberg maintenance: skipping %s/%s/%s: %v", bucketName, nsName, tblName, err)
+					} else {
+						glog.V(2).Infof("iceberg maintenance: skipping %s/%s/%s: cannot parse iceberg metadata: %v", bucketName, nsName, tblName, err)
+					}
+					continue
+				}
+				if !isIcebergTableEntry(tableEntry.Extended, state.Metadata) {
+					glog.V(2).Infof("iceberg maintenance: skipping %s/%s/%s: not an iceberg table", bucketName, nsName, tblName)
 					continue
 				}
 
-				tablePath := path.Join(nsName, tblName)
-				needsWork, err := h.tableNeedsMaintenance(ctx, filerClient, bucketName, tablePath, icebergMeta, metadataFileName, planningIndex, config, ops)
+				tableMaintenance, err := parseMaintenanceConfiguration(tableEntry.Extended, path.Join(bucketName, tablePath))
+				if err != nil {
+					glog.Warningf("iceberg maintenance: skipping %s/%s/%s: %v", bucketName, nsName, tblName, err)
+					continue
+				}
+				maintenance := mergeMaintenanceConfiguration(bucketMaintenance, tableMaintenance)
+				tableOps := filterDisabledOperations(ops, maintenance)
+				if len(tableOps) == 0 {
+					continue
+				}
+				effective := resolveTableConfig(config, state.Metadata.Properties(), maintenance)
+
+				needsWork, err := h.tableNeedsMaintenance(ctx, filerClient, bucketName, tablePath, state, effective, tableOps)
 				if err != nil {
 					glog.V(2).Infof("iceberg maintenance: skipping %s/%s/%s: cannot evaluate maintenance need: %v", bucketName, nsName, tblName, err)
 					continue
@@ -138,8 +163,8 @@ func (h *Handler) scanTablesForMaintenance(
 						Namespace:        nsName,
 						TableName:        tblName,
 						TablePath:        tablePath,
-						MetadataFileName: metadataFileName,
-						Metadata:         icebergMeta,
+						MetadataFileName: state.MetadataFileName,
+						Metadata:         state.Metadata,
 					})
 					if limit > 0 && len(tables) > limit {
 						return tables, nil
@@ -154,8 +179,8 @@ func (h *Handler) scanTablesForMaintenance(
 
 func normalizeDetectionConfig(config Config) Config {
 	config = applyThresholdDefaults(config)
-	if config.SnapshotRetentionHours <= 0 {
-		config.SnapshotRetentionHours = defaultSnapshotRetentionHours
+	if config.SnapshotRetentionMs <= 0 {
+		config.SnapshotRetentionMs = hoursToMs(defaultSnapshotRetentionHours)
 	}
 	if config.MaxSnapshotsToKeep <= 0 {
 		config.MaxSnapshotsToKeep = defaultMaxSnapshotsToKeep
@@ -167,13 +192,15 @@ func (h *Handler) tableNeedsMaintenance(
 	ctx context.Context,
 	filerClient filer_pb.SeaweedFilerClient,
 	bucketName, tablePath string,
-	meta table.Metadata,
-	metadataFileName string,
-	cachedPlanningIndex *planningIndex,
+	state *tableState,
 	config Config,
 	ops []string,
 ) (bool, error) {
 	config = normalizeDetectionConfig(config)
+	meta := state.Metadata
+	dataPath := state.DataPath
+	metadataFileName := state.MetadataFileName
+	cachedPlanningIndex := state.PlanningIndex
 
 	var predicate *partitionPredicate
 	if strings.TrimSpace(config.Where) != "" {
@@ -209,7 +236,7 @@ func (h *Handler) tableNeedsMaintenance(
 		if manifestsLoaded {
 			return currentManifests, manifestsErr
 		}
-		currentManifests, manifestsErr = loadCurrentManifests(ctx, filerClient, bucketName, tablePath, meta)
+		currentManifests, manifestsErr = loadCurrentManifests(ctx, filerClient, bucketName, dataPath, meta)
 		manifestsLoaded = true
 		return currentManifests, manifestsErr
 	}
@@ -228,7 +255,7 @@ func (h *Handler) tableNeedsMaintenance(
 			planningIndexErrs[op] = err
 			return nil, err
 		}
-		index, err := buildPlanningIndexFromManifests(ctx, filerClient, bucketName, tablePath, meta, config, []string{op}, manifests)
+		index, err := buildPlanningIndexFromManifests(ctx, filerClient, bucketName, dataPath, meta, config, []string{op}, manifests)
 		if err != nil {
 			planningIndexErrs[op] = err
 			return nil, err
@@ -286,7 +313,7 @@ func (h *Handler) tableNeedsMaintenance(
 				opEvalErrors = append(opEvalErrors, fmt.Sprintf("%s: %v", op, err))
 				continue
 			}
-			eligible, err := hasEligibleDeleteRewrite(ctx, filerClient, bucketName, tablePath, manifests, config, meta, predicate)
+			eligible, err := hasEligibleDeleteRewrite(ctx, filerClient, bucketName, dataPath, manifests, config, meta, predicate)
 			if err != nil {
 				opEvalErrors = append(opEvalErrors, fmt.Sprintf("%s: %v", op, err))
 				continue
@@ -308,14 +335,14 @@ func (h *Handler) tableNeedsMaintenance(
 			}
 		case "remove_orphans":
 			if metadataFileName == "" {
-				_, currentMetadataFileName, err := loadCurrentMetadata(ctx, filerClient, bucketName, tablePath)
+				currentState, err := loadCurrentMetadata(ctx, filerClient, bucketName, tablePath)
 				if err != nil {
 					opEvalErrors = append(opEvalErrors, fmt.Sprintf("%s: %v", op, err))
 					continue
 				}
-				metadataFileName = currentMetadataFileName
+				metadataFileName = currentState.MetadataFileName
 			}
-			orphanCandidates, err := collectOrphanCandidates(ctx, filerClient, bucketName, tablePath, meta, metadataFileName, config.OrphanOlderThanHours)
+			orphanCandidates, err := collectOrphanCandidates(ctx, filerClient, bucketName, dataPath, meta, metadataFileName, config.OrphanOlderThanHours)
 			if err != nil {
 				opEvalErrors = append(opEvalErrors, fmt.Sprintf("%s: %v", op, err))
 				continue
@@ -333,11 +360,15 @@ func (h *Handler) tableNeedsMaintenance(
 	return false, nil
 }
 
-func metadataFileNameFromLocation(location, bucketName, tablePath string) string {
+func metadataFileNameFromLocation(location string) string {
 	if location == "" {
 		return ""
 	}
-	return path.Base(normalizeIcebergPath(location, bucketName, tablePath))
+	name := path.Base(location)
+	if name == "." || name == "/" {
+		return ""
+	}
+	return name
 }
 
 func countDataManifests(manifests []iceberg.ManifestFile) int64 {
@@ -353,7 +384,7 @@ func countDataManifests(manifests []iceberg.ManifestFile) int64 {
 func loadCurrentManifests(
 	ctx context.Context,
 	filerClient filer_pb.SeaweedFilerClient,
-	bucketName, tablePath string,
+	bucketName, dataPath string,
 	meta table.Metadata,
 ) ([]iceberg.ManifestFile, error) {
 	currentSnap := meta.CurrentSnapshot()
@@ -361,11 +392,11 @@ func loadCurrentManifests(
 		return nil, nil
 	}
 
-	manifestListData, err := loadFileByIcebergPath(ctx, filerClient, bucketName, tablePath, currentSnap.ManifestList)
+	manifestListData, err := loadFileByIcebergPath(ctx, filerClient, bucketName, dataPath, currentSnap.ManifestList)
 	if err != nil {
 		return nil, fmt.Errorf("read manifest list: %w", err)
 	}
-	manifests, err := iceberg.ReadManifestList(bytes.NewReader(manifestListData))
+	manifests, err := s3tables.ReadManifestList(manifestListData)
 	if err != nil {
 		return nil, fmt.Errorf("parse manifest list: %w", err)
 	}
@@ -375,7 +406,7 @@ func loadCurrentManifests(
 func hasEligibleCompaction(
 	ctx context.Context,
 	filerClient filer_pb.SeaweedFilerClient,
-	bucketName, tablePath string,
+	bucketName, dataPath string,
 	manifests []iceberg.ManifestFile,
 	config Config,
 	meta table.Metadata,
@@ -406,13 +437,16 @@ func hasEligibleCompaction(
 		return false, nil
 	}
 
+	specsByID := specByID(meta)
+	schema := meta.CurrentSchema()
+
 	var allEntries []iceberg.ManifestEntry
 	for _, mf := range dataManifests {
-		manifestData, err := loadFileByIcebergPath(ctx, filerClient, bucketName, tablePath, mf.FilePath())
+		manifestData, err := loadFileByIcebergPath(ctx, filerClient, bucketName, dataPath, mf.FilePath())
 		if err != nil {
 			return false, fmt.Errorf("read manifest %s: %w", mf.FilePath(), err)
 		}
-		entries, err := iceberg.ReadManifest(mf, bytes.NewReader(manifestData), true)
+		entries, err := s3tables.ReadManifest(mf, manifestData, true, specsByID, schema)
 		if err != nil {
 			return false, fmt.Errorf("parse manifest %s: %w", mf.FilePath(), err)
 		}
@@ -421,7 +455,6 @@ func hasEligibleCompaction(
 
 	candidateEntries := allEntries
 	if predicate != nil {
-		specsByID := specByID(meta)
 		candidateEntries = make([]iceberg.ManifestEntry, 0, len(allEntries))
 		for _, entry := range allEntries {
 			spec, ok := specsByID[int(entry.DataFile().SpecID())]
@@ -463,27 +496,12 @@ func compactionMinInputFiles(minInputFiles int64) (int, error) {
 
 // needsMaintenance checks whether snapshot expiration work is needed based on
 // metadata-only thresholds.
+// It asks execution what it would do rather than reimplementing the rules:
+// expiry always requires a snapshot to be past the retention window, so a
+// table over the snapshot quota whose snapshots are all young, or all pinned by
+// refs, would otherwise be proposed for a job that can only no-op.
 func needsMaintenance(meta table.Metadata, config Config) bool {
-	snapshots := meta.Snapshots()
-	if len(snapshots) == 0 {
-		return false
-	}
-
-	// Check snapshot count
-	if int64(len(snapshots)) > config.MaxSnapshotsToKeep {
-		return true
-	}
-
-	// Check oldest snapshot age
-	retentionMs := config.SnapshotRetentionHours * 3600 * 1000
-	nowMs := time.Now().UnixMilli()
-	for _, snap := range snapshots {
-		if nowMs-snap.TimestampMs > retentionMs {
-			return true
-		}
-	}
-
-	return false
+	return len(snapshotsToExpire(meta, config, time.Now().UnixMilli())) > 0
 }
 
 // buildMaintenanceProposal creates a JobProposal for a table needing maintenance.

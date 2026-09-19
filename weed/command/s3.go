@@ -24,11 +24,14 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/iceberg"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/lance"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
 )
 
@@ -41,11 +44,15 @@ var (
 // When adding a new field, update all four flag registration sites.
 type S3Options struct {
 	filer                     *string
+	ip                        *string
 	bindIp                    *string
 	port                      *int
 	portHttps                 *int
 	portGrpc                  *int
 	portIceberg               *int
+	portLance                 *int
+	icebergCredentialRole     *string
+	icebergCredentialDuration *int
 	config                    *string
 	iamConfig                 *string
 	domainName                *string
@@ -57,6 +64,7 @@ type S3Options struct {
 	metricsHttpPort           *int
 	metricsHttpIp             *string
 	allowDeleteBucketNotEmpty *bool
+	autoCreateBucket          *bool
 	auditLogConfig            *string
 	localFilerSocket          *string
 	dataCenter                *string
@@ -72,6 +80,9 @@ type S3Options struct {
 	externalUrl               *string
 	defaultFileMode           *string
 	cacheSizeMB               *int64
+	readerCacheSizeMB         *int64
+
+	allowUntrustedRemoteEndpoints *bool
 	// shutdownCtx, when non-nil, tells startS3Server/startIcebergServer to
 	// gracefully shut down their HTTP/gRPC servers once the ctx is cancelled.
 	// Used by weed mini to orchestrate an ordered shutdown; nil for standalone
@@ -82,11 +93,15 @@ type S3Options struct {
 func init() {
 	cmdS3.Run = runS3 // break init cycle
 	s3StandaloneOptions.filer = cmdS3.Flag.String("filer", "localhost:8888", "comma-separated filer server addresses for high availability")
+	s3StandaloneOptions.ip = cmdS3.Flag.String("ip", "", "ip address advertised to the cluster. If empty, default to -ip.bind, or the auto-detected address.")
 	s3StandaloneOptions.bindIp = cmdS3.Flag.String("ip.bind", "", "ip address to bind to. If empty, default to 0.0.0.0.")
 	s3StandaloneOptions.port = cmdS3.Flag.Int("port", 8333, "s3 server http listen port")
 	s3StandaloneOptions.portHttps = cmdS3.Flag.Int("port.https", 0, "s3 server https listen port")
 	s3StandaloneOptions.portGrpc = cmdS3.Flag.Int("port.grpc", 0, "s3 server grpc listen port")
 	s3StandaloneOptions.portIceberg = cmdS3.Flag.Int("port.iceberg", 8181, "Iceberg REST Catalog server listen port (0 to disable)")
+	s3StandaloneOptions.portLance = cmdS3.Flag.Int("port.lance", 9101, "Lance Namespace server listen port (0 to disable); credential vending uses -iceberg.credentialRole")
+	s3StandaloneOptions.icebergCredentialRole = cmdS3.Flag.String("iceberg.credentialRole", "", "IAM role ARN the Iceberg catalog assumes to vend table-scoped credentials (empty disables vending)")
+	s3StandaloneOptions.icebergCredentialDuration = cmdS3.Flag.Int("iceberg.credentialDurationSeconds", 3600, "lifetime of credentials vended by the Iceberg catalog")
 	s3StandaloneOptions.domainName = cmdS3.Flag.String("domainName", "", "suffix of the host name in comma separated list, {bucket}.{domainName}")
 	s3StandaloneOptions.allowedOrigins = cmdS3.Flag.String("allowedOrigins", "*", "comma separated list of allowed origins")
 	s3StandaloneOptions.dataCenter = cmdS3.Flag.String("dataCenter", "", "prefer to read and write to volumes in this data center")
@@ -101,6 +116,7 @@ func init() {
 	s3StandaloneOptions.metricsHttpIp = cmdS3.Flag.String("metricsIp", "", "metrics listen ip. If empty, default to same as -ip.bind option.")
 	cmdS3.Flag.Bool("allowEmptyFolder", true, "deprecated, ignored. Empty folder cleanup is now automatic.")
 	s3StandaloneOptions.allowDeleteBucketNotEmpty = cmdS3.Flag.Bool("allowDeleteBucketNotEmpty", true, "allow recursive deleting all entries along with bucket")
+	s3StandaloneOptions.autoCreateBucket = cmdS3.Flag.Bool("autoCreateBucket", true, "create the bucket on upload if it does not exist, for admin identities only")
 	s3StandaloneOptions.localFilerSocket = cmdS3.Flag.String("localFilerSocket", "", "local filer socket path")
 	s3StandaloneOptions.localSocket = cmdS3.Flag.String("localSocket", "", "default to /tmp/seaweedfs-s3-<port>.sock")
 	s3StandaloneOptions.idleTimeout = cmdS3.Flag.Int("idleTimeout", 120, "connection idle seconds")
@@ -111,9 +127,11 @@ func init() {
 	s3StandaloneOptions.debug = cmdS3.Flag.Bool("debug", false, "serves runtime profiling data via pprof on the port specified by -debug.port")
 	s3StandaloneOptions.debugPort = cmdS3.Flag.Int("debug.port", 6060, "http port for debugging")
 	s3StandaloneOptions.cipher = cmdS3.Flag.Bool("encryptVolumeData", false, "encrypt data on volume servers")
-	s3StandaloneOptions.externalUrl = cmdS3.Flag.String("externalUrl", "", "the external URL clients use to connect (e.g. https://api.example.com:9000). Used for S3 signature verification behind a reverse proxy. Falls back to S3_EXTERNAL_URL env var.")
+	s3StandaloneOptions.externalUrl = cmdS3.Flag.String("externalUrl", "", "the external URL clients use to connect (e.g. https://api.example.com:9000). Advertised to Iceberg and Lance clients, and tried first when verifying S3 signatures behind a reverse proxy. Falls back to S3_EXTERNAL_URL env var.")
 	s3StandaloneOptions.defaultFileMode = cmdS3.Flag.String("defaultFileMode", "", "default file mode for S3 uploaded objects, e.g. 0660, 0644, 0666")
 	s3StandaloneOptions.cacheSizeMB = cmdS3.Flag.Int64("cacheCapacityMB", 0, "in-memory chunk cache capacity in MB for S3 GETs shared across requests (0 disables)")
+	s3StandaloneOptions.readerCacheSizeMB = cmdS3.Flag.Int64("readerCacheSizeMB", 0, "memory budget in MiB for downloaded and in-flight reader buffers across all S3 GETs (0 means unlimited)")
+	s3StandaloneOptions.allowUntrustedRemoteEndpoints = cmdS3.Flag.Bool("allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
 }
 
 var cmdS3 = &Command{
@@ -261,6 +279,9 @@ func (s3opt *S3Options) resolvePaths() {
 
 func (s3opt *S3Options) startS3Server() bool {
 
+	// Before the first filer dial below; gRPC caches conns and binds at dial time.
+	util.SetOutboundLocalIP(*s3opt.bindIp)
+
 	filerAddresses := pb.ServerAddresses(*s3opt.filer).ToAddresses()
 
 	filerBucketsPath := "/buckets"
@@ -273,6 +294,9 @@ func (s3opt *S3Options) startS3Server() bool {
 	var metricsAddress string
 	var metricsIntervalSec int
 
+	// chunk size for S3 uploads, read from the filer's -maxMB
+	var filerMaxMB int32
+
 	for {
 		err := pb.WithOneOfGrpcFilerClients(false, filerAddresses, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 			resp, err := client.GetFilerConfiguration(context.Background(), &filer_pb.GetFilerConfigurationRequest{})
@@ -284,7 +308,9 @@ func (s3opt *S3Options) startS3Server() bool {
 			// Get master addresses for filer discovery
 			masterAddresses = pb.ServerAddresses(strings.Join(resp.Masters, ",")).ToAddresses()
 			metricsAddress, metricsIntervalSec = resp.MetricsAddress, int(resp.MetricsIntervalSec)
+			filerMaxMB = int32(resp.MaxMb)
 			glog.V(0).Infof("S3 read filer buckets dir: %s", filerBucketsPath)
+			glog.V(0).Infof("S3 read filer maxMB: %d", filerMaxMB)
 			if len(masterAddresses) > 0 {
 				glog.V(0).Infof("S3 read master addresses for discovery: %v", masterAddresses)
 			}
@@ -330,6 +356,11 @@ func (s3opt *S3Options) startS3Server() bool {
 		glog.Fatalf("S3 API Server startup error: %v", fileModeErr)
 	}
 
+	var readerCacheSizeMB int64
+	if s3opt.readerCacheSizeMB != nil {
+		readerCacheSizeMB = *s3opt.readerCacheSizeMB
+	}
+
 	s3ApiServer, s3ApiServer_err = s3api.NewS3ApiServer(router, &s3api.S3ApiServerOption{
 		Filers:                    filerAddresses,
 		Masters:                   masterAddresses,
@@ -340,6 +371,7 @@ func (s3opt *S3Options) startS3Server() bool {
 		BucketsPath:               filerBucketsPath,
 		GrpcDialOption:            grpcDialOption,
 		AllowDeleteBucketNotEmpty: *s3opt.allowDeleteBucketNotEmpty,
+		AutoCreateBucket:          *s3opt.autoCreateBucket,
 		LocalFilerSocket:          localFilerSocket,
 		DataCenter:                *s3opt.dataCenter,
 		FilerGroup:                filerGroup,
@@ -349,11 +381,16 @@ func (s3opt *S3Options) startS3Server() bool {
 		EnableIam:                 *s3opt.enableIam, // Embedded IAM API (enabled by default)
 		IamReadOnly:               *s3opt.iamReadOnly,
 		Cipher:                    *s3opt.cipher, // encrypt data on volume servers
+		Ip:                        *s3opt.ip,
 		BindIp:                    *s3opt.bindIp,
 		GrpcPort:                  *s3opt.portGrpc,
 		ExternalUrl:               s3opt.resolveExternalUrl(),
 		DefaultFileMode:           defaultFileMode,
 		CacheSizeMB:               *s3opt.cacheSizeMB,
+		ReaderCacheSizeMB:         readerCacheSizeMB,
+		MaxMB:                     filerMaxMB,
+
+		AllowUntrustedRemoteEndpoints: *s3opt.allowUntrustedRemoteEndpoints,
 	})
 	if s3ApiServer_err != nil {
 		glog.Fatalf("S3 API Server startup error: %v", s3ApiServer_err)
@@ -363,6 +400,11 @@ func (s3opt *S3Options) startS3Server() bool {
 	// Start Iceberg REST Catalog server if enabled
 	if *s3opt.portIceberg > 0 {
 		go s3opt.startIcebergServer(s3ApiServer)
+	}
+
+	// Start Lance Namespace server if enabled
+	if s3opt.portLance != nil && *s3opt.portLance > 0 {
+		go s3opt.startLanceServer(s3ApiServer)
 	}
 
 	if runtime.GOOS != "windows" {
@@ -521,10 +563,21 @@ func (s3opt *S3Options) startS3Server() bool {
 // startIcebergServer starts the Iceberg REST Catalog server on a separate port.
 func (s3opt *S3Options) startIcebergServer(s3ApiServer *s3api.S3ApiServer) {
 	icebergRouter := mux.NewRouter().SkipClean(true)
+	// warehouse/parent query values may legally contain ';', which Go's
+	// url.ParseQuery would otherwise drop
+	icebergRouter.Use(util_http.EscapeSemicolonsInQuery)
 
 	// Create Iceberg server using the S3ApiServer as filer client
 	icebergServer := iceberg.NewServer(s3ApiServer, s3ApiServer)
 	icebergServer.SetCredentialValidator(s3ApiServer)
+	if s3opt.icebergCredentialRole != nil && *s3opt.icebergCredentialRole != "" {
+		duration := int64(0)
+		if s3opt.icebergCredentialDuration != nil {
+			duration = int64(*s3opt.icebergCredentialDuration)
+		}
+		s3ApiServer.SetIcebergCredentialRole(*s3opt.icebergCredentialRole, duration)
+		icebergServer.SetCredentialVendor(icebergCredentialVendor{s3ApiServer})
+	}
 	icebergServer.SetS3Endpoint(s3opt.deriveS3AdvertisedEndpoint())
 	icebergServer.RegisterRoutes(icebergRouter)
 
@@ -555,6 +608,82 @@ func (s3opt *S3Options) startIcebergServer(s3ApiServer *s3api.S3ApiServer) {
 	if err = httpS.Serve(icebergListener); err != nil && err != http.ErrServerClosed {
 		glog.Fatalf("Iceberg REST Catalog Server Fail to serve: %v", err)
 	}
+}
+
+// startLanceServer starts the Lance Namespace server on a separate port. It
+// shares the Iceberg catalog's credential role: one deployment vends table
+// credentials one way, whichever catalog the client speaks to.
+func (s3opt *S3Options) startLanceServer(s3ApiServer *s3api.S3ApiServer) {
+	lanceRouter := mux.NewRouter().SkipClean(true)
+	lanceRouter.Use(util_http.EscapeSemicolonsInQuery)
+
+	lanceServer := lance.NewServer(s3ApiServer, s3ApiServer)
+	if s3opt.icebergCredentialRole != nil && *s3opt.icebergCredentialRole != "" {
+		lanceServer.SetCredentialVendor(lanceCredentialVendor{s3ApiServer})
+	}
+	lanceServer.SetS3Endpoint(s3opt.deriveLanceStorageEndpoint())
+	lanceServer.SetS3Region(s3tables.DefaultRegion)
+	lanceServer.RegisterRoutes(lanceRouter)
+
+	listenAddress := fmt.Sprintf("%s:%d", *s3opt.bindIp, *s3opt.portLance)
+	lanceListener, lanceLocalListener, err := util.NewIpAndLocalListeners(
+		*s3opt.bindIp, *s3opt.portLance, time.Duration(*s3opt.idleTimeout)*time.Second)
+	if err != nil {
+		glog.Fatalf("Lance Namespace listener on %s error: %v", listenAddress, err)
+	}
+
+	glog.V(0).Infof("Start Lance Namespace Server at http://%s", listenAddress)
+
+	httpS := newHttpServer(lanceRouter, nil)
+	if s3opt.shutdownCtx != nil {
+		go func() {
+			<-s3opt.shutdownCtx.Done()
+			httpS.Shutdown(context.Background())
+		}()
+	}
+	if lanceLocalListener != nil {
+		go func() {
+			if err := httpS.Serve(lanceLocalListener); err != nil && err != http.ErrServerClosed {
+				glog.V(0).Infof("Lance localhost listener error: %v", err)
+			}
+		}()
+	}
+	if err = httpS.Serve(lanceListener); err != nil && err != http.ErrServerClosed {
+		glog.Fatalf("Lance Namespace Server Fail to serve: %v", err)
+	}
+}
+
+// deriveLanceStorageEndpoint picks the endpoint the Lance namespace puts in
+// storage_options. It falls back to the advertised -ip where the Iceberg
+// derivation gives up, because the two clients are not in the same position: a
+// Spark or Trino Iceberg client brings its own s3.endpoint and advertising the
+// wrong one hijacks it, whereas storage_options is the only place a Lance
+// client learns where the store is. Without one, object_store quietly falls
+// back to real AWS S3 and the failure reads like a credentials problem.
+func (s3opt *S3Options) deriveLanceStorageEndpoint() string {
+	if endpoint := s3opt.deriveS3AdvertisedEndpoint(); endpoint != "" {
+		return endpoint
+	}
+	host := ""
+	if s3opt.ip != nil {
+		host = *s3opt.ip
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		return ""
+	}
+	scheme := "http"
+	port := 0
+	if s3opt.port != nil {
+		port = *s3opt.port
+	}
+	if s3opt.tlsPrivateKey != nil && *s3opt.tlsPrivateKey != "" {
+		scheme = "https"
+		if s3opt.portHttps != nil && *s3opt.portHttps > 0 {
+			port = *s3opt.portHttps
+		}
+	}
+	return fmt.Sprintf("%s://%s", scheme, util.JoinHostPort(host, port))
 }
 
 // deriveS3AdvertisedEndpoint builds the S3 endpoint URL to advertise to
@@ -595,4 +724,42 @@ func (s3opt *S3Options) deriveS3AdvertisedEndpoint() string {
 		}
 	}
 	return fmt.Sprintf("%s://%s", scheme, util.JoinHostPort(host, port))
+}
+
+// icebergCredentialVendor adapts the S3 gateway's STS-backed vending to the
+// catalog's interface, keeping the two packages independent of each other.
+type icebergCredentialVendor struct {
+	server *s3api.S3ApiServer
+}
+
+func (v icebergCredentialVendor) VendTableCredentials(ctx context.Context, principal, bucket, prefix string) (*iceberg.VendedCredentials, error) {
+	credentials, err := v.server.VendTableCredentials(ctx, principal, bucket, prefix)
+	if err != nil || credentials == nil {
+		return nil, err
+	}
+	return &iceberg.VendedCredentials{
+		AccessKeyID:     credentials.AccessKeyID,
+		SecretAccessKey: credentials.SecretAccessKey,
+		SessionToken:    credentials.SessionToken,
+		Expiration:      credentials.Expiration,
+	}, nil
+}
+
+// lanceCredentialVendor adapts the S3 gateway's STS-backed vending to the Lance
+// namespace's interface, keeping the two packages independent of each other.
+type lanceCredentialVendor struct {
+	server *s3api.S3ApiServer
+}
+
+func (v lanceCredentialVendor) VendTableCredentials(ctx context.Context, principal, bucket, prefix string) (*lance.VendedCredentials, error) {
+	credentials, err := v.server.VendTableCredentials(ctx, principal, bucket, prefix)
+	if err != nil || credentials == nil {
+		return nil, err
+	}
+	return &lance.VendedCredentials{
+		AccessKeyID:     credentials.AccessKeyID,
+		SecretAccessKey: credentials.SecretAccessKey,
+		SessionToken:    credentials.SessionToken,
+		Expiration:      credentials.Expiration,
+	}, nil
 }

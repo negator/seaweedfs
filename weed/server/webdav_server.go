@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
+	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -45,7 +47,7 @@ type WebDavOption struct {
 type WebDavServer struct {
 	option         *WebDavOption
 	grpcDialOption grpc.DialOption
-	Handler        *webdav.Handler
+	Handler        http.Handler
 }
 
 func max(x, y int64) int64 {
@@ -71,9 +73,11 @@ func NewWebDavServer(option *WebDavOption) (ws *WebDavServer, err error) {
 	ws = &WebDavServer{
 		option:         option,
 		grpcDialOption: security.LoadClientTLS(util.GetViper(), "grpc.filer"),
-		Handler: &webdav.Handler{
-			FileSystem: fs,
-			LockSystem: webdav.NewMemLS(),
+		Handler: listedEntriesHandler{
+			next: &webdav.Handler{
+				FileSystem: fs,
+				LockSystem: webdav.NewMemLS(),
+			},
 		},
 	}
 
@@ -86,6 +90,7 @@ type WebDavFileSystem struct {
 	option      *WebDavOption
 	chunkCache  *chunk_cache.TieredChunkCache
 	readerCache *filer.ReaderCache
+	filerClient *wdclient.FilerClient
 	signature   int32
 }
 
@@ -109,6 +114,11 @@ func (fi *FileInfo) Sys() interface{}   { return nil }
 func (fi *FileInfo) ETag(ctx context.Context) (string, error) {
 	if fi.err != nil {
 		return "", fi.err
+	}
+	if fi.etag == "" {
+		// nothing hashed this entry; let webdav derive one rather than
+		// publish an empty DAV:getetag, which is not a valid entity-tag
+		return "", webdav.ErrNotImplemented
 	}
 	return fi.etag, nil
 }
@@ -137,7 +147,13 @@ func NewWebDavFileSystem(option *WebDavOption) (webdav.FileSystem, error) {
 		chunkCache: chunkCache,
 		signature:  util.RandomInt32(),
 	}
-	t.readerCache = filer.NewReaderCache(32, chunkCache, filer.LookupFn(t))
+	// FilerClient rather than filer.LookupFn: its cache is bounded, which the
+	// LookupFn doc asks long-running processes to prefer, and it can invalidate
+	// a volume's locations, so a read that failed against every cached location
+	// looks the volume up again instead of retrying a server that has moved or
+	// died.
+	t.filerClient = wdclient.NewFilerClient([]pb.ServerAddress{option.Filer}, option.GrpcDialOption, "")
+	t.readerCache = filer.NewReaderCache(32, chunkCache, t.filerClient.GetLookupFileIdFunction(), t.filerClient)
 	return t, nil
 }
 
@@ -145,7 +161,7 @@ var _ = filer_pb.FilerClient(&WebDavFileSystem{})
 
 func (fs *WebDavFileSystem) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
 
-	return pb.WithGrpcClient(streamingMode, fs.signature, func(grpcConnection *grpc.ClientConn) error {
+	return pb.WithGrpcClient(context.Background(), streamingMode, fs.signature, func(grpcConnection *grpc.ClientConn) error {
 		client := filer_pb.NewSeaweedFilerClient(grpcConnection)
 		return fn(client)
 	}, fs.option.Filer.ToGrpcAddress(), false, fs.option.GrpcDialOption)
@@ -370,30 +386,42 @@ func (fs *WebDavFileSystem) stat(ctx context.Context, fullFilePath string) (os.F
 
 	fullpath := util.FullPath(fullFilePath)
 
-	var fi FileInfo
-	entry, err := filer_pb.GetEntry(context.Background(), fs, fullpath)
+	if listedFi := listedEntriesFrom(ctx).get(string(fullpath)); listedFi != nil {
+		return listedFi, nil
+	}
+
+	entry, _, _, err := filer_pb.GetEntry(ctx, fs, fullpath)
 	if err != nil {
 		if err == filer_pb.ErrNotFound {
 			return nil, os.ErrNotExist
 		}
-		fi.err = err
-		return &fi, nil
+		return &FileInfo{err: err}, nil
 	}
 	if entry == nil {
 		return nil, os.ErrNotExist
 	}
-	fi.size = int64(filer.FileSize(entry))
-	fi.name = string(fullpath)
-	fi.mode = os.FileMode(entry.Attributes.FileMode)
-	fi.modifiedTime = time.Unix(entry.Attributes.Mtime, 0)
-	fi.etag = filer.ETag(entry)
-	fi.isDirectory = entry.IsDirectory
 
-	if fi.name == "/" {
+	return toFileInfo(fullpath, entry), nil
+}
+
+func toFileInfo(fullpath util.FullPath, entry *filer_pb.Entry) *FileInfo {
+	// Name is what WebDAV publishes as DAV:displayname; clients that build a
+	// child URL from it reach nothing when it carries the whole path.
+	fp := util.FullPath(listedEntryKey(string(fullpath)))
+	fi := &FileInfo{
+		size:         int64(filer.FileSize(entry)),
+		name:         fp.Name(),
+		mode:         os.FileMode(entry.Attributes.FileMode),
+		modifiedTime: time.Unix(entry.Attributes.Mtime, 0),
+		etag:         filer.ETag(entry),
+		isDirectory:  entry.IsDirectory,
+	}
+
+	if fp == "/" {
 		fi.modifiedTime = time.Now()
 		fi.isDirectory = true
 	}
-	return &fi, nil
+	return fi
 }
 
 func (fs *WebDavFileSystem) Stat(ctx context.Context, name string) (os.FileInfo, error) {
@@ -435,7 +463,7 @@ func (f *WebDavFile) Write(buf []byte) (int, error) {
 	var getErr error
 	ctx := context.Background()
 	if f.entry == nil {
-		f.entry, getErr = filer_pb.GetEntry(context.Background(), f.fs, fullPath)
+		f.entry, _, _, getErr = filer_pb.GetEntry(context.Background(), f.fs, fullPath)
 	}
 
 	if f.entry == nil {
@@ -467,7 +495,8 @@ func (f *WebDavFile) Write(buf []byte) (int, error) {
 		}
 		f.bufWriter.CloseFunc = func() error {
 
-			manifestedChunks, manifestErr := filer.MaybeManifestize(f.saveDataAsChunk, f.entry.GetChunks())
+			// no chunk deleter here: a failed fold reports the blobs it saved
+			manifestedChunks, manifestErr := filer.MaybeManifestize(f.saveDataAsChunk, nil, f.entry.GetChunks())
 			if manifestErr != nil {
 				// not good, but should be ok
 				glog.V(0).Infof("file %s close MaybeManifestize: %v", f.name, manifestErr)
@@ -526,7 +555,7 @@ func (f *WebDavFile) Read(p []byte) (readSize int, err error) {
 	glog.V(2).Infof("WebDavFileSystem.Read %v", f.name)
 
 	if f.entry == nil {
-		f.entry, err = filer_pb.GetEntry(context.Background(), f.fs, util.FullPath(f.name))
+		f.entry, _, _, err = filer_pb.GetEntry(context.Background(), f.fs, util.FullPath(f.name))
 	}
 	if f.entry == nil {
 		return 0, err
@@ -539,7 +568,10 @@ func (f *WebDavFile) Read(p []byte) (readSize int, err error) {
 		return 0, io.EOF
 	}
 	if f.visibleIntervals == nil {
-		f.visibleIntervals, _ = filer.NonOverlappingVisibleIntervals(f.ctx, filer.LookupFn(f.fs), f.entry.GetChunks(), 0, fileSize)
+		f.visibleIntervals, err = filer.NonOverlappingVisibleIntervals(f.ctx, f.fs.filerClient.GetLookupFileIdFunction(), f.entry.GetChunks(), 0, fileSize)
+		if err != nil {
+			return 0, err
+		}
 		f.reader = nil
 	}
 	if f.reader == nil {
@@ -566,20 +598,18 @@ func (f *WebDavFile) Readdir(count int) (ret []os.FileInfo, err error) {
 
 	dir, _ := util.FullPath(f.name).DirAndName()
 
-	err = filer_pb.ReadDirAllEntries(context.Background(), f.fs, util.FullPath(dir), "", func(entry *filer_pb.Entry, isLast bool) error {
-		fi := FileInfo{
-			size:         int64(filer.FileSize(entry)),
-			name:         entry.Name,
-			mode:         os.FileMode(entry.Attributes.FileMode),
-			modifiedTime: time.Unix(entry.Attributes.Mtime, 0),
-			isDirectory:  entry.IsDirectory,
-		}
+	ctx := f.requestContext()
+	listed := listedEntriesFrom(ctx)
 
-		if !strings.HasSuffix(fi.name, "/") && fi.IsDir() {
-			fi.name += "/"
-		}
+	err = filer_pb.ReadDirAllEntries(ctx, f.fs, util.FullPath(dir), "", func(entry *filer_pb.Entry, isLast bool) error {
+		childPath := util.NewFullPath(dir, entry.Name)
+		fi := toFileInfo(childPath, entry)
+
 		glog.V(4).Infof("entry: %v", fi.name)
-		ret = append(ret, &fi)
+
+		listed.put(string(childPath), fi)
+
+		ret = append(ret, fi)
 		return nil
 	})
 	if err != nil {
@@ -610,7 +640,7 @@ func (f *WebDavFile) Seek(offset int64, whence int) (int64, error) {
 
 	glog.V(2).Infof("WebDavFile.Seek %v %v %v", f.name, offset, whence)
 
-	ctx := context.Background()
+	ctx := f.requestContext()
 
 	var err error
 	switch whence {
@@ -631,7 +661,14 @@ func (f *WebDavFile) Stat() (os.FileInfo, error) {
 
 	glog.V(2).Infof("WebDavFile.Stat %v", f.name)
 
-	ctx := context.Background()
+	return f.fs.stat(f.requestContext(), f.name)
+}
 
-	return f.fs.stat(ctx, f.name)
+// the context of the request that opened the file, or a bare one for files
+// opened outside a request
+func (f *WebDavFile) requestContext() context.Context {
+	if f.ctx != nil {
+		return f.ctx
+	}
+	return context.Background()
 }

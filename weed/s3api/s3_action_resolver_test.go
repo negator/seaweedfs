@@ -113,3 +113,99 @@ func TestResolveS3Action_AttributesBeforeVersionId(t *testing.T) {
 		})
 	}
 }
+
+// Bucket subresources registered with ACTION_ADMIN must resolve to their own
+// S3 actions so a policy granting one of them does not need s3:*, and so no
+// broader grant sweeps them in.
+func TestResolveS3Action_AdminBucketSubresources(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		query  string
+		want   string
+	}{
+		{"get encryption", http.MethodGet, "encryption", s3_constants.S3_ACTION_GET_BUCKET_ENCRYPTION},
+		{"put encryption", http.MethodPut, "encryption", s3_constants.S3_ACTION_PUT_BUCKET_ENCRYPTION},
+		{"delete encryption", http.MethodDelete, "encryption", s3_constants.S3_ACTION_PUT_BUCKET_ENCRYPTION},
+		{"get requestPayment", http.MethodGet, "requestPayment", s3_constants.S3_ACTION_GET_BUCKET_REQUEST_PAYMENT},
+		{"put requestPayment", http.MethodPut, "requestPayment", s3_constants.S3_ACTION_PUT_BUCKET_REQUEST_PAYMENT},
+		{"get publicAccessBlock", http.MethodGet, "publicAccessBlock", s3_constants.S3_ACTION_GET_BUCKET_PUBLIC_ACCESS_BLOCK},
+		{"put publicAccessBlock", http.MethodPut, "publicAccessBlock", s3_constants.S3_ACTION_PUT_BUCKET_PUBLIC_ACCESS_BLOCK},
+		{"delete publicAccessBlock", http.MethodDelete, "publicAccessBlock", s3_constants.S3_ACTION_PUT_BUCKET_PUBLIC_ACCESS_BLOCK},
+		{"get ownershipControls", http.MethodGet, "ownershipControls", s3_constants.S3_ACTION_GET_BUCKET_OWNERSHIP_CONTROLS},
+		{"put ownershipControls", http.MethodPut, "ownershipControls", s3_constants.S3_ACTION_PUT_BUCKET_OWNERSHIP_CONTROLS},
+		{"delete ownershipControls", http.MethodDelete, "ownershipControls", s3_constants.S3_ACTION_PUT_BUCKET_OWNERSHIP_CONTROLS},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, _ := http.NewRequest(tt.method, "http://localhost/bucket?"+tt.query, nil)
+			got := ResolveS3Action(r, s3_constants.ACTION_ADMIN, "bucket", "")
+			if got != tt.want {
+				t.Errorf("ResolveS3Action() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// CreateBucket is a plain bucket-level PUT registered with ACTION_ADMIN. It
+// must resolve to s3:CreateBucket so an attached policy granting that action
+// can authorize it without granting s3:*.
+func TestResolveS3Action_CreateBucket(t *testing.T) {
+	r, _ := http.NewRequest(http.MethodPut, "http://localhost/new-bucket", nil)
+	if got := ResolveS3Action(r, s3_constants.ACTION_ADMIN, "new-bucket", ""); got != s3_constants.S3_ACTION_CREATE_BUCKET {
+		t.Errorf("ResolveS3Action() = %q, want %q", got, s3_constants.S3_ACTION_CREATE_BUCKET)
+	}
+}
+
+// list-type selects ListObjectsV2, which the router registers ahead of the
+// bucket subresource routes. The resolver must align with routing and resolve
+// it to s3:ListBucket even when an operation subresource like ownershipControls
+// is also present, so authorization checks the listing action the handler runs.
+func TestResolveS3Action_ListType(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+		want  string
+	}{
+		{"list-type alone", "list-type=2", s3_constants.S3_ACTION_LIST_BUCKET},
+		{"list-type with listing params", "list-type=2&prefix=a&continuation-token=x", s3_constants.S3_ACTION_LIST_BUCKET},
+		{"list-type with ownershipControls", "list-type=2&ownershipControls=", s3_constants.S3_ACTION_LIST_BUCKET},
+		// The router only selects ListObjectsV2 for list-type=2; another value
+		// falls through to the subresource route, so ownershipControls wins.
+		{"list-type=1 with ownershipControls", "list-type=1&ownershipControls=", s3_constants.S3_ACTION_GET_BUCKET_OWNERSHIP_CONTROLS},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, _ := http.NewRequest(http.MethodGet, "http://localhost/bucket?"+tt.query, nil)
+			if got := ResolveS3Action(r, s3_constants.ACTION_LIST, "bucket", ""); got != tt.want {
+				t.Errorf("ResolveS3Action() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// A base action naming another service carries no S3 request shape, so a query
+// parameter on the request must not redirect it to an S3 action.
+func TestResolveS3ActionKeepsNonS3Service(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		url        string
+		baseAction string
+	}{
+		{"iam action with batch delete query", http.MethodPost, "http://localhost/?delete", "iam:CreateUser"},
+		{"iam action with acl query", http.MethodPut, "http://localhost/?acl", "iam:AttachUserPolicy"},
+		{"iam action with tagging query", http.MethodGet, "http://localhost/?tagging", "iam:ListUsers"},
+		{"sts action with batch delete query", http.MethodPost, "http://localhost/?delete", "sts:AssumeRole"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, _ := http.NewRequest(tt.method, tt.url, nil)
+			if got := ResolveS3Action(r, tt.baseAction, "", ""); got != tt.baseAction {
+				t.Errorf("ResolveS3Action() = %q, want %q", got, tt.baseAction)
+			}
+		})
+	}
+}

@@ -27,17 +27,17 @@ const maxPoliciesForEvaluation = 1024
 
 // IAMManager orchestrates all IAM components
 type IAMManager struct {
-	stsService             *sts.STSService
-	policyEngine           *policy.PolicyEngine
-	roleStore              RoleStore
-	userStore              UserStore
-	oidcProviderStore      OIDCProviderStore
-	oidcAuditSink          OIDCProviderAuditSink
-	revocationStore        SessionRevocationStore
-	filerAddressProvider   func() string // Function to get current filer address
-	initialized            bool
-	runtimePolicyMu        sync.Mutex
-	runtimePolicyNames     map[string]struct{}
+	stsService           *sts.STSService
+	policyEngine         *policy.PolicyEngine
+	roleStore            RoleStore
+	userStore            UserStore
+	oidcProviderStore    OIDCProviderStore
+	oidcAuditSink        OIDCProviderAuditSink
+	revocationStore      SessionRevocationStore
+	filerAddressProvider func() string // Function to get current filer address
+	initialized          bool
+	runtimePolicyMu      sync.Mutex
+	runtimePolicyNames   map[string]struct{}
 }
 
 // SetOIDCProviderAuditSink configures the lifecycle event sink. When nil
@@ -466,7 +466,13 @@ func (m *IAMManager) SyncRuntimePolicies(ctx context.Context, policies []*iam_pb
 
 		var document policy.PolicyDocument
 		if err := json.Unmarshal([]byte(runtimePolicy.Content), &document); err != nil {
-			return fmt.Errorf("failed to parse runtime policy %q: %w", runtimePolicy.Name, err)
+			// Drop just this one: aborting here would leave every other policy
+			// unsynced. Leaving it out of desiredPolicies also deletes it from
+			// the engine below, which is the point — a policy whose stored
+			// definition no longer parses must stop granting access rather than
+			// keep enforcing a document the operator can no longer see.
+			glog.Warningf("skipping unparsable runtime policy %q: %v", runtimePolicy.Name, err)
+			continue
 		}
 
 		desiredPolicies[runtimePolicy.Name] = &document
@@ -859,6 +865,44 @@ func (m *IAMManager) UpdateBucketPolicy(ctx context.Context, bucketName string, 
 	return m.policyEngine.AddPolicy(m.getFilerAddress(), policyName, &policyDoc)
 }
 
+// EnsureBucketPolicy stores the policy for a bucket only when no mirror is
+// stored yet, backfilling policies that predate the IAM integration (the
+// metadata subscription only sees changes). A present mirror is left alone,
+// so repeat calls cost one cached read. Returns whether a write happened,
+// so the caller can reconcile a write that raced a concurrent change.
+func (m *IAMManager) EnsureBucketPolicy(ctx context.Context, bucketName string, policyJSON []byte) (bool, error) {
+	if !m.initialized {
+		return false, fmt.Errorf("IAM manager not initialized")
+	}
+
+	if bucketName == "" {
+		return false, fmt.Errorf("bucket name cannot be empty")
+	}
+
+	if existing, err := m.policyEngine.GetPolicy(ctx, m.getFilerAddress(), "bucket-policy:"+bucketName); err == nil && existing != nil {
+		return false, nil
+	}
+
+	if err := m.UpdateBucketPolicy(ctx, bucketName, policyJSON); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// RemoveBucketPolicy deletes the stored policy for a bucket. Removing a
+// policy that was never stored is a success.
+func (m *IAMManager) RemoveBucketPolicy(ctx context.Context, bucketName string) error {
+	if !m.initialized {
+		return fmt.Errorf("IAM manager not initialized")
+	}
+
+	if bucketName == "" {
+		return fmt.Errorf("bucket name cannot be empty")
+	}
+
+	return m.policyEngine.DeletePolicy(ctx, m.getFilerAddress(), "bucket-policy:"+bucketName)
+}
+
 // AssumeRoleWithWebIdentity assumes a role using web identity (OIDC)
 func (m *IAMManager) AssumeRoleWithWebIdentity(ctx context.Context, request *sts.AssumeRoleWithWebIdentityRequest) (*sts.AssumeRoleResponse, error) {
 	if !m.initialized {
@@ -1204,6 +1248,90 @@ func (m *IAMManager) IsActionAllowed(ctx context.Context, request *ActionRequest
 	}
 
 	return true, nil
+}
+
+// IsPrincipalActionExplicitlyDenied reports whether the action on the resource is
+// explicitly denied for the principal by either the named policies or, for a
+// chained STS caller, the inline session policy carried by sessionToken. Unlike
+// IsActionAllowed it does not require an allow — the absence of a matching
+// statement is not a denial. Used to enforce AWS deny-always-wins when the allow
+// is granted elsewhere (e.g. a role trust policy for sts:AssumeRole).
+//
+// A chained session that fails validation or has been revoked yields an error so
+// callers fail closed. Raw OIDC tokens are skipped here — they are validated on
+// the JWT path, not by the STS service.
+func (m *IAMManager) IsPrincipalActionExplicitlyDenied(ctx context.Context, principal, action, resource string, policyNames []string, sessionToken string, requestContext map[string]interface{}) (bool, error) {
+	if !m.initialized {
+		return false, fmt.Errorf("IAM manager not initialized")
+	}
+
+	if requestContext == nil {
+		requestContext = make(map[string]interface{})
+	}
+	requestContext["principal"] = principal
+	requestContext["aws:PrincipalArn"] = principal
+
+	evalCtx := &policy.EvaluationContext{
+		Principal:      principal,
+		Action:         action,
+		Resource:       resource,
+		RequestContext: requestContext,
+	}
+
+	// Base policies: the caller's attached identity policies, or for a chained
+	// caller the assumed role's attached policies.
+	if len(policyNames) > 0 {
+		result, err := m.policyEngine.Evaluate(ctx, "", evalCtx, policyNames)
+		if err != nil {
+			return false, fmt.Errorf("policy evaluation failed: %w", err)
+		}
+		if hasExplicitDeny(result.MatchingStatements) {
+			return true, nil
+		}
+	}
+
+	// A chained STS caller's session restricts what it may do. Skip raw OIDC
+	// tokens (validated on the JWT path); for our own session tokens, reject a
+	// revoked session and honor an explicit Deny in the inline session policy.
+	if sessionToken != "" && m.stsService != nil && !isOIDCToken(sessionToken) {
+		sessionInfo, err := m.stsService.ValidateSessionToken(ctx, sessionToken)
+		if err != nil {
+			return false, fmt.Errorf("session validation failed: %w", err)
+		}
+		if sessionInfo != nil && sessionInfo.SessionId != "" {
+			revoked, rerr := m.IsSessionRevoked(ctx, sessionInfo.SessionId)
+			if rerr != nil {
+				return false, fmt.Errorf("revocation check failed: %w", rerr)
+			}
+			if revoked {
+				return false, fmt.Errorf("session has been revoked")
+			}
+		}
+		if sessionInfo != nil && sessionInfo.SessionPolicy != "" {
+			var sessionPolicy policy.PolicyDocument
+			if err := json.Unmarshal([]byte(sessionInfo.SessionPolicy), &sessionPolicy); err != nil {
+				return false, fmt.Errorf("invalid session policy JSON: %w", err)
+			}
+			result, err := m.policyEngine.EvaluatePolicyDocument(ctx, evalCtx, "session-policy", &sessionPolicy, policy.EffectDeny)
+			if err != nil {
+				return false, fmt.Errorf("session policy evaluation failed: %w", err)
+			}
+			if hasExplicitDeny(result.MatchingStatements) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// hasExplicitDeny reports whether any matched statement is a Deny.
+func hasExplicitDeny(matches []policy.StatementMatch) bool {
+	for _, stmt := range matches {
+		if stmt.Effect == policy.EffectDeny {
+			return true
+		}
+	}
+	return false
 }
 
 // ValidateTrustPolicy validates if a principal can assume a role (for testing)

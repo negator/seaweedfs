@@ -2,8 +2,18 @@ package ecbalancer
 
 import (
 	"github.com/seaweedfs/seaweedfs/weed/admin/topology"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
+	"github.com/seaweedfs/seaweedfs/weed/topology/balancer"
 )
+
+// diskTooFull reports whether a disk's physical filesystem is at/above the
+// balancing high-water mark, making it ineligible as an EC-shard target even
+// when slot math says it has room. Statfs free bytes already include EC shard
+// files. No-opinion when the disk reports no bytes (slot-only fallback).
+func diskTooFull(d *topology.DiskInfo) bool {
+	return balancer.DiskTooFullAfter(d.DiskInfo.DiskTotalBytes, d.DiskInfo.DiskFreeBytes, 0, balancer.DefaultMaxDiskUsagePercent)
+}
 
 // FromActiveTopology builds a Topology snapshot from the cluster's ActiveTopology
 // using the reservation-aware effective-capacity view that EC encode and repair
@@ -32,24 +42,33 @@ func FromActiveTopology(at *topology.ActiveTopology, dataShards int) *Topology {
 	nodeFree := make(map[string]int)
 	nodeDC := make(map[string]string)
 	nodeRack := make(map[string]string)
+	nodeAddr := make(map[string]string)
 	byNode := make(map[string][]*topology.DiskInfo)
 	for _, d := range disks {
 		if d == nil || d.DiskInfo == nil {
 			continue
 		}
-		if free := perDiskFreeECSlots(at, d, dataShards); free > 0 {
+		if free := perDiskFreeECSlots(at, d, dataShards); free > 0 && !diskTooFull(d) {
 			nodeFree[d.NodeID] += free
 		}
 		nodeDC[d.NodeID] = d.DataCenter
 		nodeRack[d.NodeID] = d.DataCenter + ":" + d.Rack
+		nodeAddr[d.NodeID] = d.Address
 		byNode[d.NodeID] = append(byNode[d.NodeID], d)
 	}
 
 	for nodeID, ds := range byNode {
 		node := topo.AddNode(nodeID, nodeDC[nodeID], nodeRack[nodeID], nodeFree[nodeID])
+		// Group by physical machine: derive the host from the address (NodeID may be
+		// an opaque id), falling back to the id when no address is recorded.
+		addr := nodeAddr[nodeID]
+		if addr == "" {
+			addr = nodeID
+		}
+		node.SetHost(pb.ServerAddress(addr).ToHost())
 		for _, d := range ds {
 			free := perDiskFreeECSlots(at, d, dataShards)
-			if free < 0 {
+			if free < 0 || diskTooFull(d) {
 				free = 0
 			}
 			node.AddDisk(d.DiskID, d.DiskType, free, ecShardCountOnDisk(d))

@@ -71,7 +71,7 @@ func (v *Volume) reopenIdxForWrite() error {
 		return nil
 	}
 
-	indexFile, err := os.OpenFile(v.FileName(".idx"), os.O_RDWR|os.O_CREATE, 0644)
+	indexFile, err := backend.OpenVolumeFile(v.FileName(".idx"), os.O_RDWR|os.O_CREATE)
 	if err != nil {
 		return fmt.Errorf("reopen %s read-write: %v", v.FileName(".idx"), err)
 	}
@@ -154,14 +154,21 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 
 	if v.volumeInfo.ReadOnly && !v.HasRemoteFile() {
 		// this covers the case where the volume is marked as read-only and has no remote file
-		v.noWriteOrDelete = true
+		if v.volumeInfo.ReadOnlyCanDelete {
+			v.noWriteCanDelete = true
+		} else {
+			v.noWriteOrDelete = true
+		}
 	}
 
 	if v.HasRemoteFile() {
 		v.noWriteCanDelete = true
 		v.noWriteOrDelete = false
 		glog.V(0).Infof("loading volume %d from remote %v", v.Id, v.volumeInfo)
-		if err := v.LoadRemoteFile(); err != nil {
+		// loadRemoteFileLocked, not LoadRemoteFile: load() is reached from
+		// CommitCompact with dataFileAccessLock already held, and the locking
+		// variant would deadlock re-entering it.
+		if err := v.loadRemoteFileLocked(); err != nil {
 			return fmt.Errorf("load remote file %v: %w", v.volumeInfo, err)
 		}
 		// Set lastModifiedTsSeconds from remote file to prevent premature expiry on startup
@@ -185,10 +192,10 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 		}
 		var dataFile *os.File
 		if canWrite {
-			dataFile, err = os.OpenFile(v.FileName(".dat"), os.O_RDWR|os.O_CREATE, 0644)
+			dataFile, err = backend.OpenVolumeFile(v.FileName(".dat"), os.O_RDWR|os.O_CREATE)
 		} else {
 			glog.V(0).Infof("opening %s in READONLY mode", v.FileName(".dat"))
-			dataFile, err = os.Open(v.FileName(".dat"))
+			dataFile, err = backend.OpenVolumeFile(v.FileName(".dat"), os.O_RDONLY)
 			v.noWriteOrDelete = true
 		}
 		v.lastModifiedTsSeconds = uint64(modifiedTime.Unix())
@@ -247,17 +254,31 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 				glog.Errorf("skip remote volume %d (idx: %s): %v", v.Id, v.FileName(".idx"), err)
 				return fmt.Errorf("check volume idx file %s: %w", v.FileName(".idx"), err)
 			}
-			glog.Fatalf("check volume idx file %s: %v", v.FileName(".idx"), err)
+			// A changed -dir.idx leaves the new directory without an index.
+			// The .dat still holds every row, so rebuild rather than exit.
+			if rebuildErr := v.rebuildIdxFile(); rebuildErr != nil {
+				glog.Errorf("skip volume %d (idx: %s): %v", v.Id, v.FileName(".idx"), rebuildErr)
+				return fmt.Errorf("rebuild volume idx file %s: %w", v.FileName(".idx"), rebuildErr)
+			}
+			glog.V(0).Infof("volume %d: rebuilt %s from %s", v.Id, v.FileName(".idx"), v.FileName(".dat"))
+		}
+		// Recover rows that deletes on a tiered read-only volume overwrote at
+		// the front of .idx. Best effort: a volume that cannot be repaired is
+		// still servable for everything the surviving rows index.
+		if restored, repairErr := v.repairIdxHeadTombstones(); repairErr != nil {
+			glog.Warningf("volume %d: recover overwritten %s rows: %v", v.Id, v.FileName(".idx"), repairErr)
+		} else if restored > 0 {
+			glog.V(0).Infof("volume %d: recovered %d overwritten %s rows from %s", v.Id, restored, v.FileName(".idx"), v.FileName(".dat"))
 		}
 		var indexFile *os.File
 		if v.noWriteOrDelete {
 			glog.V(0).Infoln("open to read file", v.FileName(".idx"))
-			if indexFile, err = os.OpenFile(v.FileName(".idx"), os.O_RDONLY, 0644); err != nil {
+			if indexFile, err = backend.OpenVolumeFile(v.FileName(".idx"), os.O_RDONLY); err != nil {
 				return fmt.Errorf("cannot read Volume Index %s: %v", v.FileName(".idx"), err)
 			}
 		} else {
 			glog.V(1).Infoln("open to write file", v.FileName(".idx"))
-			if indexFile, err = os.OpenFile(v.FileName(".idx"), os.O_RDWR|os.O_CREATE, 0644); err != nil {
+			if indexFile, err = backend.OpenVolumeFile(v.FileName(".idx"), os.O_RDWR|os.O_CREATE); err != nil {
 				return fmt.Errorf("cannot write Volume Index %s: %v", v.FileName(".idx"), err)
 			}
 		}
@@ -272,6 +293,7 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 				v.noWriteOrDelete = true
 				glog.V(0).Infof("volumeDataIntegrityChecking failed %v", err)
 			}
+			v.recoverLastModifiedTs(indexFile)
 		}
 
 		// The post-load structural check below uses the in-memory needle map

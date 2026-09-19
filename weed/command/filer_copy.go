@@ -371,9 +371,6 @@ func (worker *FileCopyWorker) uploadFileAsOne(task FileCopyTask, f *os.File) err
 				MimeType:          mimeType,
 				PairMap:           nil,
 			},
-			func(host, fileId string) string {
-				return fmt.Sprintf("http://%s/%s", host, fileId)
-			},
 			util.NewBytesReader(data),
 		)
 		if flushErr != nil {
@@ -456,9 +453,6 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 					MimeType:          "",
 					PairMap:           nil,
 				},
-				func(host, fileId string) string {
-					return fmt.Sprintf("http://%s/%s", host, fileId)
-				},
 				io.NewSectionReader(f, i*chunkSize, chunkSize),
 			)
 
@@ -497,7 +491,22 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 		return uploadError
 	}
 
-	manifestedChunks, manifestErr := filer.MaybeManifestize(worker.saveDataAsChunk, chunks)
+	// A fold that fails midway aborts the copy, so the blobs its earlier
+	// batches wrote go the same way as the chunks of a failed upload.
+	deleteManifestChunks := func(saved []*filer_pb.FileChunk) {
+		if len(worker.options.masters) == 0 {
+			return
+		}
+		var fileIds []string
+		for _, chunk := range saved {
+			fileIds = append(fileIds, chunk.GetFileIdString())
+		}
+		operation.DeleteFileIds(func(_ context.Context) pb.ServerAddress {
+			return pb.ServerAddress(worker.options.masters[0])
+		}, false, worker.options.grpcDialOption, fileIds)
+	}
+
+	manifestedChunks, manifestErr := filer.MaybeManifestize(worker.saveDataAsChunk, deleteManifestChunks, chunks)
 	if manifestErr != nil {
 		return fmt.Errorf("create manifest: %w", manifestErr)
 	}
@@ -576,9 +585,6 @@ func (worker *FileCopyWorker) saveDataAsChunk(reader io.Reader, name string, off
 			MimeType:          "",
 			PairMap:           nil,
 		},
-		func(host, fileId string) string {
-			return fmt.Sprintf("http://%s/%s", host, fileId)
-		},
 		reader,
 	)
 
@@ -596,7 +602,7 @@ var _ = filer_pb.FilerClient(&FileCopyWorker{})
 func (worker *FileCopyWorker) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) (err error) {
 
 	filerGrpcAddress := worker.filerAddress.ToGrpcAddress()
-	err = pb.WithGrpcClient(streamingMode, worker.signature, func(grpcConnection *grpc.ClientConn) error {
+	err = pb.WithGrpcClient(context.Background(), streamingMode, worker.signature, func(grpcConnection *grpc.ClientConn) error {
 		client := filer_pb.NewSeaweedFilerClient(grpcConnection)
 		return fn(client)
 	}, filerGrpcAddress, false, worker.options.grpcDialOption)

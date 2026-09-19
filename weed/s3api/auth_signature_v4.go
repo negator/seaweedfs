@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,6 +38,7 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	weed_iam "github.com/seaweedfs/seaweedfs/weed/iam"
+	"github.com/seaweedfs/seaweedfs/weed/iam/sts"
 
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
@@ -314,34 +316,70 @@ func (iam *IdentityAccessManagement) verifyV4Signature(r *http.Request, shouldCh
 		)
 	}
 
-	// 8. Verify the signature, trying with X-Forwarded-Prefix first
+	// 8. Verify the signature for each plausible host value: when X-Forwarded-Host carries
+	// no port, the client may have signed the Host header the proxy kept or the forwarded
+	// host and port, and the headers alone cannot tell which.
 	pathForSignature := r.URL.EscapedPath()
 	if pathForSignature == "" {
 		pathForSignature = r.URL.Path
 	}
-	if forwardedPrefix := r.Header.Get("X-Forwarded-Prefix"); forwardedPrefix != "" {
-		cleanedPath := buildPathWithForwardedPrefix(forwardedPrefix, pathForSignature)
-		calculatedSignature, errCode = verify(cleanedPath)
+	forwardedPrefix := r.Header.Get("X-Forwarded-Prefix")
+	var matchedHost string
+	for i, hostCandidate := range extractHostHeaderCandidates(r, iam.externalHost) {
+		if i > 0 && !replaceSignedHostHeader(extractedSignedHeaders, hostCandidate) {
+			break
+		}
+
+		// 9. Verify with the X-Forwarded-Prefix path first
+		if forwardedPrefix != "" {
+			cleanedPath := buildPathWithForwardedPrefix(forwardedPrefix, pathForSignature)
+			calculatedSignature, errCode = verify(cleanedPath)
+			if errCode == s3err.ErrNone {
+				matchedHost = hostCandidate
+				break
+			}
+		}
+
+		// 10. Verify with the original path
+		calculatedSignature, errCode = verify(pathForSignature)
 		if errCode == s3err.ErrNone {
-			return identity, cred, calculatedSignature, authInfo, s3err.ErrNone
+			matchedHost = hostCandidate
+			break
+		}
+
+		// 11. Retry with decoded path if signature used raw path encoding
+		if decodedPath, decodeErr := url.PathUnescape(pathForSignature); decodeErr == nil && decodedPath != pathForSignature {
+			calculatedSignature, errCode = verify(decodedPath)
+			if errCode == s3err.ErrNone {
+				matchedHost = hostCandidate
+				break
+			}
 		}
 	}
 
-	// 9. Verify with the original path
-	calculatedSignature, errCode = verify(pathForSignature)
-	if errCode == s3err.ErrNone {
+	if matchedHost != "" {
+		if signedBucket, ok := bucketFromVirtualHost(matchedHost, iam.domain); ok {
+			if routedBucket, _ := s3_constants.GetBucketAndObject(r); routedBucket != "" && routedBucket != signedBucket {
+				glog.V(2).Infof("reject %s %s: signed host %q implies bucket %q but routed to %q",
+					r.Method, r.URL.Path, matchedHost, signedBucket, routedBucket)
+				return nil, nil, "", nil, s3err.ErrAccessDenied
+			}
+		}
 		return identity, cred, calculatedSignature, authInfo, s3err.ErrNone
 	}
 
-	// 10. Retry with decoded path if signature used raw path encoding
-	if decodedPath, decodeErr := url.PathUnescape(pathForSignature); decodeErr == nil && decodedPath != pathForSignature {
-		calculatedSignature, errCode = verify(decodedPath)
-		if errCode == s3err.ErrNone {
-			return identity, cred, calculatedSignature, authInfo, s3err.ErrNone
+	return nil, nil, "", nil, errCode
+}
+
+func replaceSignedHostHeader(headers http.Header, host string) bool {
+	replaced := false
+	for name := range headers {
+		if strings.EqualFold(name, "host") {
+			headers[name] = []string{host}
+			replaced = true
 		}
 	}
-
-	return nil, nil, "", nil, errCode
+	return replaced
 }
 
 // validateSTSSessionToken validates an STS session token and extracts temporary credentials
@@ -433,21 +471,29 @@ func (iam *IdentityAccessManagement) validateSTSSessionToken(r *http.Request, se
 		claims[k] = v
 	}
 
-	// Create an identity for the STS session
-	// The identity represents the assumed role user
+	// Key the principal on the OIDC subject so a session resolves to the same
+	// identity on the SigV4 and JWT paths (see s3_iam_middleware.go); fall back to
+	// the assumed-role user when absent. Distinct per principal, not shared admin.
+	principal := sessionInfo.Subject
+	if principal == "" {
+		principal = sessionInfo.AssumedRoleUser
+	}
 	identity := &Identity{
-		Name:         sessionInfo.AssumedRoleUser, // Use the assumed role user as the identity name
-		Account:      &AccountAdmin,               // STS sessions use admin account
+		Name:         principal,
+		Account:      &Account{Id: principal, DisplayName: sessionInfo.SessionName, EmailAddress: principal + "@seaweedfs.local"},
 		Credentials:  []*Credential{cred},
 		PrincipalArn: sessionInfo.Principal,
 		PolicyNames:  sessionInfo.Policies, // Populate PolicyNames for IAM authorization
 		Claims:       claims,               // Populate Claims for policy variable substitution
 	}
-
-	// Restore admin privileges if the session was created by an admin
-	// if isAdmin, ok := claims["is_admin"].(bool); ok && isAdmin {
-	// 	identity.Actions = append(identity.Actions, s3_constants.ACTION_ADMIN)
-	// }
+	// ParentUser is set only for OIDC-federated sessions (see
+	// AssumeRoleWithWebIdentity), so it gates the audit identity claim: without
+	// it the request context's sub is the opaque session subject injected by
+	// ValidateJWTWithClaims, not the OIDC subject, and must not be surfaced as
+	// an authoritative identity.
+	if sessionInfo.ParentUser != "" {
+		identity.IdentityClaim = sts.ResolveIdentityClaim(sessionInfo.RequestContext)
+	}
 
 	glog.V(2).Infof("Successfully validated STS session token for principal: %s, assumed role user: %s",
 		sessionInfo.Principal, sessionInfo.AssumedRoleUser)
@@ -559,6 +605,10 @@ func extractV4AuthInfoFromQuery(r *http.Request) (*v4AuthInfo, s3err.ErrorCode) 
 	if query.Get("X-Amz-Expires") == "" {
 		return nil, s3err.ErrInvalidQueryParams
 	}
+	signedHeaders, errCode := parseSignedHeaderList(query.Get("X-Amz-SignedHeaders"))
+	if errCode != s3err.ErrNone {
+		return nil, errCode
+	}
 
 	// Parse date
 	dateStr := query.Get("X-Amz-Date")
@@ -584,7 +634,7 @@ func extractV4AuthInfoFromQuery(r *http.Request) (*v4AuthInfo, s3err.ErrorCode) 
 	return &v4AuthInfo{
 		Signature:     query.Get("X-Amz-Signature"),
 		AccessKey:     credHeader.accessKey,
-		SignedHeaders: strings.Split(query.Get("X-Amz-SignedHeaders"), ";"),
+		SignedHeaders: signedHeaders,
 		Date:          t,
 		Region:        credHeader.scope.region,
 		Service:       credHeader.scope.service,
@@ -595,15 +645,14 @@ func extractV4AuthInfoFromQuery(r *http.Request) (*v4AuthInfo, s3err.ErrorCode) 
 }
 
 func getCanonicalQueryString(r *http.Request, isPresigned bool) string {
-	var queryToEncode string
-	if !isPresigned {
-		queryToEncode = r.URL.Query().Encode()
-	} else {
-		queryForCanonical := r.URL.Query()
+	queryForCanonical := r.URL.Query()
+	if isPresigned {
 		queryForCanonical.Del("X-Amz-Signature")
-		queryToEncode = queryForCanonical.Encode()
 	}
-	return queryToEncode
+	for key := range queryForCanonical {
+		sort.Strings(queryForCanonical[key])
+	}
+	return queryForCanonical.Encode()
 }
 
 func checkPresignedRequestExpiry(r *http.Request, t time.Time) s3err.ErrorCode {
@@ -716,19 +765,28 @@ func parseSignedHeader(signedHdrElement string) ([]string, s3err.ErrorCode) {
 	if signedHdrFields[0] != "SignedHeaders" {
 		return nil, s3err.ErrMissingSignHeadersTag
 	}
-	if signedHdrFields[1] == "" {
+	return parseSignedHeaderList(signedHdrFields[1])
+}
+
+func parseSignedHeaderList(signedHeadersValue string) ([]string, s3err.ErrorCode) {
+	if signedHeadersValue == "" {
 		return nil, s3err.ErrMissingFields
 	}
-	signedHeaders := strings.Split(signedHdrFields[1], ";")
+	signedHeaders := strings.Split(signedHeadersValue, ";")
+	for _, header := range signedHeaders {
+		if strings.TrimSpace(header) == "" {
+			return nil, s3err.ErrMissingFields
+		}
+	}
 	return signedHeaders, s3err.ErrNone
 }
 
-func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(formValues http.Header) s3err.ErrorCode {
+func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(formValues http.Header) (*Identity, s3err.ErrorCode) {
 
 	// Parse credential tag.
 	credHeader, err := parseCredentialHeader("Credential=" + formValues.Get("X-Amz-Credential"))
 	if err != s3err.ErrNone {
-		return err
+		return nil, err
 	}
 
 	identity, cred, found := iam.lookupByAccessKey(credHeader.accessKey)
@@ -741,19 +799,19 @@ func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(formValues http.
 		glog.Warningf("InvalidAccessKeyId (POST policy): attempted key '%s' not found. Available keys: %d, Auth enabled: %v",
 			credHeader.accessKey, availableKeyCount, iam.isAuthEnabled)
 
-		return s3err.ErrInvalidAccessKeyID
+		return nil, s3err.ErrInvalidAccessKeyID
 	}
 
 	// Check service account expiration
 	if cred.isCredentialExpired() {
 		glog.V(2).Infof("Service account credential %s has expired (expiration: %d, now: %d)",
 			credHeader.accessKey, cred.Expiration, time.Now().Unix())
-		return s3err.ErrAccessDenied
+		return nil, s3err.ErrAccessDenied
 	}
 
 	bucket := formValues.Get("bucket")
 	if !identity.CanDo(s3_constants.ACTION_WRITE, bucket, "") {
-		return s3err.ErrAccessDenied
+		return nil, s3err.ErrAccessDenied
 	}
 
 	// Get signing key.
@@ -764,9 +822,9 @@ func (iam *IdentityAccessManagement) doesPolicySignatureV4Match(formValues http.
 
 	// Verify signature.
 	if !compareSignatureV4(newSignature, formValues.Get("X-Amz-Signature")) {
-		return s3err.ErrSignatureDoesNotMatch
+		return nil, s3err.ErrSignatureDoesNotMatch
 	}
-	return s3err.ErrNone
+	return identity, s3err.ErrNone
 }
 
 // sigV4PayloadHashHeader is x-amz-content-sha256. It participates in the
@@ -848,13 +906,22 @@ func extractSignedHeaders(signedHeaders []string, r *http.Request, externalHost 
 	return extractedSignedHeaders, s3err.ErrNone
 }
 
-// extractHostHeader returns the value of host header to use for signature verification.
-// When externalHost is set (from s3.externalUrl), it is returned directly.
-// Otherwise, the host is reconstructed from X-Forwarded-* headers or the request Host,
-// with default port stripping to match AWS SDK SanitizeHostForHeader behavior.
+// extractHostHeader returns the most likely host header value for signature verification.
 func extractHostHeader(r *http.Request, externalHost string) string {
+	return extractHostHeaderCandidates(r, externalHost)[0]
+}
+
+// extractHostHeaderCandidates returns the host values the client may have signed, most
+// likely first. externalHost (from s3.externalUrl) leads when set, but the hosts derived
+// from X-Forwarded-* headers or the request Host still follow it, so clients that reach
+// the gateway directly rather than through the proxy keep verifying.
+// When X-Forwarded-Host carries no port, the true client port is ambiguous: a proxy that
+// kept the Host header makes the r.Host port right, one that rewrote it makes
+// X-Forwarded-Port right, and a client on the scheme's default port signed no port at all.
+func extractHostHeaderCandidates(r *http.Request, externalHost string) []string {
+	var candidates []string
 	if externalHost != "" {
-		return externalHost
+		candidates = append(candidates, externalHost)
 	}
 
 	forwardedHost := r.Header.Get("X-Forwarded-Host")
@@ -883,7 +950,8 @@ func extractHostHeader(r *http.Request, externalHost string) string {
 		scheme = forwardedProto
 	}
 
-	var host, port string
+	var host string
+	var ports []string
 	if forwardedHost != "" {
 		// X-Forwarded-Host can be a comma-separated list of hosts when there are multiple proxies.
 		// Use only the first host in the list and trim spaces for robustness.
@@ -896,14 +964,16 @@ func extractHostHeader(r *http.Request, externalHost string) string {
 		// If the host itself contains a port, it should take precedence
 		if h, p, err := net.SplitHostPort(host); err == nil {
 			host = h
-			port = p
+			ports = []string{p}
 		} else {
-			// If X-Forwarded-Host has no port, try to get port from r.Host if hostnames match
-			if rh, rp, err := net.SplitHostPort(r.Host); err == nil && rh == host {
-				port = rp
-			} else if forwardedPort != "" {
-				port = forwardedPort
+			// SplitHostPort unbrackets IPv6 hosts, so unbracket the forwarded host to match
+			if rh, rp, err := net.SplitHostPort(r.Host); err == nil && rh == strings.Trim(host, "[]") {
+				ports = append(ports, rp)
 			}
+			if forwardedPort != "" {
+				ports = append(ports, forwardedPort)
+			}
+			ports = append(ports, "")
 		}
 	} else {
 		host = r.Host
@@ -915,14 +985,55 @@ func extractHostHeader(r *http.Request, externalHost string) string {
 		// Otherwise, if X-Forwarded-Port is set, use it.
 		if h, p, err := net.SplitHostPort(host); err == nil {
 			host = h
-			port = p
-		} else if forwardedPort != "" {
-			port = forwardedPort
+			ports = []string{p}
+		} else {
+			if forwardedPort != "" {
+				ports = append(ports, forwardedPort)
+			}
+			ports = append(ports, "")
 		}
 	}
 
-	// Strip default ports based on scheme to match AWS SDK SanitizeHostForHeader behavior.
-	// The AWS SDK strips port 80 for HTTP and port 443 for HTTPS before signing.
+	for _, port := range ports {
+		candidate := joinSignedHost(host, port, scheme)
+		if !slices.Contains(candidates, candidate) {
+			candidates = append(candidates, candidate)
+		}
+	}
+	return candidates
+}
+
+func bucketFromVirtualHost(host, domainConfig string) (string, bool) {
+	if domainConfig == "" {
+		return "", false
+	}
+	h := host
+	if hh, _, err := net.SplitHostPort(host); err == nil {
+		h = hh
+	}
+	h = strings.ToLower(h)
+	pathStyleDomains, virtualHostDomains := classifyDomainNames(strings.Split(domainConfig, ","))
+	for _, domain := range pathStyleDomains {
+		if h == strings.ToLower(strings.TrimSpace(domain)) {
+			return "", false
+		}
+	}
+	for _, domain := range virtualHostDomains {
+		suffix := "." + strings.ToLower(strings.TrimSpace(domain))
+		if strings.HasSuffix(h, suffix) {
+			bucket := h[:len(h)-len(suffix)]
+			if bucket != "" {
+				return bucket, true
+			}
+		}
+	}
+	return "", false
+}
+
+// joinSignedHost renders host:port the way AWS SDKs sign it: default ports are stripped
+// to match SanitizeHostForHeader, and bare IPv6 addresses lose their brackets.
+// Reference: https://github.com/aws/aws-sdk-go-v2/blob/main/aws/signer/internal/v4/host.go
+func joinSignedHost(host, port, scheme string) string {
 	if port != "" && !isDefaultPort(scheme, port) {
 		// Strip existing brackets before calling JoinHostPort, which automatically adds
 		// brackets for IPv6 addresses. This prevents double-bracketing like [[::1]]:8080.
@@ -930,9 +1041,6 @@ func extractHostHeader(r *http.Request, externalHost string) string {
 		return net.JoinHostPort(host, port)
 	}
 
-	// Default port was stripped, or no port present.
-	// For IPv6 addresses, strip brackets to match AWS SDK behavior.
-	// Reference: https://github.com/aws/aws-sdk-go-v2/blob/main/aws/signer/internal/v4/host.go
 	if strings.Contains(host, ":") {
 		return strings.Trim(host, "[]")
 	}
@@ -1064,6 +1172,19 @@ func getSignedHeaders(signedHeaders http.Header) string {
 // if object matches reserved string, no need to encode them
 var reservedObjectNames = regexp.MustCompile("^[a-zA-Z0-9-_.~/]+$")
 
+// pathHexTable is used for manual percent-encoding in encodePath to avoid
+// the allocations of hex.EncodeToString + strings.ToUpper.
+const pathHexTable = "0123456789ABCDEF"
+
+// isPathUnreservedChar reports whether s is an RFC 3986 §2.3 unreserved
+// character (or '/') that does not need percent-encoding in an object path.
+func isPathUnreservedChar(s rune) bool {
+	return 'A' <= s && s <= 'Z' ||
+		'a' <= s && s <= 'z' ||
+		'0' <= s && s <= '9' ||
+		s == '-' || s == '_' || s == '.' || s == '~' || s == '/'
+}
+
 // encodePath encodes the strings from UTF-8 byte representations to HTML hex escape sequences
 //
 // This is necessary since regular url.Parse() and url.Encode() functions do not support UTF-8
@@ -1072,32 +1193,42 @@ var reservedObjectNames = regexp.MustCompile("^[a-zA-Z0-9-_.~/]+$")
 // This function on the other hand is a direct replacement for url.Encode() technique to support
 // pretty much every UTF-8 character.
 func encodePath(pathName string) string {
-	if reservedObjectNames.MatchString(pathName) {
+	// Fast path: if every character is unreserved, the encoded form equals the
+	// input, so return it unchanged with zero allocation. This is the common
+	// case for ASCII object keys and avoids the regexp engine on the SigV4 hot
+	// path, where encodePath runs on every authenticated request.
+	needEncode := false
+	for _, s := range pathName {
+		if !isPathUnreservedChar(s) {
+			needEncode = true
+			break
+		}
+	}
+	if !needEncode {
 		return pathName
 	}
-	var encodedPathname string
+
+	// Slow path: preallocated Builder + manual hex encoding.
+	var buf strings.Builder
+	buf.Grow(len(pathName) * 3) // encoded form is at most 3x the byte length
 	for _, s := range pathName {
-		if 'A' <= s && s <= 'Z' || 'a' <= s && s <= 'z' || '0' <= s && s <= '9' { // §2.3 Unreserved characters (mark)
-			encodedPathname = encodedPathname + string(s)
+		if isPathUnreservedChar(s) { // §2.3 Unreserved characters (mark)
+			buf.WriteRune(s)
 		} else {
-			switch s {
-			case '-', '_', '.', '~', '/': // §2.3 Unreserved characters (mark)
-				encodedPathname = encodedPathname + string(s)
-			default:
-				runeLen := utf8.RuneLen(s)
-				if runeLen < 0 {
-					return pathName
-				}
-				u := make([]byte, runeLen)
-				utf8.EncodeRune(u, s)
-				for _, r := range u {
-					hex := hex.EncodeToString([]byte{r})
-					encodedPathname = encodedPathname + "%" + strings.ToUpper(hex)
-				}
+			runeLen := utf8.RuneLen(s)
+			if runeLen < 0 {
+				return pathName
+			}
+			var u [utf8.UTFMax]byte
+			utf8.EncodeRune(u[:], s)
+			for _, r := range u[:runeLen] {
+				buf.WriteByte('%')
+				buf.WriteByte(pathHexTable[r>>4])
+				buf.WriteByte(pathHexTable[r&0x0f])
 			}
 		}
 	}
-	return encodedPathname
+	return buf.String()
 }
 
 // getSignature final signature in hexadecimal form.

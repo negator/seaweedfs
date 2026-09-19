@@ -77,10 +77,117 @@ type VolumeServerOptions struct {
 	allowUntrustedRemoteEndpoints *bool
 	debug                         *bool
 	debugPort                     *int
+	diskIOProbe                   *bool
+	diskIOTimeout                 *time.Duration
+	diskIOInterval                *time.Duration
+	diskHDDIOSlowLatency          *time.Duration
+	diskSSDIOSlowLatency          *time.Duration
+	diskNVMEIOSlowLatency         *time.Duration
+	diskIOWindow                  *time.Duration
+	diskIOMinSamples              *int
+	diskIOSlowPercent             *float64
+	diskIOErrorPercent            *float64
+	diskIOMaxStatFailures         *int
+	diskRecoveryCoef              *float64
 	// shutdownCtx, when non-nil, tells startVolumeServer to shut down once the
 	// ctx is cancelled. Used by integration tests and by weed mini; nil for
 	// standalone weed volume.
 	shutdownCtx context.Context
+}
+
+func (v *VolumeServerOptions) setDiskIOProbeDefaults() {
+	if v.diskIOProbe == nil {
+		defaultValue := false
+		v.diskIOProbe = &defaultValue
+	}
+	if v.diskIOTimeout == nil {
+		defaultValue := 2 * time.Second
+		v.diskIOTimeout = &defaultValue
+	}
+	if v.diskIOInterval == nil {
+		defaultValue := 60 * time.Second
+		v.diskIOInterval = &defaultValue
+	}
+	if v.diskHDDIOSlowLatency == nil {
+		defaultValue := 500 * time.Millisecond
+		v.diskHDDIOSlowLatency = &defaultValue
+	}
+	if v.diskSSDIOSlowLatency == nil {
+		defaultValue := 100 * time.Millisecond
+		v.diskSSDIOSlowLatency = &defaultValue
+	}
+	if v.diskNVMEIOSlowLatency == nil {
+		defaultValue := 50 * time.Millisecond
+		v.diskNVMEIOSlowLatency = &defaultValue
+	}
+	if v.diskIOWindow == nil {
+		defaultValue := time.Minute
+		v.diskIOWindow = &defaultValue
+	}
+	if v.diskIOMinSamples == nil {
+		defaultValue := 10
+		v.diskIOMinSamples = &defaultValue
+	}
+	if v.diskIOSlowPercent == nil {
+		defaultValue := 20.0
+		v.diskIOSlowPercent = &defaultValue
+	}
+	if v.diskIOErrorPercent == nil {
+		defaultValue := 10.0
+		v.diskIOErrorPercent = &defaultValue
+	}
+	if v.diskIOMaxStatFailures == nil {
+		defaultValue := 5
+		v.diskIOMaxStatFailures = &defaultValue
+	}
+	if v.diskRecoveryCoef == nil {
+		defaultValue := 0.5
+		v.diskRecoveryCoef = &defaultValue
+	}
+}
+
+func (v *VolumeServerOptions) applyDiskIOProbeConfig() {
+	v.setDiskIOProbeDefaults()
+
+	config := util.GetViper()
+
+	if config.IsSet("volume.disk.io.probe") {
+		*v.diskIOProbe = config.GetBool("volume.disk.io.probe")
+	}
+	if config.IsSet("volume.disk.io.timeout") {
+		*v.diskIOTimeout = config.GetDuration("volume.disk.io.timeout")
+	}
+	if config.IsSet("volume.disk.io.slow.latency.hdd") {
+		*v.diskHDDIOSlowLatency = config.GetDuration("volume.disk.io.slow.latency.hdd")
+	}
+	if config.IsSet("volume.disk.io.slow.latency.ssd") {
+		*v.diskSSDIOSlowLatency = config.GetDuration("volume.disk.io.slow.latency.ssd")
+	}
+	if config.IsSet("volume.disk.io.slow.latency.nvme") {
+		*v.diskNVMEIOSlowLatency = config.GetDuration("volume.disk.io.slow.latency.nvme")
+	}
+
+	if config.IsSet("volume.disk.io.interval") {
+		*v.diskIOInterval = config.GetDuration("volume.disk.io.interval")
+	}
+	if config.IsSet("volume.disk.io.window") {
+		*v.diskIOWindow = config.GetDuration("volume.disk.io.window")
+	}
+	if config.IsSet("volume.disk.io.min.samples") {
+		*v.diskIOMinSamples = config.GetInt("volume.disk.io.min.samples")
+	}
+	if config.IsSet("volume.disk.io.slow.percent") {
+		*v.diskIOSlowPercent = config.GetFloat64("volume.disk.io.slow.percent")
+	}
+	if config.IsSet("volume.disk.io.error.percent") {
+		*v.diskIOErrorPercent = config.GetFloat64("volume.disk.io.error.percent")
+	}
+	if config.IsSet("volume.disk.io.max.stat.failures") {
+		*v.diskIOMaxStatFailures = config.GetInt("volume.disk.io.max.stat.failures")
+	}
+	if config.IsSet("volume.disk.io.recovery.coef") {
+		*v.diskRecoveryCoef = config.GetFloat64("volume.disk.io.recovery.coef")
+	}
 }
 
 func init() {
@@ -123,6 +230,7 @@ func init() {
 	v.allowUntrustedRemoteEndpoints = cmdVolume.Flag.Bool("volume.allowUntrustedRemoteEndpoints", false, "if true, FetchAndWriteNeedle accepts arbitrary remote S3 endpoints including loopback / link-local hosts. Default rejects internal / metadata endpoints.")
 	v.debug = cmdVolume.Flag.Bool("debug", false, "serves runtime profiling data via pprof on the port specified by -debug.port")
 	v.debugPort = cmdVolume.Flag.Int("debug.port", 6060, "http port for debugging")
+	v.setDiskIOProbeDefaults()
 }
 
 var cmdVolume = &Command{
@@ -147,6 +255,8 @@ func runVolume(cmd *Command, args []string) bool {
 	}
 
 	util.LoadSecurityConfiguration()
+	util.LoadConfiguration("volume", false)
+	v.applyDiskIOProbeConfig()
 
 	// If --pprof is set we assume the caller wants to be able to collect
 	// cpu and memory profiles via go tool pprof
@@ -179,14 +289,33 @@ func runVolume(cmd *Command, args []string) bool {
 }
 
 func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, volumeWhiteListOption string, minFreeSpaces []util.MinFreeSpace) {
+	v.setDiskIOProbeDefaults()
 
 	// Set multiple folders and each folder's max volume count limit'
 	v.folders = strings.Split(volumeFolders, ",")
+	// Two locations on one directory would load every volume twice, appending to
+	// the same .dat under two independent locks. Compare identity rather than the
+	// path, so a symlink or bind mount aliasing an earlier -dir is caught too.
+	type seenFolder struct {
+		path string
+		info os.FileInfo
+	}
+	var seenFolders []seenFolder
 	for i, folder := range v.folders {
 		v.folders[i] = util.ResolvePath(folder)
 		if err := util.TestFolderWritable(v.folders[i]); err != nil {
 			glog.Fatalf("Check Data Folder(-dir) Writable %s : %s", v.folders[i], err)
 		}
+		folderInfo, err := os.Stat(v.folders[i])
+		if err != nil {
+			glog.Fatalf("Check Data Folder(-dir) %s : %s", v.folders[i], err)
+		}
+		for _, seen := range seenFolders {
+			if os.SameFile(seen.info, folderInfo) {
+				glog.Fatalf("Data Folder(-dir) %s and %s are the same directory", seen.path, v.folders[i])
+			}
+		}
+		seenFolders = append(seenFolders, seenFolder{v.folders[i], folderInfo})
 	}
 
 	// set max
@@ -247,6 +376,7 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 	if *v.bindIp == "" {
 		*v.bindIp = *v.ip
 	}
+	util.SetOutboundLocalIP(*v.bindIp)
 
 	if *v.publicPort == 0 {
 		*v.publicPort = *v.port
@@ -285,6 +415,28 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 	// Determine volume server ID: if not specified, use ip:port
 	volumeServerId := util.GetVolumeServerId(*v.id, *v.ip, *v.port)
 
+	diskProbeConfig := stats_collect.DiskIOProbeConfig{
+		Enabled:  *v.diskIOProbe,
+		Timeout:  *v.diskIOTimeout,
+		Interval: *v.diskIOInterval,
+
+		SlowLatency: *v.diskHDDIOSlowLatency,
+		SlowLatencyByDiskType: map[string]time.Duration{
+			types.HddType:  *v.diskHDDIOSlowLatency,
+			types.SsdType:  *v.diskSSDIOSlowLatency,
+			types.NvmeType: *v.diskNVMEIOSlowLatency,
+		},
+
+		Window:     *v.diskIOWindow,
+		MinSamples: *v.diskIOMinSamples,
+
+		SlowPercent:  *v.diskIOSlowPercent,
+		ErrorPercent: *v.diskIOErrorPercent,
+
+		MaxStatFailures: *v.diskIOMaxStatFailures,
+
+		RecoveryCoef: *v.diskRecoveryCoef,
+	}
 	volumeServer := weed_server.NewVolumeServer(volumeMux, publicVolumeMux,
 		*v.ip, *v.port, *v.portGrpc, *v.publicUrl, volumeServerId,
 		v.folders, v.folderMaxLimits, minFreeSpaces, diskTypes, folderTags,
@@ -304,6 +456,7 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 		*v.readBufferSizeMB,
 		*v.ldbTimeout,
 		*v.allowUntrustedRemoteEndpoints,
+		diskProbeConfig,
 	)
 	// starting grpc server
 	grpcS := v.startGrpcService(volumeServer)

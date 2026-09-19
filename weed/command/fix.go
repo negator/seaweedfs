@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -36,14 +37,15 @@ var cmdFix = &Command{
 }
 
 var (
-	fixVolumeCollection = cmdFix.Flag.String("collection", "", "an optional volume collection name, if specified only it will be processed")
-	fixVolumeId         = cmdFix.Flag.Int64("volumeId", 0, "an optional volume id, if not 0 (default) only it will be processed")
-	fixIncludeDeleted   = cmdFix.Flag.Bool("includeDeleted", true, "include deleted entries in the index file")
-	fixIgnoreError      = cmdFix.Flag.Bool("ignoreError", false, "an optional, if true will be processed despite errors")
-	fixRemoteFile       = cmdFix.Flag.Bool("remoteFile", false, "an optional, if true will not try to load the local .dat file, but only the remote file")
-	fixGenerateEcx      = cmdFix.Flag.Bool("ecx", false, "regenerate a lost EC index (.ecx) — and the .vif when missing — from the local .ec## shards (missing shards are reconstructed from parity when enough survive). Run with the volume server stopped.")
-	fixEcDataShards     = cmdFix.Flag.Int("ecDataShards", 0, "EC data shard count for -ecx (0 = read from .vif, otherwise default 10)")
-	fixEcParityShards   = cmdFix.Flag.Int("ecParityShards", 0, "EC parity shard count for -ecx (0 = read from .vif, infer from shard count, otherwise default 4)")
+	fixVolumeCollection      = cmdFix.Flag.String("collection", "", "an optional volume collection name, if specified only it will be processed")
+	fixVolumeId              = cmdFix.Flag.Int64("volumeId", 0, "an optional volume id, if not 0 (default) only it will be processed")
+	fixIncludeDeleted        = cmdFix.Flag.Bool("includeDeleted", true, "include deleted entries in the index file")
+	fixIgnoreError           = cmdFix.Flag.Bool("ignoreError", false, "an optional, if true will be processed despite errors")
+	fixRemoteFile            = cmdFix.Flag.Bool("remoteFile", false, "an optional, if true will not try to load the local .dat file, but only the remote file")
+	fixGenerateEcx           = cmdFix.Flag.Bool("ecx", false, "regenerate a lost EC index (.ecx) — and the .vif when missing — from the local .ec## shards (missing shards are reconstructed from parity when enough survive). Run with the volume server stopped.")
+	fixEcDataShards          = cmdFix.Flag.Int("ecDataShards", 0, "EC data shard count for -ecx (0 = read from .vif, otherwise default 10)")
+	fixEcParityShards        = cmdFix.Flag.Int("ecParityShards", 0, "EC parity shard count for -ecx (0 = read from .vif, infer from shard count, otherwise default 4)")
+	fixEcUnsafeIgnoreSidecar = cmdFix.Flag.Bool("ecUnsafeIgnoreSidecar", false, "for -ecx: proceed even when the EC bitrot checksum sidecar (.ecsum) is malformed or stale, instead of failing closed; the reconstructed shards are not verified against it")
 )
 
 type VolumeFileScanner4Fix struct {
@@ -190,15 +192,34 @@ func SaveToIdx(scaner *VolumeFileScanner4Fix, idxName string) (ret error) {
 		idxFile.Close()
 	}()
 
-	return scaner.nm.AscendingVisit(func(value needle_map.NeedleValue) error {
-		_, err := idxFile.Write(value.ToBytes())
-		if scaner.includeDeleted && err == nil {
-			if deleted, ok := scaner.nmDeleted.Get(value.Key); ok {
-				_, err = idxFile.Write(deleted.ToBytes())
-			}
-		}
+	// Emit entries in .dat offset (append) order so the .idx stays the
+	// append-ordered log the volume server writes at runtime — not sorted by
+	// key, which is the .sdx / .ecx shape. A key-sorted .idx puts the
+	// highest-key needle last instead of the .dat-tail needle, which used to
+	// flip volumes read-only on load. Every tombstone is included (including
+	// any whose live needle is gone) so the last entry is the real .dat tail.
+	var values []needle_map.NeedleValue
+	collect := func(value needle_map.NeedleValue) error {
+		values = append(values, value)
+		return nil
+	}
+	if err = scaner.nm.AscendingVisit(collect); err != nil {
 		return err
+	}
+	if scaner.includeDeleted {
+		if err = scaner.nmDeleted.AscendingVisit(collect); err != nil {
+			return err
+		}
+	}
+	sort.Slice(values, func(i, j int) bool {
+		return values[i].Offset.ToActualOffset() < values[j].Offset.ToActualOffset()
 	})
+	for _, value := range values {
+		if _, err = idxFile.Write(value.ToBytes()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func doFixOneVolume(basepath string, baseFileName string, collection string, volumeId int64, fixIncludeDeleted bool) {
@@ -306,9 +327,15 @@ func doFixEcxFromShards(basePath, baseFileName, collection string, volumeId int6
 	// Priority: explicit flags > existing .vif > defaults (10+4).
 	vifName := base + ".vif"
 	vifExists := util.FileExists(vifName)
+	// Whether the on-disk .vif actually answers the layout question. An empty
+	// stub (MaybeLoadVolumeInfo reads it as absent) or one with no EC config
+	// exists but tells us nothing, and the recovered layout must still be
+	// written back over it.
+	vifUsable := false
 	dataShards := erasure_coding.DataShardsCount
 	parityShards := erasure_coding.ParityShardsCount
 	var datFileSize int64
+	blockSize := int64(-1) // the shard block layout; 0 legacy, >0 uniform, <0 unknown
 	if vifExists {
 		// MaybeLoadVolumeInfo returns a non-nil error when the .vif exists but
 		// cannot be read or unmarshalled; fail loudly rather than silently
@@ -317,11 +344,64 @@ func doFixEcxFromShards(basePath, baseFileName, collection string, volumeId int6
 			fail(fmt.Errorf("volume %d: read %s: %w", volumeId, vifName, loadErr))
 			return
 		} else if found && vi != nil {
-			if cfg := vi.GetEcShardConfig(); cfg != nil && cfg.GetDataShards() > 0 {
+			// A partial config (parity 0, or counts past the shard ceiling)
+			// describes no layout: leave the sentinel unknown and let the
+			// sidecar / dual scan below answer, and rewrite the .vif at the end
+			// rather than trusting it.
+			cfg := vi.GetEcShardConfig()
+			if cfg != nil && erasure_coding.ValidEcShardCounts(cfg.GetDataShards(), cfg.GetParityShards()) {
 				dataShards = int(cfg.GetDataShards())
 				parityShards = int(cfg.GetParityShards())
+				// Only an EC config answers the layout question. Reading 0 off a
+				// vif with no config would assert "legacy" and suppress both the
+				// .ecsum fallback and the dual-layout scan below; leave the
+				// sentinel at -1 (unknown) instead.
+				// A recorded block size no encoder could have produced is not
+				// an answer: a positive one would pin the scan to a geometry
+				// that de-stripes to garbage, and a negative one would leave
+				// the invalid .vif in place after the dual scan recovers the
+				// real layout. Leave the sentinel unknown and rewrite the file
+				// at the end.
+				if bs := cfg.GetBlockSize(); erasure_coding.ValidateBlockSize(bs) == nil {
+					blockSize = bs
+					vifUsable = true
+				} else {
+					glog.Warningf("volume %d: %s records an invalid shard block size %d; recovering the layout by scan and rewriting it",
+						volumeId, vifName, bs)
+				}
 			}
 			datFileSize = vi.GetDatFileSize()
+		}
+	}
+	// The bitrot sidecar records the same EC config at encode time; use it when
+	// the .vif is gone. A uniform-layout volume cannot be de-striped correctly
+	// without its block size.
+	if blockSize < 0 {
+		sidecarPath := erasure_coding.BitrotSidecarPath(base, 0)
+		if prot, serr := erasure_coding.LoadBitrotSidecar(sidecarPath); serr == nil {
+			// The sidecar is about to pin the reconstruction to one geometry
+			// instead of letting the dual scan decide, so every field it
+			// contributes has to hold up: it must describe generation 0 (the
+			// shards being read), a complete in-range ratio, and a block size
+			// an encoder could have produced. Anything less leaves the layout
+			// unknown, which is the answer that still recovers by scanning.
+			cfg := prot.GetEcShardConfig()
+			ds, ps := int(cfg.GetDataShards()), int(cfg.GetParityShards())
+			switch {
+			case prot.GetGeneration() != 0:
+				glog.Warningf("volume %d: %s records generation %d, not the generation-0 shards; ignoring it",
+					volumeId, sidecarPath, prot.GetGeneration())
+			case !erasure_coding.ValidEcShardCounts(cfg.GetDataShards(), cfg.GetParityShards()):
+				glog.Warningf("volume %d: %s records invalid shard counts %d+%d; ignoring it",
+					volumeId, sidecarPath, ds, ps)
+			case erasure_coding.ValidateBlockSize(cfg.GetBlockSize()) != nil:
+				glog.Warningf("volume %d: %s records an invalid shard block size %d; ignoring it",
+					volumeId, sidecarPath, cfg.GetBlockSize())
+			default:
+				dataShards = ds
+				parityShards = ps
+				blockSize = cfg.GetBlockSize()
+			}
 		}
 	}
 	if *fixEcDataShards > 0 {
@@ -360,8 +440,11 @@ func doFixEcxFromShards(basePath, baseFileName, collection string, volumeId int6
 	}
 	if !dataComplete {
 		ctx := &erasure_coding.ECContext{DataShards: dataShards, ParityShards: parityShards}
+		if blockSize > 0 {
+			ctx.BlockSize = blockSize
+		}
 		glog.Infof("volume %d: %d/%d shards present; reconstructing missing shards (%s) before index rebuild", volumeId, presentCount, dataShards+parityShards, ctx.String())
-		if _, err := erasure_coding.RebuildEcFilesWithContext(base, ctx); err != nil {
+		if _, err := erasure_coding.RebuildEcFiles(base, ctx, *fixEcUnsafeIgnoreSidecar); err != nil {
 			fail(fmt.Errorf("volume %d: reconstruct missing shards from %d survivors: %w", volumeId, presentCount, err))
 			return
 		}
@@ -386,30 +469,106 @@ func doFixEcxFromShards(basePath, baseFileName, collection string, volumeId int6
 		glog.V(0).Infof("volume %d: no .dat size in .vif; reconstructing padded .dat (%d bytes) from %d data shards", volumeId, reconstructSize, dataShards)
 	}
 
-	// De-stripe the data shards into a temporary .dat next to the shards.
+	// De-stripe the data shards into a temporary .dat next to the shards and
+	// scan it into a fresh .ecx. With the layout unknown, de-stripe under both
+	// candidate layouts and keep the one whose needle chain scans furthest.
+	type layoutCandidate struct {
+		name         string
+		large, small int64
+	}
+	var candidates []layoutCandidate
+	switch {
+	case blockSize > 0:
+		candidates = []layoutCandidate{{"uniform", blockSize, blockSize}}
+	case blockSize == 0:
+		candidates = []layoutCandidate{{"legacy", erasure_coding.ErasureCodingLargeBlockSize, erasure_coding.ErasureCodingSmallBlockSize}}
+	default:
+		candidates = []layoutCandidate{
+			{"legacy", erasure_coding.ErasureCodingLargeBlockSize, erasure_coding.ErasureCodingSmallBlockSize},
+		}
+		// A uniform-layout shard is exactly one block long, and every block
+		// size an encoder can produce is a whole number of small blocks. An
+		// extent that is not — a truncated or partially copied shard — could
+		// not have come from a uniform encode, and recording it would write a
+		// .vif that ValidateBlockSize refuses on the next mount: the volume
+		// this tool was run to rescue would never open again.
+		if erasure_coding.ValidateBlockSize(shardSize) == nil && shardSize > 0 {
+			candidates = append(candidates, layoutCandidate{"uniform", shardSize, shardSize})
+			glog.Infof("volume %d: no .vif or .ecsum records the shard block layout; trying both", volumeId)
+		} else {
+			glog.Infof("volume %d: no .vif or .ecsum records the shard block layout, and the %d-byte shard extent is not a whole number of %d-byte blocks; trying the legacy layout only",
+				volumeId, shardSize, erasure_coding.ErasureCodingSmallBlockSize)
+		}
+	}
+
 	tmpBase := base + ".ecxrecover"
 	tmpDat := tmpBase + ".dat"
-	if err := erasure_coding.WriteDatFile(tmpBase, reconstructSize, shardFileNames); err != nil {
-		os.Remove(tmpDat)
-		fail(fmt.Errorf("volume %d: reconstruct .dat from data shards: %w", volumeId, err))
+	defer os.Remove(tmpDat)
+	bestIdx := -1
+	var realDatSize, bestNeedles int64
+	var version needle.Version
+	var candErr error
+	for i, cand := range candidates {
+		if err := erasure_coding.WriteDatFile(tmpBase, reconstructSize, reconstructSize, shardFileNames, cand.large, cand.small); err != nil {
+			candErr = fmt.Errorf("volume %d: reconstruct .dat (%s layout): %w", volumeId, cand.name, err)
+			continue
+		}
+		size, needles, ver, err := writeEcxFromDat(tmpDat, ecxName+"."+cand.name)
+		if err != nil {
+			os.Remove(ecxName + "." + cand.name)
+			candErr = fmt.Errorf("volume %d: build .ecx from reconstructed .dat (%s layout): %w", volumeId, cand.name, err)
+			continue
+		}
+		// The wrong layout de-stripes to garbage past the first block
+		// boundary, so the layout that indexes more valid needles wins.
+		// On a tie — garbage bytes do sometimes parse as plausible sizes — the
+		// layout whose needle chain reached further into the .dat wins, which is
+		// the distance the scan actually validated.
+		if bestIdx < 0 || needles > bestNeedles || (needles == bestNeedles && size > realDatSize) {
+			bestIdx = i
+			bestNeedles = needles
+			realDatSize = size
+			version = ver
+		}
+	}
+	if bestIdx < 0 {
+		fail(candErr)
 		return
 	}
-	defer os.Remove(tmpDat)
-
-	realDatSize, version, err := writeEcxFromDat(tmpDat, ecxName)
-	if err != nil {
-		os.Remove(ecxName)
-		fail(fmt.Errorf("volume %d: build .ecx from reconstructed .dat: %w", volumeId, err))
+	for i := range candidates {
+		if i != bestIdx {
+			os.Remove(ecxName + "." + candidates[i].name)
+		}
+	}
+	if err := os.Rename(ecxName+"."+candidates[bestIdx].name, ecxName); err != nil {
+		fail(fmt.Errorf("volume %d: publish %s: %w", volumeId, ecxName, err))
 		return
+	}
+	if blockSize < 0 {
+		if candidates[bestIdx].name == "uniform" {
+			blockSize = shardSize
+		} else {
+			blockSize = 0
+		}
+		glog.Infof("volume %d: %s layout indexes %d needles over %d bytes; keeping it", volumeId, candidates[bestIdx].name, bestNeedles, realDatSize)
 	}
 	glog.Infof("volume %d: wrote %s from %d data shards", volumeId, ecxName, dataShards)
 
-	// Regenerate the .vif when missing so the volume can mount and future
-	// rebuilds know the EC ratio and original .dat size.
-	if !vifExists {
+	// Regenerate the .vif when it is missing OR unusable (an empty stub, or one
+	// with no EC config): the layout just recovered by the dual scan is the only
+	// record of it, and leaving the stub in place would mount the volume as
+	// legacy on the next start and serve the wrong offsets.
+	if !vifUsable {
 		size := datFileSize
 		if size <= 0 {
 			size = realDatSize
+		}
+		// Never publish a layout the mount path will refuse: NewEcVolume runs
+		// the same check and fails closed, so an unvalidated write here would
+		// trade a recoverable volume for one that can no longer be opened.
+		if bsErr := erasure_coding.ValidateBlockSize(blockSize); bsErr != nil {
+			fail(fmt.Errorf("volume %d: refusing to write %s: %w", volumeId, vifName, bsErr))
+			return
 		}
 		volumeInfo := &volume_server_pb.VolumeInfo{
 			Version:     uint32(version),
@@ -417,6 +576,7 @@ func doFixEcxFromShards(basePath, baseFileName, collection string, volumeId int6
 			EcShardConfig: &volume_server_pb.EcShardConfig{
 				DataShards:   uint32(dataShards),
 				ParityShards: uint32(parityShards),
+				BlockSize:    blockSize,
 			},
 		}
 		if err := volume_info.SaveVolumeInfo(vifName, volumeInfo); err != nil {
@@ -430,25 +590,26 @@ func doFixEcxFromShards(basePath, baseFileName, collection string, volumeId int6
 // writeEcxFromDat scans a (reconstructed) .dat and writes an ascending-sorted
 // .ecx containing only live needles — the same on-disk shape
 // WriteSortedFileFromIdx produces when an EC volume is first encoded. It returns
-// the physical .dat size (the offset where the EC zero padding begins) and the
-// volume version read from the superblock.
-func writeEcxFromDat(datPath, ecxPath string) (datFileSize int64, version needle.Version, err error) {
+// the physical .dat size (the offset where the EC zero padding begins), the
+// number of live needles indexed, and the volume version read from the
+// superblock.
+func writeEcxFromDat(datPath, ecxPath string) (datFileSize int64, liveNeedles int64, version needle.Version, err error) {
 	f, err := os.OpenFile(datPath, os.O_RDONLY, 0644)
 	if err != nil {
-		return 0, 0, fmt.Errorf("open %s: %w", datPath, err)
+		return 0, 0, 0, fmt.Errorf("open %s: %w", datPath, err)
 	}
 	datBackend := backend.NewDiskFile(f)
 	defer datBackend.Close()
 
 	superBlock, err := super_block.ReadSuperBlock(datBackend)
 	if err != nil {
-		return 0, 0, fmt.Errorf("read superblock: %w", err)
+		return 0, 0, 0, fmt.Errorf("read superblock: %w", err)
 	}
 	version = superBlock.Version
 
 	fileSize, _, err := datBackend.GetStat()
 	if err != nil {
-		return 0, version, fmt.Errorf("stat %s: %w", datPath, err)
+		return 0, 0, version, fmt.Errorf("stat %s: %w", datPath, err)
 	}
 
 	nm := needle_map.NewMemDb()
@@ -461,7 +622,7 @@ func writeEcxFromDat(datPath, ecxPath string) (datFileSize int64, version needle
 			if readErr == io.EOF {
 				break
 			}
-			return 0, version, fmt.Errorf("read needle header at offset %d: %w", offset, readErr)
+			return 0, 0, version, fmt.Errorf("read needle header at offset %d: %w", offset, readErr)
 		}
 		// EC encoding zero-pads the tail of the last block row. An all-zero
 		// header marks the start of that padding, i.e. the end of real needles.
@@ -470,13 +631,13 @@ func writeEcxFromDat(datPath, ecxPath string) (datFileSize int64, version needle
 		}
 		if n.Size.IsValid() {
 			if pe := nm.Set(n.Id, types.ToOffset(offset), n.Size); pe != nil {
-				return 0, version, fmt.Errorf("set needle %d: %w", n.Id, pe)
+				return 0, 0, version, fmt.Errorf("set needle %d: %w", n.Id, pe)
 			}
 		} else {
 			// Deleted/invalid: drop it so the .ecx carries only live entries,
 			// matching the encode-time WriteSortedFileFromIdx behavior.
 			if pe := nm.Delete(n.Id); pe != nil {
-				return 0, version, fmt.Errorf("delete needle %d: %w", n.Id, pe)
+				return 0, 0, version, fmt.Errorf("delete needle %d: %w", n.Id, pe)
 			}
 		}
 		offset += types.NeedleHeaderSize + rest
@@ -485,16 +646,17 @@ func writeEcxFromDat(datPath, ecxPath string) (datFileSize int64, version needle
 
 	ecxFile, err := os.OpenFile(ecxPath, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		return 0, version, fmt.Errorf("open %s: %w", ecxPath, err)
+		return 0, 0, version, fmt.Errorf("open %s: %w", ecxPath, err)
 	}
 	defer ecxFile.Close()
 
 	if err := nm.AscendingVisit(func(value needle_map.NeedleValue) error {
+		liveNeedles++
 		_, writeErr := ecxFile.Write(value.ToBytes())
 		return writeErr
 	}); err != nil {
-		return 0, version, fmt.Errorf("write %s: %w", ecxPath, err)
+		return 0, 0, version, fmt.Errorf("write %s: %w", ecxPath, err)
 	}
 
-	return datFileSize, version, nil
+	return datFileSize, liveNeedles, version, nil
 }

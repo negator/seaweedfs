@@ -160,7 +160,9 @@ func (c *commandRemoteCache) doComprehensiveSync(commandEnv *CommandEnv, writer 
 				// File exists locally, check if it needs updating
 				if localEntry.RemoteEntry == nil ||
 					localEntry.RemoteEntry.RemoteETag != remoteEntry.RemoteETag ||
-					localEntry.RemoteEntry.RemoteMtime < remoteEntry.RemoteMtime {
+					localEntry.RemoteEntry.RemoteMtime < remoteEntry.RemoteMtime ||
+					(remoteEntry.RemoteContentEncoding != nil &&
+						localEntry.RemoteEntry.GetRemoteContentEncoding() != remoteEntry.GetRemoteContentEncoding()) {
 					filesToUpdate = append(filesToUpdate, remotePath)
 				}
 				// Check if it needs caching
@@ -228,14 +230,7 @@ func (c *commandRemoteCache) doComprehensiveSync(commandEnv *CommandEnv, writer 
 				fmt.Fprintf(writer, "Deleting %s... ", pathToDelete)
 
 				dir, name := util.FullPath(pathToDelete).DirAndName()
-				_, err := client.DeleteEntry(ctx, &filer_pb.DeleteEntryRequest{
-					Directory:            dir,
-					Name:                 name,
-					IgnoreRecursiveError: false,
-					IsDeleteData:         true,
-					IsRecursive:          false,
-					IsFromOtherCluster:   false,
-				})
+				err := filer_pb.DoRemove(ctx, client, dir, name, true, false, false, false, nil)
 				if err != nil {
 					fmt.Fprintf(writer, "failed: %v\n", err)
 					return err
@@ -273,8 +268,9 @@ func (c *commandRemoteCache) doComprehensiveSync(commandEnv *CommandEnv, writer 
 						Attributes: &filer_pb.FuseAttributes{
 							FileSize: uint64(remoteEntry.RemoteSize),
 							Mtime:    remoteEntry.RemoteMtime,
-							FileMode: uint32(0644),
+							FileMode: remoteEntryFileMode(isDirectory),
 						},
+						Extended:    filer.MergeRemoteContentEncoding(remoteEntry, nil),
 						RemoteEntry: remoteEntry,
 					},
 				})
@@ -295,6 +291,7 @@ func (c *commandRemoteCache) doComprehensiveSync(commandEnv *CommandEnv, writer 
 				existingEntry.Attributes.FileSize = uint64(remoteEntry.RemoteSize)
 				existingEntry.Attributes.Mtime = remoteEntry.RemoteMtime
 				existingEntry.Attributes.Md5 = nil
+				existingEntry.Extended = filer.MergeRemoteContentEncoding(remoteEntry, existingEntry.Extended)
 				existingEntry.Chunks = nil
 				existingEntry.Content = nil
 

@@ -33,23 +33,33 @@ impl Error for GrpcClientError {}
 pub fn load_outgoing_grpc_tls(
     config: &VolumeServerConfig,
 ) -> Result<Option<OutgoingGrpcTlsConfig>, GrpcClientError> {
-    if config.grpc_cert_file.is_empty()
-        || config.grpc_key_file.is_empty()
-        || config.grpc_ca_file.is_empty()
+    // prefer a dedicated client certificate: CAs may issue certs with only one of the serverAuth/clientAuth EKUs
+    let (cert_file, key_file) = if !config.grpc_client_cert_file.is_empty()
+        && !config.grpc_client_key_file.is_empty()
     {
+        (&config.grpc_client_cert_file, &config.grpc_client_key_file)
+    } else {
+        if !config.grpc_client_cert_file.is_empty() || !config.grpc_client_key_file.is_empty() {
+            tracing::warn!(
+                "grpc.volume.client_cert and grpc.volume.client_key must both be set, falling back to grpc.volume.cert and grpc.volume.key"
+            );
+        }
+        (&config.grpc_cert_file, &config.grpc_key_file)
+    };
+    if cert_file.is_empty() || key_file.is_empty() || config.grpc_ca_file.is_empty() {
         return Ok(None);
     }
 
-    let cert_pem = std::fs::read_to_string(&config.grpc_cert_file).map_err(|e| {
+    let cert_pem = std::fs::read_to_string(cert_file).map_err(|e| {
         GrpcClientError(format!(
             "Failed to read outgoing gRPC cert '{}': {}",
-            config.grpc_cert_file, e
+            cert_file, e
         ))
     })?;
-    let key_pem = std::fs::read_to_string(&config.grpc_key_file).map_err(|e| {
+    let key_pem = std::fs::read_to_string(key_file).map_err(|e| {
         GrpcClientError(format!(
             "Failed to read outgoing gRPC key '{}': {}",
-            config.grpc_key_file, e
+            key_file, e
         ))
     })?;
     let ca_pem = std::fs::read_to_string(&config.grpc_ca_file).map_err(|e| {
@@ -105,6 +115,38 @@ pub fn build_grpc_endpoint(
     }
 
     Ok(endpoint)
+}
+
+/// Connect `endpoint` through a connector that re-validates every resolved
+/// address at connect time (Go's `guardedDialerPolicy` mirror), pinning a
+/// validated copy/tail source against DNS rebinding. `allow_untrusted`
+/// preserves the plain connect for operators that opted out.
+pub async fn connect_guarded(
+    endpoint: Endpoint,
+    target: &str,
+    allow_untrusted: bool,
+) -> Result<Channel, GrpcClientError> {
+    if allow_untrusted {
+        return endpoint
+            .connect()
+            .await
+            .map_err(|e| GrpcClientError(format!("connect {} failed: {}", target, e)));
+    }
+    let target_owned = target.to_string();
+    let connector = tower::service_fn(move |uri: Uri| {
+        let target = target_owned.clone();
+        async move {
+            let host = uri.host().unwrap_or_default().to_string();
+            let port = uri.port_u16().unwrap_or(80);
+            crate::remote_storage::guarded_tcp_connect(&host, port, &target)
+                .await
+                .map(hyper_util::rt::TokioIo::new)
+        }
+    });
+    endpoint
+        .connect_with_connector(connector)
+        .await
+        .map_err(|e| GrpcClientError(format!("connect {} failed: {}", target, e)))
 }
 
 /// Parse a SeaweedFS server address (`"ip:port.grpcPort"` or
@@ -164,6 +206,21 @@ mod tests {
     use crate::config::{NeedleMapKind, ReadMode, VolumeServerConfig};
     use crate::security::tls::TlsPolicy;
 
+    const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBPDCB76ADAgECAhRuRPQgeAu43BT/M7EfAWSdapVdYDAFBgMrZXAwFDESMBAG\nA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcwNTE2MTUyOVoXDTM2MDcwMjE2MTUyOVow\nFDESMBAGA1UEAwwJbG9jYWxob3N0MCowBQYDK2VwAyEAr/3bNIFI+8V32oCiY6y+\nXRFmZpdNQ2g//VtRkT+nQg+jUzBRMB0GA1UdDgQWBBTsy9tLf1zPiXCQfgci6zNi\ndEzRSjAfBgNVHSMEGDAWgBTsy9tLf1zPiXCQfgci6zNidEzRSjAPBgNVHRMBAf8E\nBTADAQH/MAUGAytlcANBAIvsdw0IbvOBBkb9cd7BfMJfIP9pQQrAL03pCRWJFnFh\nSysaLVgFXI4T078IiaM874oO+iB+5vNbWEpc7CkGow4=\n-----END CERTIFICATE-----\n";
+    const TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIHbyn71Kk+Y7KT3sBctit7uZpErpoH6qDbFj6P8qGaZH\n-----END PRIVATE KEY-----\n";
+
+    #[test]
+    fn test_build_grpc_endpoint_with_tls_resolves_crypto_provider() {
+        crate::security::tls::install_default_crypto_provider();
+        let tls = super::OutgoingGrpcTlsConfig {
+            cert_pem: TEST_CERT_PEM.to_string(),
+            key_pem: TEST_KEY_PEM.to_string(),
+            ca_pem: TEST_CERT_PEM.to_string(),
+        };
+        let endpoint = build_grpc_endpoint("127.0.0.1:19333", Some(&tls)).unwrap();
+        assert_eq!(endpoint.uri().scheme_str(), Some("https"));
+    }
+
     fn sample_config() -> VolumeServerConfig {
         VolumeServerConfig {
             port: 8080,
@@ -189,6 +246,7 @@ mod tests {
             white_list: vec![],
             fix_jpg_orientation: false,
             read_mode: ReadMode::Local,
+            allow_untrusted_remote_endpoints: false,
             cpu_profile: String::new(),
             mem_profile: String::new(),
             compaction_byte_per_second: 0,
@@ -220,6 +278,8 @@ mod tests {
             https_client_ca_file: String::new(),
             grpc_cert_file: String::new(),
             grpc_key_file: String::new(),
+            grpc_client_cert_file: String::new(),
+            grpc_client_key_file: String::new(),
             grpc_ca_file: String::new(),
             grpc_allowed_wildcard_domain: String::new(),
             grpc_volume_allowed_common_names: vec![],
@@ -247,6 +307,45 @@ mod tests {
         let mut config = sample_config();
         config.grpc_cert_file = "/tmp/client.pem".to_string();
         assert!(load_outgoing_grpc_tls(&config).unwrap().is_none());
+    }
+
+    fn write_pem_files(dir: &tempfile::TempDir, config: &mut VolumeServerConfig) {
+        let write = |name: &str, content: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, content).unwrap();
+            path.to_str().unwrap().to_string()
+        };
+        config.grpc_cert_file = write("server.pem", "server-cert");
+        config.grpc_key_file = write("server.key", "server-key");
+        config.grpc_ca_file = write("ca.pem", "ca");
+    }
+
+    #[test]
+    fn test_load_outgoing_grpc_tls_prefers_client_cert() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = sample_config();
+        write_pem_files(&dir, &mut config);
+        let client_cert = dir.path().join("client.pem");
+        let client_key = dir.path().join("client.key");
+        std::fs::write(&client_cert, "client-cert").unwrap();
+        std::fs::write(&client_key, "client-key").unwrap();
+        config.grpc_client_cert_file = client_cert.to_str().unwrap().to_string();
+        config.grpc_client_key_file = client_key.to_str().unwrap().to_string();
+
+        let tls = load_outgoing_grpc_tls(&config).unwrap().unwrap();
+        assert_eq!(tls.cert_pem, "client-cert");
+        assert_eq!(tls.key_pem, "client-key");
+    }
+
+    #[test]
+    fn test_load_outgoing_grpc_tls_falls_back_to_server_cert() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = sample_config();
+        write_pem_files(&dir, &mut config);
+
+        let tls = load_outgoing_grpc_tls(&config).unwrap().unwrap();
+        assert_eq!(tls.cert_pem, "server-cert");
+        assert_eq!(tls.key_pem, "server-key");
     }
 
     #[test]

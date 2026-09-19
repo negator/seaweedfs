@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strings"
@@ -89,7 +90,7 @@ func (fs *SftpServer) AdjustedUrl(location *filer_pb.Location) string { return l
 func (fs *SftpServer) GetDataCenter() string                          { return fs.dataCenter }
 func (fs *SftpServer) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
 	addr := fs.filerAddr.ToGrpcAddress()
-	return pb.WithGrpcClient(streamingMode, util.RandomInt32(), func(conn *grpc.ClientConn) error {
+	return pb.WithGrpcClient(context.Background(), streamingMode, util.RandomInt32(), func(conn *grpc.ClientConn) error {
 		return fn(filer_pb.NewSeaweedFilerClient(conn))
 	}, addr, false, fs.grpcDialOption)
 }
@@ -322,7 +323,8 @@ func (fs *SftpServer) removeDir(absPath string) error {
 
 func (fs *SftpServer) putFile(filepath string, reader io.Reader, user *user.User) error {
 	dir, filename := util.FullPath(filepath).DirAndName()
-	uploadUrl := fmt.Sprintf("http://%s%s", fs.filerAddr, filepath)
+	// Escape the path so a "?" in the filename cannot inject filer query commands like cp.from/mv.from.
+	uploadUrl := (&url.URL{Scheme: "http", Host: fs.filerAddr.ToHttpAddress(), Path: filepath}).String()
 	// Let the global HTTP client normalize the scheme to https:// when TLS is configured
 	normalizedUrl, err := util_http.NormalizeUrl(uploadUrl)
 	if err != nil {
@@ -345,7 +347,7 @@ func (fs *SftpServer) putFile(filepath string, reader io.Reader, user *user.User
 	if len(fs.filerSigningKey) > 0 {
 		jwt := security.GenJwtForFilerServer(security.SigningKey(fs.filerSigningKey), fs.filerSigningExpiresAfter)
 		if jwt != "" {
-			req.Header.Set("Authorization", "Bearer "+string(jwt))
+			req.Header.Set("Authorization", security.BearerPrefix+string(jwt))
 		}
 	}
 

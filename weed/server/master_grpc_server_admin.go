@@ -154,8 +154,27 @@ func (ms *MasterServer) LeaseAdminToken(ctx context.Context, req *master_pb.Leas
 
 func (ms *MasterServer) ReleaseAdminToken(ctx context.Context, req *master_pb.ReleaseAdminTokenRequest) (*master_pb.ReleaseAdminTokenResponse, error) {
 	resp := &master_pb.ReleaseAdminTokenResponse{}
+	// a follower holds no lock state; answering success here would fake a
+	// release while the leader keeps the lock until it expires
+	if !ms.Topo.IsLeader() {
+		return resp, raft.NotLeaderError
+	}
 	if ms.adminLocks.isValidToken(req.LockName, time.Unix(0, req.PreviousLockTime), req.PreviousToken) {
 		ms.adminLocks.deleteLock(req.LockName)
+	}
+	return resp, nil
+}
+
+func (ms *MasterServer) GetAdminLockStatus(ctx context.Context, req *master_pb.GetAdminLockStatusRequest) (*master_pb.GetAdminLockStatusResponse, error) {
+	resp := &master_pb.GetAdminLockStatusResponse{}
+	if !ms.Topo.IsLeader() {
+		return resp, raft.NotLeaderError
+	}
+	// isLocked reports the last holder even after the lease expired
+	if clientName, message, isLocked := ms.adminLocks.isLocked(req.LockName); isLocked {
+		resp.IsLocked = true
+		resp.ClientName = clientName
+		resp.Message = message
 	}
 	return resp, nil
 }
@@ -222,7 +241,7 @@ func (ms *MasterServer) Ping(ctx context.Context, req *master_pb.PingRequest) (r
 		})
 	}
 	if req.TargetType == cluster.MasterType {
-		pingErr = pb.WithMasterClient(false, pb.ServerAddress(req.Target), ms.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
+		pingErr = pb.WithMasterClient(context.Background(), false, pb.ServerAddress(req.Target), ms.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
 			pingResp, err := client.Ping(ctx, &master_pb.PingRequest{})
 			if pingResp != nil {
 				resp.RemoteTimeNs = pingResp.StartTimeNs

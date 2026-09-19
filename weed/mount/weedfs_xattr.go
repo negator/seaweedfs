@@ -8,7 +8,6 @@ import (
 	"syscall"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
-	sys "golang.org/x/sys/unix"
 )
 
 const (
@@ -121,24 +120,30 @@ func (wfs *WFS) SetXAttr(cancel <-chan struct{}, input *fuse.SetXAttrIn, attr st
 	if entry.Extended == nil {
 		entry.Extended = make(map[string][]byte)
 	}
-	oldData, _ := entry.Extended[XATTR_PREFIX+attr]
+	_, exists := entry.Extended[XATTR_PREFIX+attr]
 	switch input.Flags {
-	case sys.XATTR_CREATE:
-		if len(oldData) > 0 {
-			break
+	case xattr_CREATE:
+		if exists {
+			return fuse.Status(syscall.EEXIST)
 		}
-		fallthrough
-	case sys.XATTR_REPLACE:
-		fallthrough
-	default:
-		// data aliases the FUSE request's pooled input buffer, which is
-		// recycled once this handler returns. Copy before storing so a
-		// later request reusing the buffer cannot corrupt the value.
-		entry.Extended[XATTR_PREFIX+attr] = append([]byte(nil), data...)
+	case xattr_REPLACE:
+		if !exists {
+			return fuse.ENODATA
+		}
 	}
+
+	// data aliases the FUSE request's pooled input buffer, which is
+	// recycled once this handler returns. Copy before storing so a
+	// later request reusing the buffer cannot corrupt the value.
+	entry.Extended[XATTR_PREFIX+attr] = append([]byte(nil), data...)
 
 	if fh != nil {
 		fh.dirtyMetadata = true
+		return fuse.OK
+	}
+	if path == "" {
+		// removed while open: the remembered entry is all there is to update
+		wfs.rememberRemovedDir(input.NodeId, entry)
 		return fuse.OK
 	}
 
@@ -217,6 +222,11 @@ func (wfs *WFS) RemoveXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr 
 
 	if fh != nil {
 		fh.dirtyMetadata = true
+		return fuse.OK
+	}
+	if path == "" {
+		// removed while open: the remembered entry is all there is to update
+		wfs.rememberRemovedDir(header.NodeId, entry)
 		return fuse.OK
 	}
 

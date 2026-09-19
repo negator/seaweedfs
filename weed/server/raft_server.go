@@ -35,7 +35,6 @@ type RaftServerOption struct {
 	SingleMaster      bool
 	HeartbeatInterval time.Duration
 	ElectionTimeout   time.Duration
-	RaftBootstrap     bool
 }
 
 type RaftServer struct {
@@ -303,15 +302,23 @@ func (s *RaftServer) HasExistingState() bool {
 	return false
 }
 
-func (s *RaftServer) DoJoinCommand() {
-
+// Bootstrap mints a new raft cluster out of the configured peers. Only call it
+// when no leader exists anywhere: a master that starts with no raft state and
+// finds a leader must be admitted by that leader instead, or the two clusters
+// never merge. Committed state is never bootstrapped over — hashicorp refuses,
+// and goraft callers reach here only past HasExistingState.
+func (s *RaftServer) Bootstrap() error {
 	glog.V(0).Infoln("Initializing new cluster")
 
-	if _, err := s.raftServer.Do(&raft.DefaultJoinCommand{
+	if s.RaftHashicorp != nil {
+		return s.RaftHashicorp.BootstrapCluster(s.AddPeersConfiguration()).Error()
+	}
+	if s.raftServer == nil {
+		return nil
+	}
+	_, err := s.raftServer.Do(&raft.DefaultJoinCommand{
 		Name:             s.raftServer.Name(),
 		ConnectionString: s.serverAddr.ToGrpcAddress(),
-	}); err != nil {
-		glog.Errorf("fail to send join command: %v", err)
-	}
-
+	})
+	return err
 }

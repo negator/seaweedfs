@@ -9,20 +9,23 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3bucket"
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster/lock_manager"
 	"github.com/seaweedfs/seaweedfs/weed/filer/empty_folder_cleanup"
-	"github.com/seaweedfs/seaweedfs/weed/sequence"
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
 
 	"google.golang.org/grpc"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/log_buffer"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
@@ -41,36 +44,41 @@ var (
 )
 
 type Filer struct {
-	UniqueFilerId           int32
-	UniqueFilerEpoch        int32
-	Store                   VirtualFilerStore
-	MasterClient            *wdclient.MasterClient
-	fileIdDeletionQueue     *util.UnboundedQueue
-	GrpcDialOption          grpc.DialOption
-	DirBucketsPath          string
-	Cipher                  bool
-	LocalMetaLogBuffer      *log_buffer.LogBuffer
-	metaLogCollection       string
-	metaLogReplication      string
-	MetaAggregator          *MetaAggregator
-	Signature               int32
-	FilerConf               *FilerConf
-	RemoteStorage           *FilerRemoteStorage
-	lazyFetchGroup          singleflight.Group
-	lazyListGroup           singleflight.Group
-	Dlm                     *lock_manager.DistributedLockManager
-	MaxFilenameLength       uint32
-	deletionQuit            chan struct{}
-	DeletionRetryQueue      *DeletionRetryQueue
-	EmptyFolderCleaner      *empty_folder_cleanup.EmptyFolderCleaner
-	EmptyFolderCleanupDelay time.Duration
-	inodeSequencer          sequence.Sequencer
+	UniqueFilerId                 int32
+	UniqueFilerEpoch              int32
+	Store                         VirtualFilerStore
+	MasterClient                  *wdclient.MasterClient
+	FileIdDeletionQueue           *util.UnboundedQueue
+	GrpcDialOption                grpc.DialOption
+	DirBucketsPath                string
+	Cipher                        bool
+	LocalMetaLogBuffer            *log_buffer.LogBuffer
+	metaLogCollection             string
+	metaLogReplication            string
+	DefaultDiskType               string
+	MetaAggregator                *MetaAggregator
+	Signature                     int32
+	FilerConf                     *FilerConf
+	placementOverlay              PlacementOverlay
+	RemoteStorage                 *FilerRemoteStorage
+	BuildGuardedRemoteClient      RemoteStorageClientBuilder
+	AllowUntrustedRemoteEndpoints bool
+	lazyFetchGroup                singleflight.Group
+	lazyListGroup                 singleflight.Group
+	Dlm                           *lock_manager.DistributedLockManager
+	MaxFilenameLength             uint32
+	deletionQuit                  chan struct{}
+	DeletionRetryQueue            *DeletionRetryQueue
+	EmptyFolderCleaner            *empty_folder_cleanup.EmptyFolderCleaner
+	EmptyFolderCleanupDelay       time.Duration
+	persistedLogCache             *persistedLogCache
+	metaLogInflight               metaLogInflight
 }
 
 func NewFiler(masters pb.ServerDiscovery, grpcDialOption grpc.DialOption, filerHost pb.ServerAddress, filerGroup string, collection string, replication string, dataCenter string, maxFilenameLength uint32, notifyFn func()) *Filer {
 	f := &Filer{
 		MasterClient:        wdclient.NewMasterClient(grpcDialOption, filerGroup, cluster.FilerType, filerHost, dataCenter, "", masters),
-		fileIdDeletionQueue: util.NewUnboundedQueue(),
+		FileIdDeletionQueue: util.NewUnboundedQueue(),
 		GrpcDialOption:      grpcDialOption,
 		FilerConf:           NewFilerConf(),
 		RemoteStorage:       NewFilerRemoteStorage(),
@@ -79,7 +87,7 @@ func NewFiler(masters pb.ServerDiscovery, grpcDialOption grpc.DialOption, filerH
 		MaxFilenameLength:   maxFilenameLength,
 		deletionQuit:        make(chan struct{}),
 		DeletionRetryQueue:  NewDeletionRetryQueue(),
-		inodeSequencer:      newInodeSequencer(filerHost),
+		persistedLogCache:   newPersistedLogCache(persistedLogCacheMaxBytes),
 	}
 	if f.UniqueFilerId < 0 {
 		f.UniqueFilerId = -f.UniqueFilerId
@@ -95,9 +103,20 @@ func NewFiler(masters pb.ServerDiscovery, grpcDialOption grpc.DialOption, filerH
 	f.metaLogCollection = collection
 	f.metaLogReplication = replication
 
+	if newPlacementOverlay != nil {
+		f.placementOverlay = newPlacementOverlay(f)
+	}
+
 	go f.loopProcessingDeletion()
 
 	return f
+}
+
+func (f *Filer) buildRemoteStorageClient(ctx context.Context, remoteConf *remote_pb.RemoteConf) (remote_storage.RemoteStorageClient, error) {
+	if f.BuildGuardedRemoteClient != nil {
+		return f.BuildGuardedRemoteClient(ctx, remoteConf, f.AllowUntrustedRemoteEndpoints)
+	}
+	return remote_storage.GetRemoteStorage(remoteConf)
 }
 
 func (f *Filer) MaybeBootstrapFromOnePeer(self pb.ServerAddress, existingNodes []*master_pb.ClusterNodeUpdate, snapshotTime time.Time) (err error) {
@@ -136,6 +155,9 @@ func (f *Filer) AggregateFromPeers(self pb.ServerAddress, existingNodes []*maste
 	f.EmptyFolderCleaner = empty_folder_cleanup.NewEmptyFolderCleaner(f, f.Dlm.LockRing, self, f.DirBucketsPath, f.EmptyFolderCleanupDelay)
 
 	f.MetaAggregator = NewMetaAggregator(f, self, f.GrpcDialOption)
+	// The ring starts empty while peer history sits on disk: mark the pre-startFrom
+	// range evicted so a cursor there reads disk, not the ring's earliest entry.
+	f.MetaAggregator.MetaLogBuffer.MarkEvictedThrough(startFrom.UnixNano())
 	f.MasterClient.SetOnPeerUpdateFn(func(update *master_pb.ClusterNodeUpdate, startFrom time.Time) {
 		if update.NodeType != cluster.FilerType {
 			return
@@ -153,6 +175,16 @@ func (f *Filer) AggregateFromPeers(self pb.ServerAddress, existingNodes []*maste
 		f.Dlm.LockRing.SetSnapshot(servers, update.Version)
 	})
 
+	// Subscribe to the local filer first: its events reach the aggregated
+	// buffer only through this subscription, and the peer watermarks must
+	// account for it before any remote peer - a remotes-only watermark set
+	// would claim completeness without self. existingNodes can omit self
+	// (master registration races this bootstrap); duplicate adds are no-ops.
+	f.MetaAggregator.OnPeerUpdate(&master_pb.ClusterNodeUpdate{
+		NodeType: cluster.FilerType,
+		Address:  string(self),
+		IsAdd:    true,
+	}, startFrom)
 	for _, peerUpdate := range existingNodes {
 		f.MetaAggregator.OnPeerUpdate(peerUpdate, startFrom)
 	}
@@ -247,17 +279,30 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 	if oldEntry == nil {
 		f.ensureEntryInode(entry)
 
-		if !skipCreateParentDir {
-			dirParts := strings.Split(string(entry.FullPath), "/")
-			if err := f.ensureParentDirectoryEntry(ctx, entry, dirParts, len(dirParts)-1, isFromOtherCluster); err != nil {
-				return err
-			}
-		}
-
 		glog.V(4).InfofCtx(ctx, "InsertEntry %s: new entry: %v", entry.FullPath, entry.Name())
 		if err := f.Store.InsertEntry(ctx, entry); err != nil {
 			glog.ErrorfCtx(ctx, "insert entry %s: %v", entry.FullPath, err)
 			return fmt.Errorf("insert entry %s: %v", entry.FullPath, err)
+		}
+
+		// Parents go after the entry: one checked first can be taken by the
+		// empty-folder cleaner before the entry lands, and nothing would look again.
+		if !skipCreateParentDir {
+			dirParts := strings.Split(string(entry.FullPath), "/")
+			if err := f.ensureParentDirectoryEntry(ctx, entry, dirParts, len(dirParts)-1, isFromOtherCluster); err != nil {
+				// The entry stays: deleting by path would destroy a concurrent create
+				// that already succeeded through the update branch, and the update keeps
+				// the inode and crtime while mtime only survives the store to the second.
+				// It is not announced - the aggregator replicates creates into peer
+				// stores, so a failed write would land on all of them rather than on the
+				// one filer whose next write into that folder repairs it.
+				glog.ErrorfCtx(ctx, "create parent directories of %s: %v", entry.FullPath, err)
+				return err
+			}
+		}
+
+		if !entry.IsDirectory() {
+			stats.FilerObjectSizeBytesHistogram.Observe(float64(entry.Size()))
 		}
 	} else {
 		if o_excl {
@@ -266,8 +311,12 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 		}
 		glog.V(4).InfofCtx(ctx, "UpdateEntry %s: old entry: %v", entry.FullPath, oldEntry.Name())
 		if err := f.UpdateEntry(ctx, oldEntry, entry); err != nil {
-			glog.ErrorfCtx(ctx, "update entry %s: %v", entry.FullPath, err)
-			return fmt.Errorf("update entry %s: %v", entry.FullPath, err)
+			if errors.Is(err, filer_pb.ErrExistingIsDirectory) || errors.Is(err, filer_pb.ErrExistingIsFile) {
+				glog.V(2).InfofCtx(ctx, "update entry %s: %v", entry.FullPath, err)
+			} else {
+				glog.ErrorfCtx(ctx, "update entry %s: %v", entry.FullPath, err)
+			}
+			return fmt.Errorf("update entry %s: %w", entry.FullPath, err)
 		}
 	}
 
@@ -355,11 +404,96 @@ func (f *Filer) ensureParentDirectoryEntry(ctx context.Context, entry *Entry, di
 		// the original object data remains accessible.
 		glog.V(2).InfofCtx(ctx, "promoting %s from file to directory for %s", dirPath, entry.FullPath)
 		dirEntry.Attr.Mode |= os.ModeDir | 0111
+		// Expiring the entry now deletes the directory row and strands the keys under
+		// it, so the prefix object gives up its lazy TTL. The lifecycle worker still
+		// expires it, through the delete that leaves the directory behind.
+		dirEntry.Attr.TtlSec = 0
+		// An empty object leaves no chunks, content or mime behind, so without the
+		// mark the promotion would hide it.
+		if dirEntry.Extended == nil {
+			dirEntry.Extended = make(map[string][]byte)
+		}
+		dirEntry.Extended[s3_constants.SeaweedFSPrefixObject] = []byte("true")
 		if updateErr := f.Store.UpdateEntry(ctx, dirEntry); updateErr != nil {
 			return fmt.Errorf("promote %s to directory: %v", dirPath, updateErr)
 		}
 		f.NotifyUpdateEvent(ctx, nil, dirEntry, false, isFromOtherCluster, nil)
 	}
+
+	return nil
+}
+
+// restorableModeBits is everything but the type bits: ModePerm alone would drop
+// setgid, setuid and sticky, quietly changing group inheritance and delete semantics.
+const restorableModeBits = os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+
+// DirectoryAttributes reads what a directory would need to be recreated as it is.
+func (f *Filer) DirectoryAttributes(ctx context.Context, dirPath util.FullPath) (attrs empty_folder_cleanup.DirectoryAttributes, err error) {
+	entry, err := f.FindEntry(ctx, dirPath)
+	if err != nil {
+		return attrs, err
+	}
+	if entry == nil {
+		return attrs, filer_pb.ErrNotFound
+	}
+	return empty_folder_cleanup.DirectoryAttributes{
+		Mode:       entry.Mode & restorableModeBits,
+		Uid:        entry.Uid,
+		Gid:        entry.Gid,
+		UserName:   entry.UserName,
+		GroupNames: entry.GroupNames,
+	}, nil
+}
+
+// EnsureDirectoryEntry recreates dirPath, and any missing ancestor, for entries that
+// outlived the directory holding them. dirPath comes back with the attributes it was
+// deleted with, so a restore cannot hand back a directory more permissive than the one
+// it replaces - including when someone else already put it back with wider ones.
+func (f *Filer) EnsureDirectoryEntry(ctx context.Context, dirPath util.FullPath, attrs empty_folder_cleanup.DirectoryAttributes) error {
+	existing, err := f.FindEntry(ctx, dirPath)
+	if err != nil && !errors.Is(err, filer_pb.ErrNotFound) {
+		return err
+	}
+	if existing != nil {
+		// A writer recreating its own missing parent infers the mode from the entry it
+		// is inserting, so it can come back wider. Intersect rather than replace, or a
+		// mode holding a bit the saved one lacks would be granted the ones it lacks.
+		kept := existing.Mode & attrs.Mode & restorableModeBits
+		if existing.Mode&restorableModeBits == kept {
+			return nil
+		}
+		narrowed := existing.ShallowClone()
+		narrowed.Mode = existing.Mode&^restorableModeBits | kept
+		glog.V(1).InfofCtx(ctx, "restore directory %s: narrowing %v to %v", dirPath, existing.Mode, narrowed.Mode)
+		if err := f.UpdateEntry(ctx, existing, narrowed); err != nil {
+			return err
+		}
+		f.NotifyUpdateEvent(ctx, existing, narrowed, false, false, nil)
+		return nil
+	}
+
+	holder := &Entry{FullPath: dirPath, Attr: Attr{
+		Mode: attrs.Mode, Uid: attrs.Uid, Gid: attrs.Gid,
+		UserName: attrs.UserName, GroupNames: attrs.GroupNames,
+	}}
+	dirParts := strings.Split(string(dirPath), "/")
+	if err := f.ensureParentDirectoryEntry(ctx, holder, dirParts, len(dirParts)-1, false); err != nil {
+		return err
+	}
+
+	now := time.Now()
+	dirEntry := &Entry{FullPath: dirPath, Attr: Attr{
+		Mtime: now, Crtime: now,
+		Mode:     os.ModeDir | attrs.Mode,
+		Uid:      attrs.Uid,
+		Gid:      attrs.Gid,
+		UserName: attrs.UserName, GroupNames: attrs.GroupNames,
+	}}
+	f.ensureEntryInode(dirEntry)
+	if err := f.Store.InsertEntry(ctx, dirEntry); err != nil {
+		return fmt.Errorf("restore directory %s: %v", dirPath, err)
+	}
+	f.NotifyUpdateEvent(ctx, nil, dirEntry, false, false, nil)
 
 	return nil
 }
@@ -373,12 +507,15 @@ func (f *Filer) UpdateEntry(ctx context.Context, oldEntry, entry *Entry) (err er
 		} else {
 			f.ensureEntryInode(entry)
 		}
+		// A type conflict is reported through the sentinel, and callers act on it -
+		// an S3 write of a key other keys are nested under retries as a prefix object -
+		// so it is the caller's outcome that decides whether anything went wrong.
 		if oldEntry.IsDirectory() && !entry.IsDirectory() {
-			glog.ErrorfCtx(ctx, "existing %s is a directory", oldEntry.FullPath)
+			glog.V(2).InfofCtx(ctx, "existing %s is a directory", oldEntry.FullPath)
 			return fmt.Errorf("%s: %w", oldEntry.FullPath, filer_pb.ErrExistingIsDirectory)
 		}
 		if !oldEntry.IsDirectory() && entry.IsDirectory() {
-			glog.ErrorfCtx(ctx, "existing %s is a file", oldEntry.FullPath)
+			glog.V(2).InfofCtx(ctx, "existing %s is a file", oldEntry.FullPath)
 			return fmt.Errorf("%s: %w", oldEntry.FullPath, filer_pb.ErrExistingIsFile)
 		}
 	}
@@ -414,7 +551,9 @@ func (f *Filer) FindEntry(ctx context.Context, p util.FullPath) (entry *Entry, e
 		return Root, nil
 	}
 	entry, err = f.Store.FindEntry(ctx, p)
-	if entry != nil && entry.TtlSec > 0 {
+	// A directory is deleted here one row at a time, which would strand whatever is
+	// under it, so a TTL an older build left on one is not acted on.
+	if entry != nil && entry.TtlSec > 0 && !entry.IsDirectory() {
 		if entry.IsExpireS3Enabled() {
 			if entry.GetS3ExpireTime().Before(time.Now()) && !entry.IsS3Versioning() {
 				if delErr := f.doDeleteEntryMetaAndData(ctx, entry, true, false, nil); delErr != nil {
@@ -453,7 +592,7 @@ func (f *Filer) doListDirectoryEntries(ctx context.Context, p util.FullPath, sta
 			glog.Errorf("Context is done.")
 			return false, fmt.Errorf("context canceled: %w", ctx.Err())
 		default:
-			if entry.TtlSec > 0 {
+			if entry.TtlSec > 0 && !entry.IsDirectory() {
 				if entry.IsExpireS3Enabled() {
 					if entry.GetS3ExpireTime().Before(time.Now()) && !entry.IsS3Versioning() {
 						// Collect for deletion after iteration completes to avoid DB deadlock
@@ -588,6 +727,8 @@ func (f *Filer) Shutdown() {
 		f.EmptyFolderCleaner.Stop()
 	}
 	f.LocalMetaLogBuffer.ShutdownLogBuffer()
+	// The final metadata-log flush still needs the store to append its entry.
+	f.LocalMetaLogBuffer.WaitForShutdown()
 	f.Store.Shutdown()
 }
 
@@ -613,5 +754,7 @@ func (f *Filer) IsDirectoryKeyObject(ctx context.Context, p util.FullPath) (bool
 	if entry == nil {
 		return false, nil
 	}
-	return entry.IsDirectory() && entry.Mime != "", nil
+	// Mirror filer_pb.Entry.IsDirectoryKeyObject so the cleaner keeps a promoted file's data.
+	_, isPrefixObject := entry.Extended[s3_constants.SeaweedFSPrefixObject]
+	return entry.IsDirectory() && (entry.Mime != "" || len(entry.GetChunks()) > 0 || len(entry.Content) > 0 || entry.IsInRemoteOnly() || isPrefixObject), nil
 }

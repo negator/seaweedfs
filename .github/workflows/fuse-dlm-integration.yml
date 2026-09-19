@@ -8,6 +8,7 @@ on:
       - 'weed/cluster/**'
       - 'test/fuse_dlm/**'
       - '.github/workflows/fuse-dlm-integration.yml'
+      - '.github/actions/fix-fusermount-setuid/**'
   push:
     branches: [master]
     paths:
@@ -15,6 +16,7 @@ on:
       - 'weed/mount/**'
       - 'weed/cluster/**'
       - 'test/fuse_dlm/**'
+      - '.github/actions/fix-fusermount-setuid/**'
 
 concurrency:
   group: ${{ github.head_ref || github.ref }}/fuse-dlm-integration
@@ -31,19 +33,23 @@ jobs:
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
 
-      - name: Install FUSE dependencies
+      - name: Configure FUSE
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libfuse3-dev
+          # Nothing to install: fuse3 ships fusermount3 and is pre-installed,
+          # and go-fuse is pure Go, so the libfuse headers were never linked
+          # against.
           echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
           sudo chmod 644 /etc/fuse.conf
+
+      - name: Repair the fusermount3 setuid bit
+        uses: ./.github/actions/fix-fusermount-setuid
 
       - name: Build SeaweedFS
         run: go build -o weed/weed -buildvcs=false ./weed

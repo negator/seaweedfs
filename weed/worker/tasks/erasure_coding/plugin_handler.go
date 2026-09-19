@@ -78,7 +78,7 @@ func (h *ErasureCodingHandler) Descriptor() *plugin_pb.JobTypeDescriptor {
 						{
 							Name:        "collection_filter",
 							Label:       "Collection Filter",
-							Description: "Only detect erasure coding opportunities in this collection when set.",
+							Description: "Only erasure code volumes in matching collections. Comma-separated list of names, wildcards, or regex patterns.",
 							Placeholder: "all collections",
 							FieldType:   plugin_pb.ConfigFieldType_CONFIG_FIELD_TYPE_STRING,
 							Widget:      plugin_pb.ConfigWidget_CONFIG_WIDGET_TEXT,
@@ -241,6 +241,18 @@ func (h *ErasureCodingHandler) Detect(
 	if err != nil {
 		return err
 	}
+	// Stamp the admin-issued encode generation onto every EC proposal. DetectionSequence
+	// is minted once per cycle on the single admin clock, so generations are globally
+	// ordered even though detection runs on a rotating worker; this lets a stale worker's
+	// shard cleanup fence against a newer run instead of wiping it.
+	for _, result := range results {
+		if result == nil || result.TypedParams == nil {
+			continue
+		}
+		if ecp := result.TypedParams.GetErasureCodingParams(); ecp != nil {
+			ecp.EncodeTsNs = request.DetectionSequence
+		}
+	}
 	if traceErr := emitErasureCodingDetectionDecisionTrace(sender, metrics, workerConfig.TaskConfig, results, maxResults, hasMore); traceErr != nil {
 		glog.Warningf("Plugin worker failed to emit erasure_coding detection trace: %v", traceErr)
 	}
@@ -284,7 +296,10 @@ func emitErasureCodingDetectionDecisionTrace(
 
 	quietThreshold := time.Duration(taskConfig.QuietForSeconds) * time.Second
 	minSizeBytes := uint64(taskConfig.MinSizeMB) * 1024 * 1024
-	allowedCollections := wildcard.CompileWildcardMatchers(taskConfig.CollectionFilter)
+	allowedCollections, err := wildcard.CompileCollectionMatcher(taskConfig.CollectionFilter)
+	if err != nil {
+		return err
+	}
 
 	volumeGroups := make(map[uint32][]*workertypes.VolumeHealthMetrics)
 	for _, metric := range metrics {
@@ -322,7 +337,7 @@ func emitErasureCodingDetectionDecisionTrace(
 			skippedTooSmall++
 			continue
 		}
-		if len(allowedCollections) > 0 && !wildcard.MatchesAnyWildcard(allowedCollections, metric.Collection) {
+		if !allowedCollections.Matches(metric.Collection) {
 			skippedCollectionFilter++
 			continue
 		}

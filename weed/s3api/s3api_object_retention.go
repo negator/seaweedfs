@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -282,7 +281,9 @@ func (s3a *S3ApiServer) setObjectRetention(bucket, object, versionId string, ret
 			if entry.Extended != nil {
 				if versionIdBytes, exists := entry.Extended[s3_constants.ExtVersionIdKey]; exists {
 					versionId = string(versionIdBytes)
-					if versionId != "null" {
+					// A stored version id must be a valid path segment before it can
+					// name a .versions file; otherwise fall back to the regular object.
+					if versionId != "null" && isValidVersionID(versionId) {
 						entryPath = object + ".versions/" + s3a.getVersionFileName(versionId)
 					}
 				}
@@ -425,7 +426,9 @@ func (s3a *S3ApiServer) setObjectLegalHold(bucket, object, versionId string, leg
 			if entry.Extended != nil {
 				if versionIdBytes, exists := entry.Extended[s3_constants.ExtVersionIdKey]; exists {
 					versionId = string(versionIdBytes)
-					if versionId != "null" {
+					// A stored version id must be a valid path segment before it can
+					// name a .versions file; otherwise fall back to the regular object.
+					if versionId != "null" && isValidVersionID(versionId) {
 						entryPath = object + ".versions/" + s3a.getVersionFileName(versionId)
 					}
 				}
@@ -517,33 +520,26 @@ func (s3a *S3ApiServer) getLegalHoldFromEntry(entry *filer_pb.Entry) (*ObjectLeg
 
 // checkGovernanceBypassPermission checks if user has permission to bypass governance retention
 func (s3a *S3ApiServer) checkGovernanceBypassPermission(request *http.Request, bucket, object string) bool {
-	// Use the existing IAM auth system to check the specific permission
-	// Create the governance bypass action with proper bucket/object concatenation
-	// Note: path.Join would drop bucket if object has leading slash, so use explicit formatting
-	resource := fmt.Sprintf("%s/%s", bucket, strings.TrimPrefix(object, "/"))
-	action := Action(fmt.Sprintf("%s:%s", s3_constants.ACTION_BYPASS_GOVERNANCE_RETENTION, resource))
+	identity, _ := s3_constants.GetIdentityFromContext(request).(*Identity)
+	if identity == nil {
+		// Most handlers arrive through Auth and carry the authenticated identity
+		// in context. Keep direct callers correct without authorizing against the
+		// request URL, which is bucket-only for DeleteObjects.
+		var errCode s3err.ErrorCode
+		identity, errCode, _ = s3a.iam.authenticateRequestInternal(request)
+		if errCode != s3err.ErrNone {
+			glog.V(3).Infof("IAM authentication failed for governance bypass: %v", errCode)
+			return false
+		}
+	}
 
-	// Use the IAM system to authenticate and authorize this specific action
-	identity, errCode := s3a.iam.authRequest(request, action)
+	errCode := s3a.iam.authorizeObjectKeyAction(request, identity, request.Method,
+		s3_constants.ACTION_BYPASS_GOVERNANCE_RETENTION, bucket, s3_constants.NormalizeObjectKey(object), request.URL.Query().Get("versionId"))
 	if errCode != s3err.ErrNone {
-		glog.V(3).Infof("IAM auth failed for governance bypass: %v", errCode)
+		glog.V(3).Infof("IAM authorization failed for governance bypass on %s/%s: %v", bucket, object, errCode)
 		return false
 	}
-
-	// Verify that the authenticated identity can perform this action
-	if identity != nil && identity.CanDo(action, bucket, object) {
-		return true
-	}
-
-	// Additional check: allow users with Admin action to bypass governance retention
-	// Use the proper S3 Admin action constant instead of generic isAdmin() method
-	adminAction := Action(fmt.Sprintf("%s:%s", s3_constants.ACTION_ADMIN, resource))
-	if identity != nil && identity.CanDo(adminAction, bucket, object) {
-		glog.V(2).Infof("Admin user %s granted governance bypass permission for %s/%s", identity.Name, bucket, object)
-		return true
-	}
-
-	return false
+	return true
 }
 
 // evaluateGovernanceBypassRequest evaluates if governance bypass is requested and permitted
@@ -608,14 +604,20 @@ func (s3a *S3ApiServer) enforceObjectLockProtections(request *http.Request, buck
 		return err
 	}
 
-	// Extract retention information from the entry
+	return s3a.enforceObjectLockOnEntry(entry, bucket, object, versionId, governanceBypassAllowed)
+}
+
+// enforceObjectLockOnEntry reports whether a lock recorded on an entry stops the
+// operation. Callers holding the entry already -- one reached without a version id
+// of its own, or the one a write is about to replace -- use it directly, so that
+// the decision lives in one place.
+func (s3a *S3ApiServer) enforceObjectLockOnEntry(entry *filer_pb.Entry, bucket, object, versionId string, governanceBypassAllowed bool) error {
 	retention, retentionActive, err := s3a.getRetentionFromEntry(entry)
 	if err != nil {
 		glog.Warningf("Error parsing retention for %s/%s (versionId: %s): %v", bucket, object, versionId, err)
 		// Continue with legal hold check even if retention parsing fails
 	}
 
-	// Extract legal hold information from the entry
 	_, legalHoldActive, err := s3a.getLegalHoldFromEntry(entry)
 	if err != nil {
 		glog.Warningf("Error parsing legal hold for %s/%s (versionId: %s): %v", bucket, object, versionId, err)

@@ -26,6 +26,13 @@ import (
 //   - Falls back to base action mapping if no specific resolution is possible
 //   - Always returns a valid S3 action string (never empty)
 func ResolveS3Action(r *http.Request, baseAction string, bucket string, object string) string {
+	// An action naming another service is already resolved, and an S3 request
+	// shape says nothing about it: a query parameter on an IAM or STS request
+	// must not turn it into the S3 action that parameter stands for.
+	if strings.HasPrefix(baseAction, "iam:") || strings.HasPrefix(baseAction, "sts:") {
+		return baseAction
+	}
+
 	if r == nil || r.URL == nil {
 		// No HTTP context available: fall back to coarse-grained mapping
 		// This ensures consistent behavior and avoids returning empty strings
@@ -89,6 +96,30 @@ var bucketQueryActions = map[string]map[string]string{
 	"object-lock": {
 		http.MethodGet: s3_constants.S3_ACTION_GET_BUCKET_OBJECT_LOCK,
 		http.MethodPut: s3_constants.S3_ACTION_PUT_BUCKET_OBJECT_LOCK,
+	},
+	"encryption": {
+		http.MethodGet:    s3_constants.S3_ACTION_GET_BUCKET_ENCRYPTION,
+		http.MethodPut:    s3_constants.S3_ACTION_PUT_BUCKET_ENCRYPTION,
+		http.MethodDelete: s3_constants.S3_ACTION_PUT_BUCKET_ENCRYPTION, // DELETE uses same permission as PUT
+	},
+	"requestPayment": {
+		http.MethodGet: s3_constants.S3_ACTION_GET_BUCKET_REQUEST_PAYMENT,
+		http.MethodPut: s3_constants.S3_ACTION_PUT_BUCKET_REQUEST_PAYMENT,
+	},
+	"publicAccessBlock": {
+		http.MethodGet:    s3_constants.S3_ACTION_GET_BUCKET_PUBLIC_ACCESS_BLOCK,
+		http.MethodPut:    s3_constants.S3_ACTION_PUT_BUCKET_PUBLIC_ACCESS_BLOCK,
+		http.MethodDelete: s3_constants.S3_ACTION_PUT_BUCKET_PUBLIC_ACCESS_BLOCK, // DELETE uses same permission as PUT
+	},
+	"ownershipControls": {
+		http.MethodGet:    s3_constants.S3_ACTION_GET_BUCKET_OWNERSHIP_CONTROLS,
+		http.MethodPut:    s3_constants.S3_ACTION_PUT_BUCKET_OWNERSHIP_CONTROLS,
+		http.MethodDelete: s3_constants.S3_ACTION_PUT_BUCKET_OWNERSHIP_CONTROLS, // DELETE uses same permission as PUT
+	},
+	// SeaweedFS extension: bucket quota subresource
+	"seaweedfs-quota": {
+		http.MethodGet: s3_constants.S3_ACTION_GET_BUCKET_QUOTA,
+		http.MethodPut: s3_constants.S3_ACTION_PUT_BUCKET_QUOTA,
 	},
 }
 
@@ -186,6 +217,12 @@ func resolveFromQueryParameters(query url.Values, method string, hasObject bool)
 		}
 	}
 
+	if query.Get("list-type") == "2" {
+		if method == http.MethodGet && !hasObject {
+			return s3_constants.S3_ACTION_LIST_BUCKET
+		}
+	}
+
 	// Check bucket-level query parameters using data-driven approach
 	// These are strictly bucket-level operations, so only apply when !hasObject
 	if !hasObject {
@@ -274,7 +311,9 @@ func resolveBucketLevelAction(method string, baseAction string) string {
 		}
 
 	case http.MethodPut:
-		if baseAction == s3_constants.ACTION_WRITE {
+		// CreateBucket is registered with ACTION_ADMIN; resolving it to s3:*
+		// would make it unmatchable by a policy granting s3:CreateBucket.
+		if baseAction == s3_constants.ACTION_WRITE || baseAction == s3_constants.ACTION_ADMIN {
 			return s3_constants.S3_ACTION_CREATE_BUCKET
 		}
 
@@ -334,6 +373,14 @@ func mapBaseActionToS3Format(baseAction string) string {
 		return s3_constants.S3_ACTION_GET_BUCKET_OBJECT_LOCK
 	case s3_constants.ACTION_PUT_BUCKET_OBJECT_LOCK_CONFIG:
 		return s3_constants.S3_ACTION_PUT_BUCKET_OBJECT_LOCK
+	case s3_constants.ACTION_PUT_BUCKET_POLICY:
+		return s3_constants.S3_ACTION_PUT_BUCKET_POLICY
+	case s3_constants.ACTION_DELETE_BUCKET_POLICY:
+		return s3_constants.S3_ACTION_DELETE_BUCKET_POLICY
+	case s3_constants.ACTION_PUT_BUCKET_QUOTA:
+		return s3_constants.S3_ACTION_PUT_BUCKET_QUOTA
+	case s3_constants.ACTION_GET_BUCKET_QUOTA:
+		return s3_constants.S3_ACTION_GET_BUCKET_QUOTA
 	default:
 		// For unknown actions, prefix with s3: to maintain format consistency
 		return "s3:" + baseAction

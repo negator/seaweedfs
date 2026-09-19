@@ -162,6 +162,25 @@ func (t *Topology) unregisterDataNodeAddress(addr pb.ServerAddress, dn *DataNode
 	}
 }
 
+// FreeBytes sums what every volume server reports as free on its filesystems.
+// reported is false unless all of them answered: the one that stayed quiet may
+// be the one holding the room, and a partial sum would read as a cluster with
+// none left.
+func (t *Topology) FreeBytes() (freeBytes uint64, reported bool) {
+	for _, dcNode := range t.Children() {
+		for _, rackNode := range dcNode.Children() {
+			for _, dataNode := range rackNode.Children() {
+				nodeFreeBytes, nodeReported := dataNode.GetDiskUsages().FreeBytes()
+				if !nodeReported {
+					return 0, false
+				}
+				freeBytes += nodeFreeBytes
+			}
+		}
+	}
+	return freeBytes, true
+}
+
 func (t *Topology) IsChildLocked() (bool, error) {
 	if t.IsLocked() {
 		return true, errors.New("topology is locked")
@@ -310,16 +329,6 @@ func (t *Topology) Leader() (l pb.ServerAddress, err error) {
 		func() (l pb.ServerAddress, err error) {
 			l, err = t.MaybeLeader()
 			if err == nil && l == "" {
-				// Thread-safe check if we are the leader
-				t.RaftServerAccessLock.RLock()
-				if t.RaftServer != nil && t.RaftServer.State() == raft.Leader {
-					l = pb.ServerAddress(t.RaftServer.Name())
-				}
-				t.RaftServerAccessLock.RUnlock()
-
-				if l != "" {
-					return l, nil
-				}
 				err = leaderNotSelected
 			}
 			return l, err
@@ -337,6 +346,9 @@ func (t *Topology) MaybeLeader() (l pb.ServerAddress, err error) {
 
 	if t.RaftServer != nil {
 		l = pb.ServerAddress(t.RaftServer.Leader())
+		if l == "" && t.RaftServer.State() == raft.Leader {
+			l = pb.ServerAddress(t.RaftServer.Name())
+		}
 	} else if t.HashicorpRaft != nil {
 		l = pb.ServerAddress(t.HashicorpRaft.Leader())
 	} else {
@@ -410,11 +422,16 @@ func (t *Topology) PickForWrite(requestedCount uint64, option *VolumeGrowOption,
 	if volumeLocationList == nil || volumeLocationList.Length() == 0 {
 		return "", 0, nil, shouldGrow, fmt.Errorf("%s available for collection:%s replication:%s ttl:%s", NoWritableVolumes, option.Collection, option.ReplicaPlacement.String(), option.Ttl.String())
 	}
-	// Track estimated assigned bytes to spread load between heartbeats.
-	// Use the client hint if provided, otherwise fall back to 1MB estimate.
+	// Track estimated assigned bytes to spread load between heartbeats. A flat
+	// fallback overcharges a small-file workload enough to mark near-empty
+	// volumes full, so prefer the volume's own average.
 	sizePerFile := DefaultNeedleSizeEstimate
 	if expectedDataSize > 0 {
 		sizePerFile = expectedDataSize
+	} else if vi, infoErr := volumeLocationList.Head().GetVolumesById(vid); infoErr == nil && vi.FileCount > 0 {
+		if avg := vi.Size / uint64(vi.FileCount); avg > 0 {
+			sizePerFile = avg
+		}
 	}
 	pendingBytes := min(uint64(count)*sizePerFile, uint64(math.MaxInt64))
 	if volumeLayout.RecordAssign(vid, int64(pendingBytes)) {
@@ -429,6 +446,50 @@ func (t *Topology) GetVolumeLayout(collectionName string, rp *super_block.Replic
 	return t.collectionMap.Get(collectionName, func() interface{} {
 		return NewCollection(collectionName, t.volumeSizeLimit, t.replicationAsMin)
 	}).(*Collection).GetOrCreateVolumeLayout(rp, ttl, diskType)
+}
+
+// DecayQuietVolumeSizes decays pending assign estimates across every layout.
+// A volume that changed reports within a pulse, so two quiet pulses mean the
+// size on record is the size there is.
+func (t *Topology) DecayQuietVolumeSizes() {
+	quietCutoff := time.Duration(2*t.pulse) * time.Second
+	for _, c := range t.collectionMap.Items() {
+		for _, vl := range c.(*Collection).GetAllVolumeLayouts() {
+			vl.DecayQuietVolumeSizes(quietCutoff)
+		}
+	}
+}
+
+// CollectionVolumeStats aggregates stats across all volume layouts and EC
+// volumes of one collection, or across every collection when collectionName is
+// empty.
+func (t *Topology) CollectionVolumeStats(collectionName string) *VolumeLayoutStats {
+	ret := &VolumeLayoutStats{}
+	var collections []*Collection
+	if collectionName == "" {
+		for _, c := range t.collectionMap.Items() {
+			collections = append(collections, c.(*Collection))
+		}
+	} else if c, found := t.FindCollection(collectionName); found {
+		collections = append(collections, c)
+	}
+	for _, c := range collections {
+		for _, vl := range c.GetAllVolumeLayouts() {
+			stats := vl.Stats()
+			ret.TotalSize += stats.TotalSize
+			ret.UsedSize += stats.UsedSize
+			ret.LogicalUsedSize += stats.LogicalUsedSize
+			ret.FileCount += stats.FileCount
+		}
+	}
+	// EC volumes live outside collectionMap, so a collection whose volumes are
+	// all encoded has no layout left to report them
+	ecStats := t.CollectionEcVolumeStats(collectionName)
+	ret.TotalSize += ecStats.TotalSize
+	ret.UsedSize += ecStats.UsedSize
+	ret.LogicalUsedSize += ecStats.LogicalUsedSize
+	ret.FileCount += ecStats.FileCount
+	return ret
 }
 
 func (t *Topology) ListCollections(includeNormalVolumes, includeEcVolumes bool) (ret []string) {
@@ -467,7 +528,18 @@ func (t *Topology) FindCollection(collectionName string) (*Collection, bool) {
 }
 
 func (t *Topology) DeleteCollection(collectionName string) {
-	t.collectionMap.Delete(collectionName)
+	// The layouts vanish with the collection, but every location they served
+	// holds a bit in its node's lookup digest. Left in place, those bits keep
+	// the node's held and servable digests apart forever, and the master asks
+	// for the full volume list on every heartbeat from then on.
+	// Unpublish first so a racing registration re-resolves into a fresh collection.
+	collection, found := t.collectionMap.Delete(collectionName)
+	if !found {
+		return
+	}
+	for _, vl := range collection.(*Collection).GetAllVolumeLayouts() {
+		vl.releaseLookupOwnership()
+	}
 }
 
 func (t *Topology) DeleteLayout(collectionName string, rp *super_block.ReplicaPlacement, ttl *needle.TTL, diskType types.DiskType) {
@@ -483,19 +555,27 @@ func (t *Topology) DeleteLayout(collectionName string, rp *super_block.ReplicaPl
 
 func (t *Topology) RegisterVolumeLayout(v storage.VolumeInfo, dn *DataNode) {
 	diskType := types.ToDiskType(v.DiskType)
-	vl := t.GetVolumeLayout(v.Collection, v.ReplicaPlacement, v.Ttl, diskType)
-	vl.RegisterVolume(&v, dn)
-	vl.EnsureCorrectWritables(&v)
+	for {
+		vl := t.GetVolumeLayout(v.Collection, v.ReplicaPlacement, v.Ttl, diskType)
+		if vl.RegisterVolume(&v, dn) {
+			vl.EnsureCorrectWritables(&v)
+			return
+		}
+		// Dropped with its collection; the next lookup creates a fresh one.
+	}
 }
 
 func (t *Topology) UnRegisterVolumeLayout(v storage.VolumeInfo, dn *DataNode) {
 	glog.Infof("removing volume info: %+v from %v", v, dn.id)
-	if v.ReplicaPlacement.GetCopyCount() > 1 {
-		stats.MasterReplicaPlacementMismatch.WithLabelValues(v.Collection, v.Id.String()).Set(0)
-	}
 	diskType := types.ToDiskType(v.DiskType)
 	volumeLayout := t.GetVolumeLayout(v.Collection, v.ReplicaPlacement, v.Ttl, diskType)
 	volumeLayout.UnRegisterVolume(&v, dn)
+	// Drop the series only after the last placement is gone. Deleting while
+	// another data node still holds v would hide under-replication until the
+	// next CollectDeadNodeAndFullVolumes cycle recreates the label.
+	if v.ReplicaPlacement.GetCopyCount() > 1 && len(t.Lookup(v.Collection, v.Id)) == 0 {
+		stats.MasterReplicaPlacementMismatch.DeleteLabelValues(v.Collection, v.Id.String())
+	}
 	if volumeLayout.isEmpty() {
 		t.DeleteLayout(v.Collection, v.ReplicaPlacement, v.Ttl, diskType)
 	}
@@ -553,9 +633,9 @@ func (t *Topology) ListDCAndRacks() (dcs map[NodeId][]NodeId) {
 	return dcs
 }
 
-func (t *Topology) SyncDataNodeRegistration(volumes []*master_pb.VolumeInformationMessage, dn *DataNode) (newVolumes, deletedVolumes []storage.VolumeInfo) {
+func (t *Topology) SyncDataNodeRegistration(volumes []*master_pb.VolumeInformationMessage, dn *DataNode) (newVolumes, deletedVolumes, changedVolumes []storage.VolumeInfo) {
 	// convert into in memory struct storage.VolumeInfo
-	var volumeInfos []storage.VolumeInfo
+	volumeInfos := make([]storage.VolumeInfo, 0, len(volumes))
 	for _, v := range volumes {
 		if vi, err := storage.NewVolumeInfo(v); err == nil {
 			volumeInfos = append(volumeInfos, vi)
@@ -564,18 +644,12 @@ func (t *Topology) SyncDataNodeRegistration(volumes []*master_pb.VolumeInformati
 		}
 	}
 	// find out the delta volumes
-	var changedVolumes []storage.VolumeInfo
 	newVolumes, deletedVolumes, changedVolumes = dn.UpdateVolumes(volumeInfos)
 	for _, v := range newVolumes {
 		t.RegisterVolumeLayout(v, dn)
 	}
 	for _, v := range deletedVolumes {
 		t.UnRegisterVolumeLayout(v, dn)
-	}
-	for _, v := range changedVolumes {
-		diskType := types.ToDiskType(v.DiskType)
-		vl := t.GetVolumeLayout(v.Collection, v.ReplicaPlacement, v.Ttl, diskType)
-		vl.EnsureCorrectWritables(&v)
 	}
 	// Update effective sizes for all reported volumes (decay pending estimates).
 	// If decay brings a volume eagerly removed by RecordAssign back under the
@@ -594,14 +668,22 @@ func (t *Topology) SyncDataNodeRegistration(volumes []*master_pb.VolumeInformati
 		// Without this, the volume stays visible in volume.list/admin UI yet
 		// LookupVolume returns "volume id not found".
 		if !vl.HasDataNode(v.Id, dn) {
-			// vl is already resolved above; call it directly instead of
-			// RegisterVolumeLayout, which would repeat the GetVolumeLayout lookup.
-			vl.RegisterVolume(&v, dn)
-			vl.EnsureCorrectWritables(&v)
+			for !vl.RegisterVolume(&v, dn) {
+				// Dropped with its collection; the next lookup creates a fresh
+				// one, which the calls below must use too.
+				vl = t.GetVolumeLayout(v.Collection, v.ReplicaPlacement, v.Ttl, diskType)
+			}
+			// Volumes new to the disk map were registered above, so reaching
+			// here means only the lookup index had lost it. Clients were told
+			// it went when the node dropped out, so the repair has to tell them
+			// it is back.
+			newVolumes = append(newVolumes, v)
 		}
-		if vl.UpdateVolumeSize(v.Id, v.Size, v.CompactRevision) {
+		vl.UpdateOversizedState(&v, dn)
+		if vl.UpdateVolumeSize(v.Id, v.Size, v.CompactRevision, true) {
 			vl.AdjustActiveVolumeCountAfterRecovery(v.Id)
 		}
+		vl.EnsureCorrectWritables(&v)
 	}
 	return
 }
@@ -626,14 +708,85 @@ func (t *Topology) IncrementalSyncDataNodeRegistration(newVolumes, deletedVolume
 	}
 	dn.DeltaUpdateVolumes(newVis, oldVis)
 
+	type layoutKey struct {
+		id               needle.VolumeId
+		collection       string
+		replicaPlacement byte
+		ttl              uint32
+		diskType         types.DiskType
+	}
+	key := func(vi storage.VolumeInfo) layoutKey {
+		return layoutKey{
+			id:               vi.Id,
+			collection:       vi.Collection,
+			replicaPlacement: vi.ReplicaPlacement.Byte(),
+			ttl:              vi.Ttl.ToUint32(),
+			diskType:         types.ToDiskType(vi.DiskType),
+		}
+	}
+	replacements := make(map[layoutKey]struct{}, len(newVis))
 	for _, vi := range newVis {
+		replacements[key(vi)] = struct{}{}
 		t.RegisterVolumeLayout(vi, dn)
 	}
-	for _, vi := range oldVis {
-		t.UnRegisterVolumeLayout(vi, dn)
+	for _, oldVi := range oldVis {
+		if _, replaced := replacements[key(oldVi)]; !replaced {
+			t.UnRegisterVolumeLayout(oldVi, dn)
+		}
 	}
 
 	return
+}
+
+// ApplyVolumeChanges records the volumes a heartbeat reported as changed and
+// returns the ones the node did not already have. Only the named volumes are
+// touched: unlike a full report, silence about a volume says nothing about
+// whether the server still has it.
+//
+// Most changes are a volume growing, which moves no location, so returning
+// only the arrivals keeps a busy cluster from telling every client about
+// volumes they can already reach. The arrival set also includes replicas whose
+// IsRemote() classification flipped on tier transition: the volume is still
+// servable from the same node, but every connected client has stale replica
+// priority and must be told to refresh.
+func (t *Topology) ApplyVolumeChanges(changed []*master_pb.VolumeInformationMessage, dn *DataNode) (newVolumes []storage.VolumeInfo) {
+	volumeInfos := make([]storage.VolumeInfo, 0, len(changed))
+	for _, v := range changed {
+		vi, err := storage.NewVolumeInfo(v)
+		if err != nil {
+			glog.V(0).Infof("Fail to convert changed volume information: %v", err)
+			continue
+		}
+		volumeInfos = append(volumeInfos, vi)
+	}
+
+	for _, vi := range volumeInfos {
+		isNew, isChanged, tierTransition := dn.AddOrUpdateVolume(vi)
+		if vi.ReplicaPlacement == nil {
+			if isNew {
+				newVolumes = append(newVolumes, vi)
+			}
+			continue
+		}
+		vl := t.GetVolumeLayout(vi.Collection, vi.ReplicaPlacement, vi.Ttl, types.ToDiskType(vi.DiskType))
+		// Reaching the lookup index is what makes a volume servable, so a
+		// volume only that index had lost is an arrival as far as clients are
+		// concerned: they were told it went when the node dropped out.
+		becameServable := !vl.HasDataNode(vi.Id, dn)
+		for becameServable && !vl.RegisterVolume(&vi, dn) {
+			// Dropped with its collection; the next lookup creates a fresh one.
+			vl = t.GetVolumeLayout(vi.Collection, vi.ReplicaPlacement, vi.Ttl, types.ToDiskType(vi.DiskType))
+		}
+		if isNew || becameServable || tierTransition || isChanged {
+			newVolumes = append(newVolumes, vi)
+		}
+		vl.UpdateOversizedState(&vi, dn)
+		if vl.UpdateVolumeSize(vi.Id, vi.Size, vi.CompactRevision, true) {
+			vl.AdjustActiveVolumeCountAfterRecovery(vi.Id)
+		}
+		vl.EnsureCorrectWritables(&vi)
+	}
+	return newVolumes
 }
 
 func (t *Topology) DataNodeRegistration(dcName, rackName string, dn *DataNode) {

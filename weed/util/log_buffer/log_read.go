@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	"google.golang.org/protobuf/proto"
-
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -16,6 +14,10 @@ import (
 var (
 	ResumeError         = fmt.Errorf("resume")
 	ResumeFromDiskError = fmt.Errorf("resumeFromDisk")
+	// StopReadingError, wrapped by an eachLogDataFn's error, marks a read the
+	// callback ended on purpose - control flow, not a failure - so the loop
+	// hands it back to the caller without logging it.
+	StopReadingError = fmt.Errorf("stopReading")
 )
 
 // notificationHealthCheckInterval bounds how long an idle subscriber blocks
@@ -103,6 +105,7 @@ func (logBuffer *LogBuffer) LoopProcessLogData(readerName string, startPosition 
 
 	// loop through all messages
 	var bytesBuf *bytes.Buffer
+	var bytesBufPooled bool
 	var batchIndex int64
 	lastReadPosition = startPosition
 	var entryCounter int64
@@ -115,7 +118,7 @@ func (logBuffer *LogBuffer) LoopProcessLogData(readerName string, startPosition 
 	// responsive 250ms cadence resumes for active readers.
 	caughtUpToDiskHead := false
 	defer func() {
-		if bytesBuf != nil {
+		if bytesBuf != nil && bytesBufPooled {
 			logBuffer.ReleaseMemory(bytesBuf)
 		}
 		// println("LoopProcessLogData", readerName, "sent messages total", entryCounter)
@@ -123,10 +126,11 @@ func (logBuffer *LogBuffer) LoopProcessLogData(readerName string, startPosition 
 
 	for {
 
-		if bytesBuf != nil {
+		if bytesBuf != nil && bytesBufPooled {
 			logBuffer.ReleaseMemory(bytesBuf)
+			bytesBuf = nil // keep the deferred release from double-freeing if ReadFromBuffer panics
 		}
-		bytesBuf, batchIndex, err = logBuffer.ReadFromBuffer(lastReadPosition)
+		bytesBuf, batchIndex, bytesBufPooled, err = logBuffer.ReadFromBuffer(lastReadPosition)
 		if err == ResumeFromDiskError {
 			// Try to read from disk if readFromDiskFn is available
 			if logBuffer.ReadFromDiskFn != nil {
@@ -147,7 +151,27 @@ func (logBuffer *LogBuffer) LoopProcessLogData(readerName string, startPosition 
 					glog.V(4).Infof("%s: Caught up to disk head, backing off to %s poll", readerName, caughtUpDiskPollInterval)
 				}
 			} else if logBuffer.HasData() {
-				return lastReadPosition, isDone, ResumeFromDiskError
+				// HasData() and ReadFromBuffer lock separately, so a racing write can make
+				// HasData() see data the empty-buffer read missed. Re-read; only bail if the
+				// position is genuinely behind the in-memory window (flushed to disk).
+				reBuf, _, rePooled, reErr := logBuffer.ReadFromBuffer(lastReadPosition)
+				if reErr == ResumeFromDiskError {
+					return lastReadPosition, isDone, ResumeFromDiskError
+				}
+				if reBuf != nil && rePooled {
+					logBuffer.ReleaseMemory(reBuf)
+				}
+				continue
+			}
+
+			// Nothing readable anywhere for this cursor: a bounded subscription is
+			// done, same as the caught-up path below. Without this a bounded
+			// subscriber on a buffer that never took a write (empty since process
+			// start, ReadFromDiskFn nil) parks here forever while heartbeats keep
+			// the stream looking alive. The nil error matters: err still holds
+			// ResumeFromDiskError, which callers treat as retry-the-disk-pass.
+			if stopTsNs != 0 {
+				return lastReadPosition, true, nil
 			}
 
 			// CRITICAL: Check if client is still connected
@@ -251,7 +275,8 @@ func (logBuffer *LogBuffer) LoopProcessLogData(readerName string, startPosition 
 			entryData := buf[pos+4 : pos+4+int(size)]
 
 			logEntry := &filer_pb.LogEntry{}
-			if err = proto.Unmarshal(entryData, logEntry); err != nil {
+			// data/key alias entryData; valid only within eachLogDataFn below.
+			if err = unmarshalLogEntryAliased(entryData, logEntry); err != nil {
 				glog.Errorf("unexpected unmarshal mq_pb.Message: %v", err)
 				pos += 4 + int(size)
 				continue
@@ -276,7 +301,9 @@ func (logBuffer *LogBuffer) LoopProcessLogData(readerName string, startPosition 
 			lastReadPosition = NewMessagePosition(logEntry.TsNs, batchIndex)
 
 			if isDone, err = eachLogDataFn(logEntry); err != nil {
-				glog.Errorf("LoopProcessLogData: %s process log entry %d %v: %v", readerName, batchSize+1, logEntry, err)
+				if !errors.Is(err, StopReadingError) {
+					glog.Errorf("LoopProcessLogData: %s process log entry %d key:%q ts_ns:%d offset:%d size:%d: %v", readerName, batchSize+1, logEntry.Key, logEntry.TsNs, logEntry.Offset, len(logEntry.Data), err)
+				}
 				return
 			}
 			if isDone {
@@ -306,13 +333,14 @@ func (logBuffer *LogBuffer) LoopProcessLogDataWithOffset(readerName string, star
 
 	// loop through all messages
 	var bytesBuf *bytes.Buffer
+	var bytesBufPooled bool
 	var offset int64
 	lastReadPosition = startPosition
 	var entryCounter int64
 	// See LoopProcessLogData for the caughtUpToDiskHead invariant.
 	caughtUpToDiskHead := false
 	defer func() {
-		if bytesBuf != nil {
+		if bytesBuf != nil && bytesBufPooled {
 			logBuffer.ReleaseMemory(bytesBuf)
 		}
 		// println("LoopProcessLogDataWithOffset", readerName, "sent messages total", entryCounter)
@@ -326,10 +354,11 @@ func (logBuffer *LogBuffer) LoopProcessLogDataWithOffset(readerName string, star
 			return
 		}
 
-		if bytesBuf != nil {
+		if bytesBuf != nil && bytesBufPooled {
 			logBuffer.ReleaseMemory(bytesBuf)
+			bytesBuf = nil // keep the deferred release from double-freeing if ReadFromBuffer panics
 		}
-		bytesBuf, offset, err = logBuffer.ReadFromBuffer(lastReadPosition)
+		bytesBuf, offset, bytesBufPooled, err = logBuffer.ReadFromBuffer(lastReadPosition)
 		glog.V(4).Infof("ReadFromBuffer for %s returned bytesBuf=%v, offset=%d, err=%v", readerName, bytesBuf != nil, offset, err)
 
 		// Check for buffer corruption error before other error handling
@@ -362,7 +391,17 @@ func (logBuffer *LogBuffer) LoopProcessLogDataWithOffset(readerName string, star
 					glog.V(4).Infof("%s: Caught up to disk head, backing off to %s poll", readerName, caughtUpDiskPollInterval)
 				}
 			} else if logBuffer.HasData() {
-				return lastReadPosition, isDone, ResumeFromDiskError
+				// HasData() and ReadFromBuffer lock separately, so a racing write can make
+				// HasData() see data the empty-buffer read missed. Re-read; only bail if the
+				// position is genuinely behind the in-memory window (flushed to disk).
+				reBuf, _, rePooled, reErr := logBuffer.ReadFromBuffer(lastReadPosition)
+				if reErr == ResumeFromDiskError {
+					return lastReadPosition, isDone, ResumeFromDiskError
+				}
+				if reBuf != nil && rePooled {
+					logBuffer.ReleaseMemory(reBuf)
+				}
+				continue
 			}
 
 			// CRITICAL: Check if client is still connected after disk read
@@ -503,7 +542,8 @@ func (logBuffer *LogBuffer) LoopProcessLogDataWithOffset(readerName string, star
 			entryData := buf[pos+4 : pos+4+int(size)]
 
 			logEntry := &filer_pb.LogEntry{}
-			if err = proto.Unmarshal(entryData, logEntry); err != nil {
+			// data/key alias entryData; valid only within eachLogDataFn below.
+			if err = unmarshalLogEntryAliased(entryData, logEntry); err != nil {
 				glog.Errorf("unexpected unmarshal mq_pb.Message: %v", err)
 				pos += 4 + int(size)
 				continue
@@ -536,7 +576,9 @@ func (logBuffer *LogBuffer) LoopProcessLogDataWithOffset(readerName string, star
 
 			glog.V(4).Infof("Calling eachLogDataFn for entry at offset %d, next position will be %d", logEntry.Offset, logEntry.Offset+1)
 			if isDone, err = eachLogDataFn(logEntry, logEntry.Offset); err != nil {
-				glog.Errorf("LoopProcessLogDataWithOffset: %s process log entry %d %v: %v", readerName, batchSize+1, logEntry, err)
+				if !errors.Is(err, StopReadingError) {
+					glog.Errorf("LoopProcessLogDataWithOffset: %s process log entry %d key:%q ts_ns:%d offset:%d size:%d: %v", readerName, batchSize+1, logEntry.Key, logEntry.TsNs, logEntry.Offset, len(logEntry.Data), err)
+				}
 				return
 			}
 			if isDone {

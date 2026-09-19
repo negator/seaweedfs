@@ -22,16 +22,30 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
+
+// fencedFindEntry reads an entry with an exact log-position fence: the stamp
+// and the read share the path lock mutations hold across write and notify, so
+// every event at or below the fence is in the entry and none above it are.
+// Any read whose result a client versions must go through here.
+func (fs *FilerServer) fencedFindEntry(ctx context.Context, path util.FullPath) (entry *filer.Entry, logTsNs int64, err error) {
+	pathLock := fs.entryLockTable.AcquireLock("fencedFindEntry", path, util.SharedLock)
+	logTsNs = time.Now().UnixNano()
+	entry, err = fs.filer.FindEntry(ctx, path)
+	fs.entryLockTable.ReleaseLock(path, pathLock)
+	return
+}
 
 func (fs *FilerServer) LookupDirectoryEntry(ctx context.Context, req *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
 
 	glog.V(4).InfofCtx(ctx, "LookupDirectoryEntry %s", filepath.Join(req.Directory, req.Name))
 
-	entry, err := fs.filer.FindEntry(ctx, util.JoinPath(req.Directory, req.Name))
+	entry, logTsNs, err := fs.fencedFindEntry(ctx, util.JoinPath(req.Directory, req.Name))
+
 	if err == filer_pb.ErrNotFound {
-		return &filer_pb.LookupDirectoryEntryResponse{}, err
+		return &filer_pb.LookupDirectoryEntryResponse{LogTsNs: logTsNs, LogSignature: fs.filer.Signature}, err
 	}
 	if err != nil {
 		glog.V(3).InfofCtx(ctx, "LookupDirectoryEntry %s: %+v, ", filepath.Join(req.Directory, req.Name), err)
@@ -39,7 +53,9 @@ func (fs *FilerServer) LookupDirectoryEntry(ctx context.Context, req *filer_pb.L
 	}
 
 	return &filer_pb.LookupDirectoryEntryResponse{
-		Entry: entry.ToProtoEntry(),
+		Entry:        entry.ToProtoEntry(),
+		LogTsNs:      logTsNs,
+		LogSignature: fs.filer.Signature,
 	}, nil
 }
 
@@ -69,8 +85,21 @@ func (fs *FilerServer) ListEntries(req *filer_pb.ListEntriesRequest, stream file
 		var hasEntries bool
 		lastFileName, listErr = fs.filer.StreamListDirectoryEntries(stream.Context(), util.FullPath(req.Directory), lastFileName, includeLastFile, int64(paginationLimit), req.Prefix, "", "", func(entry *filer.Entry) (bool, error) {
 			hasEntries = true
+			pbEntry := entry.ToProtoEntry()
+			if req.OmitChunks {
+				// Stamp the size before dropping the only other thing carrying
+				// it. Most stores fold the chunk extents into FileSize when they
+				// decode, but one that keeps entries as JSON rather than as an
+				// encoded Entry never re-derives it, and the caller would be
+				// left with a zero. The entries are still read whole, because
+				// expiring one here deletes its data and that needs the chunks.
+				if pbEntry.Attributes != nil {
+					pbEntry.Attributes.FileSize = filer.FileSize(pbEntry)
+				}
+				pbEntry.Chunks = nil
+			}
 			resp := &filer_pb.ListEntriesResponse{
-				Entry: entry.ToProtoEntry(),
+				Entry: pbEntry,
 			}
 			if !sentSnapshot {
 				resp.SnapshotTsNs = snapshotTsNs
@@ -101,12 +130,10 @@ func (fs *FilerServer) ListEntries(req *filer_pb.ListEntriesRequest, stream file
 
 	}
 
-	// For empty directories we intentionally do NOT send a snapshot-only
-	// response (Entry == nil). Many consumers (Java FilerClient, S3 listing,
-	// etc.) treat any received response as an entry. The Go client-side
-	// DoSeaweedListWithSnapshot generates a client-side cutoff when the
-	// server sends no snapshot, so snapshot consistency is preserved
-	// without a server-side send.
+	// No snapshot-only response for empty directories: many consumers (Java
+	// FilerClient, S3 listing) treat any response as an entry. The trailer
+	// carries it instead; older clients ignore trailers.
+	stream.SetTrailer(metadata.Pairs(filer_pb.ListSnapshotTsNsTrailerKey, strconv.FormatInt(snapshotTsNs, 10)))
 
 	return nil
 }
@@ -131,14 +158,19 @@ func (fs *FilerServer) LookupVolume(ctx context.Context, req *filer_pb.LookupVol
 	return resp, err
 }
 
+// wdclientLocationsToPb converts the wdclient's internal Location entries
+// (carrying DataInRemote and grpc-port metadata) to the protobuf form served
+// by the filer gRPC API, preserving the fields the lookup client uses to
+// prefer a local replica over a remote-tiered one.
 func wdclientLocationsToPb(locations []wdclient.Location) []*filer_pb.Location {
 	locs := make([]*filer_pb.Location, 0, len(locations))
 	for _, loc := range locations {
 		locs = append(locs, &filer_pb.Location{
-			Url:        loc.Url,
-			PublicUrl:  loc.PublicUrl,
-			GrpcPort:   uint32(loc.GrpcPort),
-			DataCenter: loc.DataCenter,
+			Url:          loc.Url,
+			PublicUrl:    loc.PublicUrl,
+			GrpcPort:     uint32(loc.GrpcPort),
+			DataCenter:   loc.DataCenter,
+			DataInRemote: loc.DataInRemote,
 		})
 	}
 	return locs
@@ -168,24 +200,46 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 
 	resp = &filer_pb.CreateEntryResponse{}
 
+	// An exclusive or conditional create is a read-then-write that the per-path
+	// lock below only makes atomic on this filer, while the store's insert is an
+	// upsert. Route it to the entry's ring owner so one filer's lock arbitrates
+	// every creator cluster-wide; is_moved bounds this to one hop. Plain creates
+	// are upserts either way and stay local.
+	if !req.IsMoved && (req.OExcl || conditionIsSet(req.Condition)) {
+		fullpath := util.NewFullPath(req.Directory, req.Entry.Name)
+		// Held apart from the named resp, which the local path below writes into:
+		// a failed forward must not leave it nil.
+		var ownerResp *filer_pb.CreateEntryResponse
+		handled, forwardErr := fs.forwardToWriteOwner(ctx, entryRouteKey(fullpath), func(owner pb.ServerAddress) error {
+			glog.V(2).InfofCtx(ctx, "CreateEntry %s: forwarding to owner %s", fullpath, owner)
+			req.IsMoved = true
+			return pb.WithFilerClient(false, 0, owner, fs.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+				forwarded, e := client.CreateEntry(ctx, req)
+				if e != nil {
+					return e
+				}
+				ownerResp = forwarded
+				return nil
+			})
+		})
+		if handled {
+			if forwardErr != nil {
+				return &filer_pb.CreateEntryResponse{}, forwardErr
+			}
+			return ownerResp, nil
+		}
+	}
+
 	chunks, garbage, err2 := fs.cleanupChunks(ctx, util.Join(req.Directory, req.Entry.Name), nil, req.Entry)
 	if err2 != nil {
 		return &filer_pb.CreateEntryResponse{}, fmt.Errorf("CreateEntry cleanupChunks %s %s: %v", req.Directory, req.Entry.Name, err2)
 	}
 
-	so, err := fs.detectStorageOption(ctx, string(util.NewFullPath(req.Directory, req.Entry.Name)), "", "", 0, "", "", "", "")
-	if err != nil {
-		return nil, err
-	}
 	newEntry := filer.FromPbEntry(req.Directory, req.Entry)
 	newEntry.Chunks = chunks
-	// Don't apply TTL to remote entries - they're managed by remote storage
-	if newEntry.Remote == nil {
-		if newEntry.TtlSec == 0 {
-			newEntry.TtlSec = so.TtlSeconds
-		}
-	} else {
-		newEntry.TtlSec = 0
+	so, err := fs.applyStorageDefaultsToEntry(ctx, newEntry)
+	if err != nil {
+		return nil, err
 	}
 
 	// Serialize concurrent mutations to the same path on this filer so the
@@ -194,6 +248,11 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 	fullpath := newEntry.FullPath
 	pathLock := fs.entryLockTable.AcquireLock("CreateEntry", fullpath, util.ExclusiveLock)
 	defer fs.entryLockTable.ReleaseLock(fullpath, pathLock)
+
+	// Fence stamped under the lock: a no-op create returns no event, but the
+	// acknowledged state still reflects everything at or below this.
+	resp.LogTsNs = time.Now().UnixNano()
+	resp.LogSignature = fs.filer.Signature
 
 	// Evaluate the optional precondition against the current entry while the
 	// path lock is held, so the check and the write are atomic on this filer.
@@ -262,27 +321,29 @@ func (fs *FilerServer) ObjectTransaction(ctx context.Context, req *filer_pb.Obje
 	// serialization point — even when the caller's ring view was stale. is_moved
 	// bounds this to one hop: a forwarded transaction is applied locally, so two
 	// filers that disagree on the owner during a ring change cannot loop.
-	if req.RouteKey != "" && !req.IsMoved && fs.filer.Dlm != nil {
-		if owner := fs.filer.Dlm.LockRing.GetPrimary(req.RouteKey); owner != "" && owner != fs.option.Host {
-			// Rebuild rather than copy the request struct (it carries a mutex);
-			// the pointer/slice fields are shared since the original is not mutated.
-			forwarded := &filer_pb.ObjectTransactionRequest{
-				LockKey:            req.LockKey,
-				Condition:          req.Condition,
-				Mutations:          req.Mutations,
-				IsFromOtherCluster: req.IsFromOtherCluster,
-				Signatures:         req.Signatures,
-				ConditionKey:       req.ConditionKey,
-				RouteKey:           req.RouteKey,
-				IsMoved:            true,
-			}
+	if req.RouteKey != "" && !req.IsMoved {
+		// Rebuild rather than copy the request struct (it carries a mutex); the
+		// pointer/slice fields are shared since the original is not mutated.
+		forwarded := &filer_pb.ObjectTransactionRequest{
+			LockKey:            req.LockKey,
+			Condition:          req.Condition,
+			Mutations:          req.Mutations,
+			IsFromOtherCluster: req.IsFromOtherCluster,
+			Signatures:         req.Signatures,
+			ConditionKey:       req.ConditionKey,
+			RouteKey:           req.RouteKey,
+			IsMoved:            true,
+		}
+		var resp *filer_pb.ObjectTransactionResponse
+		handled, err := fs.forwardToWriteOwner(ctx, req.RouteKey, func(owner pb.ServerAddress) error {
 			glog.V(2).InfofCtx(ctx, "ObjectTransaction %s: forwarding to owner %s", req.LockKey, owner)
-			var resp *filer_pb.ObjectTransactionResponse
-			err := pb.WithFilerClient(false, 0, owner, fs.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+			return pb.WithFilerClient(false, 0, owner, fs.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 				var e error
 				resp, e = client.ObjectTransaction(ctx, forwarded)
 				return e
 			})
+		})
+		if handled {
 			if err != nil {
 				return &filer_pb.ObjectTransactionResponse{}, err
 			}
@@ -361,6 +422,22 @@ func (fs *FilerServer) ObjectTransactionBatch(ctx context.Context, req *filer_pb
 	return resp, nil
 }
 
+// applyStorageDefaultsToEntry enforces the path's storage rule (read-only
+// prefixes reject the write) and fills in the rule TTL when the entry carries
+// none. The returned option carries the same TTL as the entry, so chunks a
+// caller still has to place expire with it.
+func (fs *FilerServer) applyStorageDefaultsToEntry(ctx context.Context, entry *filer.Entry) (*operation.StorageOption, error) {
+	if entry.Remote != nil {
+		entry.TtlSec = 0
+	}
+	so, err := fs.detectStorageOption(ctx, string(entry.FullPath), "", "", entry.TtlSec, "", "", "", "")
+	if err != nil {
+		return nil, err
+	}
+	entry.ApplyStorageTtl(so.TtlSeconds)
+	return so, nil
+}
+
 // applyObjectMutation applies a single mutation while the transaction's path
 // lock is held. PUT entries are expected to be fully prepared by the caller
 // (chunks resolved); mutations here are metadata-scoped. A DELETE of an absent
@@ -373,15 +450,30 @@ func (fs *FilerServer) applyObjectMutation(ctx context.Context, m *filer_pb.Obje
 			return fmt.Errorf("PUT requires an entry")
 		}
 		newEntry := filer.FromPbEntry(m.Directory, m.Entry)
-		return fs.filer.CreateEntry(ctx, newEntry, nil, false, fromOtherCluster, signatures, false, fs.filer.MaxFilenameLength)
+		so, err := fs.applyStorageDefaultsToEntry(ctx, newEntry)
+		if err != nil {
+			return err
+		}
+		return fs.filer.CreateEntry(ctx, newEntry, nil, false, fromOtherCluster, signatures, false, so.MaxFileNameLength)
 
 	case filer_pb.ObjectMutation_DELETE:
 		fullpath := util.NewFullPath(m.Directory, m.Name)
 		err := fs.filer.DeleteEntryMetaAndData(ctx, fullpath, m.IsRecursive, false, m.IsDeleteData, fromOtherCluster, signatures, 0)
-		if err == filer_pb.ErrNotFound {
-			return nil
+		if err != nil && err != filer_pb.ErrNotFound {
+			return err
 		}
-		return err
+		if m.RemoveEmptyParent {
+			// A parent that exists only to hold this child (e.g. a .versions/
+			// directory losing its last version) is torn down in the same locked
+			// transaction. Best-effort: a non-empty or already-removed parent is
+			// the expected no-op, and a failed teardown must not fail the
+			// already-applied delete.
+			parentErr := fs.filer.DeleteEntryMetaAndData(ctx, util.FullPath(m.Directory), false, false, false, fromOtherCluster, signatures, 0)
+			if parentErr != nil && parentErr != filer_pb.ErrNotFound && !errors.Is(parentErr, filer.ErrNonEmptyFolder) {
+				glog.V(1).InfofCtx(ctx, "remove empty parent %s: %v", m.Directory, parentErr)
+			}
+		}
+		return nil
 
 	case filer_pb.ObjectMutation_PATCH_EXTENDED:
 		fullpath := util.NewFullPath(m.Directory, m.Name)
@@ -425,7 +517,7 @@ func (fs *FilerServer) applyObjectMutation(ctx context.Context, m *filer_pb.Obje
 		return nil
 
 	case filer_pb.ObjectMutation_RECOMPUTE_LATEST:
-		return fs.applyRecomputeLatest(ctx, m)
+		return fs.applyRecomputeLatest(ctx, m, fromOtherCluster, signatures)
 
 	default:
 		return fmt.Errorf("unknown mutation type %v", m.Type)
@@ -439,7 +531,7 @@ func (fs *FilerServer) applyObjectMutation(ctx context.Context, m *filer_pb.Obje
 // name_to_key. When the scanned directory is empty the pointer keys are cleared.
 // The caller, which knows the versioning scheme, supplies the direction and the
 // key mappings. A missing pointer entry is a no-op (idempotent on replay).
-func (fs *FilerServer) applyRecomputeLatest(ctx context.Context, m *filer_pb.ObjectMutation) error {
+func (fs *FilerServer) applyRecomputeLatest(ctx context.Context, m *filer_pb.ObjectMutation, fromOtherCluster bool, signatures []int32) error {
 	rc := m.Recompute
 	if rc == nil {
 		return fmt.Errorf("RECOMPUTE_LATEST requires recompute parameters")
@@ -452,6 +544,15 @@ func (fs *FilerServer) applyRecomputeLatest(ctx context.Context, m *filer_pb.Obj
 	if err != nil {
 		return err
 	}
+
+	// Capture the pre-update image so the metadata notification carries a correct
+	// diff; pointer.Extended is mutated in place below.
+	oldPointer := pointer.ShallowClone()
+	oldPointer.Extended = make(map[string][]byte, len(pointer.Extended))
+	for k, v := range pointer.Extended {
+		oldPointer.Extended[k] = v
+	}
+
 	if pointer.Extended == nil {
 		pointer.Extended = make(map[string][]byte)
 	}
@@ -512,9 +613,13 @@ func (fs *FilerServer) applyRecomputeLatest(ctx context.Context, m *filer_pb.Obj
 		}
 	}
 
-	if err := fs.filer.UpdateEntry(ctx, pointer, pointer); err != nil {
+	if err := fs.filer.UpdateEntry(ctx, oldPointer, pointer); err != nil {
 		return err
 	}
+	// Replicate the recomputed pointer to peer filers and subscribers. Without
+	// this the latest-version pointer stays in this filer's store only, so other
+	// filers never learn the current version and ListObjects undercounts.
+	fs.filer.NotifyUpdateEvent(ctx, oldPointer, pointer, false, fromOtherCluster, signatures)
 
 	// Stamp the displaced prior child (e.g. NoncurrentSinceNs for lifecycle).
 	newName := ""
@@ -529,11 +634,20 @@ func (fs *FilerServer) applyRecomputeLatest(ctx context.Context, m *filer_pb.Obj
 		if perr != nil {
 			return perr
 		}
+		oldPrior := priorEntry.ShallowClone()
+		oldPrior.Extended = make(map[string][]byte, len(priorEntry.Extended))
+		for k, v := range priorEntry.Extended {
+			oldPrior.Extended[k] = v
+		}
 		if priorEntry.Extended == nil {
 			priorEntry.Extended = make(map[string][]byte)
 		}
 		priorEntry.Extended[rc.DemoteKey] = rc.DemoteValue
-		return fs.filer.UpdateEntry(ctx, priorEntry, priorEntry)
+		if err := fs.filer.UpdateEntry(ctx, oldPrior, priorEntry); err != nil {
+			return err
+		}
+		fs.filer.NotifyUpdateEvent(ctx, oldPrior, priorEntry, false, fromOtherCluster, signatures)
+		return nil
 	}
 
 	return nil
@@ -547,12 +661,29 @@ func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntr
 	}
 
 	fullpath := util.Join(req.Directory, req.Entry.Name)
-	entry, err := fs.filer.FindEntry(ctx, util.FullPath(fullpath))
+
+	// Serialize concurrent mutations to the same path on this filer so the
+	// read (preconditions, garbage diff) and the write are atomic. Callers
+	// route a key's writes to this owner filer, making this local lock
+	// sufficient.
+	lockPath := util.FullPath(fullpath)
+	pathLock := fs.entryLockTable.AcquireLock("UpdateEntry", lockPath, util.ExclusiveLock)
+	defer fs.entryLockTable.ReleaseLock(lockPath, pathLock)
+
+	// Fence stamped under the lock: the no-change path below returns no event,
+	// but the acknowledged state still reflects everything at or below this.
+	logTsNs := time.Now().UnixNano()
+
+	entry, err := fs.filer.FindEntry(ctx, lockPath)
 	if err != nil {
 		return &filer_pb.UpdateEntryResponse{}, fmt.Errorf("not found %s: %v", fullpath, err)
 	}
 	if err := validateUpdateEntryPreconditions(entry, req.ExpectedExtended); err != nil {
 		return &filer_pb.UpdateEntryResponse{}, err
+	}
+	if conditionIsSet(req.Condition) && !writeConditionSatisfied(req.Condition, entry) {
+		glog.V(3).InfofCtx(ctx, "UpdateEntry %s: precondition failed: %v", fullpath, req.Condition)
+		return &filer_pb.UpdateEntryResponse{}, status.Errorf(codes.FailedPrecondition, "precondition failed: %s", fullpath)
 	}
 
 	chunks, garbage, err2 := fs.cleanupChunks(ctx, fullpath, entry, req.Entry)
@@ -569,11 +700,11 @@ func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntr
 	}
 
 	if filer.EqualEntry(entry, newEntry) {
-		return &filer_pb.UpdateEntryResponse{}, err
+		return &filer_pb.UpdateEntryResponse{LogTsNs: logTsNs, LogSignature: fs.filer.Signature}, err
 	}
 
 	ctx, eventSink := filer.WithMetadataEventSink(ctx)
-	resp := &filer_pb.UpdateEntryResponse{}
+	resp := &filer_pb.UpdateEntryResponse{LogTsNs: logTsNs, LogSignature: fs.filer.Signature}
 	if err = fs.filer.UpdateEntry(ctx, entry, newEntry); err == nil {
 		fs.filer.DeleteChunksNotRecursive(garbage)
 
@@ -616,7 +747,7 @@ func (fs *FilerServer) cleanupChunks(ctx context.Context, fullpath string, exist
 
 	// remove old chunks if not included in the new ones
 	if existingEntry != nil {
-		garbage, err = filer.MinusChunks(ctx, fs.lookupFileId, existingEntry.GetChunks(), newEntry.GetChunks())
+		garbage, err = filer.MinusChunks(ctx, fs.lookupFileId, existingEntry.GetChunks(), newEntry.GetChunks(), fs.filer.MasterClient)
 		if err != nil {
 			return newEntry.GetChunks(), nil, fmt.Errorf("MinusChunks: %w", err)
 		}
@@ -638,11 +769,13 @@ func (fs *FilerServer) cleanupChunks(ctx context.Context, fullpath string, exist
 			"",
 			"",
 		) // ignore readonly error for capacity needed to manifestize
-		chunks, err = filer.MaybeManifestize(fs.saveAsChunk(ctx, so), chunks)
-		if err != nil {
-			// not good, but should be ok
-			glog.V(0).InfofCtx(ctx, "MaybeManifestize: %v", err)
+		// A failed fold leaves a flat list, which is still a correct entry --
+		// and the store rejects it by name if it cannot hold one this size.
+		folded, manifestErr := filer.MaybeManifestize(fs.saveAsChunk(ctx, so), fs.filer.DeleteChunksNotRecursive, chunks)
+		if manifestErr != nil {
+			glog.V(0).InfofCtx(ctx, "MaybeManifestize %s: %v", fullpath, manifestErr)
 		}
+		chunks = folded
 	}
 
 	chunks = append(manifestChunks, chunks...)
@@ -658,6 +791,12 @@ func (fs *FilerServer) AppendToEntry(ctx context.Context, req *filer_pb.AppendTo
 	lockClient := cluster.NewLockClient(fs.grpcDialOption, fs.option.Host)
 	lock := lockClient.NewShortLivedLock(string(fullpath), string(fs.option.Host))
 	defer lock.StopShortLivedLock()
+
+	// The cluster lock serializes appenders across filers; the path lock makes
+	// this read-modify-write atomic against conditional updates and deletes on
+	// the owner filer.
+	pathLock := fs.entryLockTable.AcquireLock("AppendToEntry", fullpath, util.ExclusiveLock)
+	defer fs.entryLockTable.ReleaseLock(fullpath, pathLock)
 
 	var offset int64 = 0
 	entry, err := fs.filer.FindEntry(ctx, fullpath)
@@ -682,15 +821,15 @@ func (fs *FilerServer) AppendToEntry(ctx context.Context, req *filer_pb.AppendTo
 	}
 
 	entry.Chunks = append(entry.GetChunks(), req.Chunks...)
-	so, err := fs.detectStorageOption(ctx, string(fullpath), "", "", entry.TtlSec, "", "", "", "")
+	so, err := fs.applyStorageDefaultsToEntry(ctx, entry)
 	if err != nil {
-		glog.WarningfCtx(ctx, "detectStorageOption: %v", err)
+		glog.WarningfCtx(ctx, "applyStorageDefaultsToEntry: %v", err)
 		return &filer_pb.AppendToEntryResponse{}, err
 	}
-	entry.Chunks, err = filer.MaybeManifestize(fs.saveAsChunk(ctx, so), entry.GetChunks())
+	entry.Chunks, err = filer.MaybeManifestize(fs.saveAsChunk(ctx, so), fs.filer.DeleteChunksNotRecursive, entry.GetChunks())
 	if err != nil {
-		// not good, but should be ok
-		glog.V(0).InfofCtx(ctx, "MaybeManifestize: %v", err)
+		// the append is still correct with the flat list
+		glog.V(0).InfofCtx(ctx, "MaybeManifestize %s: %v", fullpath, err)
 	}
 
 	err = fs.filer.CreateEntry(context.Background(), entry, nil, false, false, nil, false, fs.filer.MaxFilenameLength)
@@ -702,8 +841,16 @@ func (fs *FilerServer) DeleteEntry(ctx context.Context, req *filer_pb.DeleteEntr
 
 	glog.V(4).InfofCtx(ctx, "DeleteEntry %v", req)
 
+	// A delete queues the entry's chunks for deletion, so it must not
+	// interleave with a conditional update's check-then-write on the same
+	// path: the update would pass its precondition and then resurrect fids
+	// that are already on the deletion queue.
+	fullpath := util.JoinPath(req.Directory, req.Name)
+	pathLock := fs.entryLockTable.AcquireLock("DeleteEntry", fullpath, util.ExclusiveLock)
+	defer fs.entryLockTable.ReleaseLock(fullpath, pathLock)
+
 	ctx, eventSink := filer.WithMetadataEventSink(ctx)
-	err = fs.filer.DeleteEntryMetaAndData(ctx, util.JoinPath(req.Directory, req.Name), req.IsRecursive, req.IgnoreRecursiveError, req.IsDeleteData, req.IsFromOtherCluster, req.Signatures, req.IfNotModifiedAfter)
+	err = fs.filer.DeleteEntryMetaAndData(ctx, fullpath, req.IsRecursive, req.IgnoreRecursiveError, req.IsDeleteData, req.IsFromOtherCluster, req.Signatures, req.IfNotModifiedAfter)
 	resp = &filer_pb.DeleteEntryResponse{}
 	if err != nil && err != filer_pb.ErrNotFound {
 		resp.Error = err.Error()
@@ -737,7 +884,7 @@ func (fs *FilerServer) AssignVolume(ctx context.Context, req *filer_pb.AssignVol
 		return &filer_pb.AssignVolumeResponse{Error: fmt.Sprintf("assign volume result: %v", assignResult.Error)}, nil
 	}
 
-	return &filer_pb.AssignVolumeResponse{
+	resp = &filer_pb.AssignVolumeResponse{
 		FileId: assignResult.Fid,
 		Count:  int32(assignResult.Count),
 		Location: &filer_pb.Location{
@@ -748,7 +895,17 @@ func (fs *FilerServer) AssignVolume(ctx context.Context, req *filer_pb.AssignVol
 		Auth:        string(assignResult.Auth),
 		Collection:  so.Collection,
 		Replication: so.Replication,
-	}, nil
+		Fsync:       so.Fsync,
+	}
+	// Forward the replica holders so a client can write all copies directly.
+	for _, replica := range assignResult.Replicas {
+		resp.Replicas = append(resp.Replicas, &filer_pb.Location{
+			Url:        replica.Url,
+			PublicUrl:  replica.PublicUrl,
+			DataCenter: replica.DataCenter,
+		})
+	}
+	return resp, nil
 }
 
 func (fs *FilerServer) resolveAssignStorageOption(ctx context.Context, req *filer_pb.AssignVolumeRequest) (*operation.StorageOption, error) {
@@ -771,8 +928,8 @@ func (fs *FilerServer) CollectionList(ctx context.Context, req *filer_pb.Collect
 	glog.V(4).InfofCtx(ctx, "CollectionList %v", req)
 	resp = &filer_pb.CollectionListResponse{}
 
-	err = fs.filer.MasterClient.WithClient(false, func(client master_pb.SeaweedClient) error {
-		masterResp, err := client.CollectionList(context.Background(), &master_pb.CollectionListRequest{
+	err = fs.filer.MasterClient.WithClient(ctx, false, func(client master_pb.SeaweedClient) error {
+		masterResp, err := client.CollectionList(ctx, &master_pb.CollectionListRequest{
 			IncludeNormalVolumes: req.IncludeNormalVolumes,
 			IncludeEcVolumes:     req.IncludeEcVolumes,
 		})
@@ -792,7 +949,7 @@ func (fs *FilerServer) DeleteCollection(ctx context.Context, req *filer_pb.Delet
 
 	glog.V(4).InfofCtx(ctx, "DeleteCollection %v", req)
 
-	err = fs.filer.DoDeleteCollection(req.GetCollection())
+	err = fs.filer.DoDeleteCollection(ctx, req.GetCollection())
 
 	return &filer_pb.DeleteCollectionResponse{}, err
 }

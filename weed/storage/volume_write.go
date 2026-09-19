@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"syscall"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
@@ -16,27 +15,6 @@ import (
 var ErrorNotFound = errors.New("not found")
 var ErrorDeleted = errors.New("already deleted")
 var ErrorSizeMismatch = errors.New("size mismatch")
-
-// IoErrorTolerance is the number of consecutive EIOs a volume must
-// see before CollectHeartbeat treats the replica as broken. A single
-// transient error is forgiven so a brief NFS / fabric / power blip
-// affecting several replicas at once does not cascade into removal of
-// the last healthy copy.
-const IoErrorTolerance = 3
-
-func (v *Volume) checkReadWriteError(err error) {
-	if err == nil {
-		v.clearIoError()
-		return
-	}
-	if errors.Is(err, syscall.EIO) {
-		v.noteIoError(err)
-		return
-	}
-	// non-EIO error breaks the EIO streak — only sustained EIOs should
-	// be treated as a failing volume.
-	v.clearIoError()
-}
 
 // isFileUnchanged checks whether this needle to write is same as last one.
 // It requires serialized access in the same volume.
@@ -85,7 +63,7 @@ func (v *Volume) Destroy(onlyEmpty bool, keepRemoteData bool) (err error) {
 		err = fmt.Errorf("volume %d is compacting", v.Id)
 		return
 	}
-	close(v.asyncRequestsChan)
+	v.stopWorker()
 	if !keepRemoteData {
 		storageName, storageKey := v.RemoteStorageNameKey()
 		if v.HasRemoteFile() && storageName != "" && storageKey != "" {
@@ -94,13 +72,31 @@ func (v *Volume) Destroy(onlyEmpty bool, keepRemoteData bool) (err error) {
 			}
 		}
 	}
+	// A regular volume and an EC volume for the same id share <base>.vif. When
+	// EC artefacts coexist on this disk (e.g. shards distributed onto a source
+	// replica before it is deleted), keep the .vif so removing the regular
+	// volume does not strip the EC volume's info file.
+	keepVif := v.sharesVifWithEcVolume()
 	v.doClose()
-	removeVolumeFiles(v.DataFileName())
-	removeVolumeFiles(v.IndexFileName())
+	removeVolumeFiles(v.DataFileName(), keepVif)
+	removeVolumeFiles(v.IndexFileName(), keepVif)
 	return
 }
 
-func removeVolumeFiles(filename string) {
+// sharesVifWithEcVolume reports whether an EC volume for this volume id lives
+// on the same disk, in which case its .vif is the same file as the regular
+// volume's and must outlive the regular volume's deletion.
+func (v *Volume) sharesVifWithEcVolume() bool {
+	if v.location == nil {
+		return false
+	}
+	if _, found := v.location.FindEcVolume(v.Id); found {
+		return true
+	}
+	return v.location.HasEcxFileOnDisk(v.Collection, v.Id)
+}
+
+func removeVolumeFiles(filename string, keepVif bool) {
 	// .dat/.idx removals log at V(0) so destructive calls are traceable.
 	deleteAndLog := func(ext string) {
 		fullFilename := filename + "." + ext
@@ -116,12 +112,16 @@ func removeVolumeFiles(filename string) {
 	}
 	deleteAndLog("dat")
 	deleteAndLog("idx")
-	deleteAndLog("vif")
+	if !keepVif {
+		deleteAndLog("vif")
+	}
 	// sorted index file
 	deleteAndLog("sdx")
 	// compaction
 	deleteAndLog("cpd")
 	deleteAndLog("cpx")
+	// compaction commit marker
+	deleteAndLog("cpc")
 	// level db index file
 	deleteAndLog("ldb")
 	// redb index file (Rust volume server)
@@ -130,33 +130,100 @@ func removeVolumeFiles(filename string) {
 	deleteAndLog("note")
 }
 
-func (v *Volume) asyncRequestAppend(request *needle.AsyncRequest) {
-	v.asyncRequestsChan <- request
+// asyncRequestAppend queues a request for the batch worker, starting it on the
+// first one. It reports false for a destroyed volume, so the caller writes
+// inline rather than wait on a worker that will never answer.
+func (v *Volume) asyncRequestAppend(request *needle.AsyncRequest) bool {
+	requests := v.startWorker()
+	if requests == nil {
+		return false
+	}
+	requests <- request
+	return true
 }
 
-func (v *Volume) syncWrite(n *needle.Needle, checkCookie bool) (offset uint64, size Size, isUnchanged bool, err error) {
+func (v *Volume) syncWrite(n *needle.Needle, checkCookie bool, fsync bool) (offset uint64, size Size, isUnchanged bool, err error) {
 	// glog.V(4).Infof("writing needle %s", needle.NewFileIdFromNeedle(v.Id, n).String())
 	v.dataFileAccessLock.Lock()
 	defer v.dataFileAccessLock.Unlock()
 
-	return v.doWriteRequest(n, checkCookie)
+	// A caller can still hold the volume after it was closed or destroyed, which
+	// leaves both of these nil. Refuse the write rather than dereference them.
+	if v.nm == nil || v.DataBackend == nil {
+		return 0, 0, false, fmt.Errorf("volume %d is closed", v.Id)
+	}
+
+	if !fsync {
+		return v.doWriteRequest(n, checkCookie)
+	}
+
+	end, _, statErr := v.DataBackend.GetStat()
+	if statErr != nil {
+		return 0, 0, false, fmt.Errorf("cannot read current volume position: %v", statErr)
+	}
+	priorOffset, priorSize, hasPrior := Offset{}, Size(0), false
+	if nv, found := v.nm.Get(n.Id); found {
+		priorOffset, priorSize, hasPrior = nv.Offset, nv.Size, true
+	}
+
+	offset, size, isUnchanged, err = v.doWriteRequest(n, checkCookie)
+	if err != nil {
+		return
+	}
+	if syncErr := v.DataBackend.Sync(); syncErr != nil {
+		v.checkReadWriteError(syncErr)
+		if !isUnchanged {
+			v.rollbackUnflushedWrite(n, offset, end, priorOffset, priorSize, hasPrior)
+		}
+		return 0, 0, false, syncErr
+	}
+	return
 }
 
-func (v *Volume) writeNeedle2(n *needle.Needle, checkCookie bool, fsync bool) (offset uint64, size Size, isUnchanged bool, err error) {
+// rollbackUnflushedWrite undoes an append whose fsync failed: the bytes are not
+// data we can vouch for, so they come back off the .dat and the needle map goes
+// back to what it pointed at before, rather than at an offset past the new end.
+func (v *Volume) rollbackUnflushedWrite(n *needle.Needle, offset uint64, end int64, priorOffset Offset, priorSize Size, hasPrior bool) {
+	if te := v.DataBackend.Truncate(end); te != nil {
+		glog.V(0).Infof("Failed to truncate %s back to %d with error: %v", v.DataBackend.Name(), end, te)
+	}
+	current, found := v.nm.Get(n.Id)
+	if !found || current.Offset.ToActualOffset() != int64(offset) {
+		// doWriteRequest kept an existing mapping at a higher offset
+		return
+	}
+	var err error
+	if hasPrior {
+		err = v.nm.Put(n.Id, priorOffset, priorSize)
+	} else {
+		err = v.nm.Delete(n.Id, ToOffset(int64(offset)))
+	}
+	if err != nil {
+		glog.V(0).Infof("Failed to roll back the index of needle %d in volume %d: %v", n.Id, v.Id, err)
+	}
+}
+
+// writeNeedle2 appends a needle. A durable write normally goes through the
+// async batch worker, which fsyncs once for the whole batch; while the server
+// is stopping the worker is winding down, so it is flushed inline instead. Both
+// paths only return once the .dat is on disk.
+func (v *Volume) writeNeedle2(n *needle.Needle, checkCookie bool, fsync bool, isStopping bool) (offset uint64, size Size, isUnchanged bool, err error) {
 	// glog.V(4).Infof("writing needle %s", needle.NewFileIdFromNeedle(v.Id, n).String())
 	if n.Ttl == needle.EMPTY_TTL && v.Ttl != needle.EMPTY_TTL {
 		n.SetHasTtl()
 		n.Ttl = v.Ttl
 	}
 
-	if !fsync {
-		return v.syncWrite(n, checkCookie)
+	if !fsync || isStopping {
+		return v.syncWrite(n, checkCookie, fsync)
 	} else {
 		asyncRequest := needle.NewAsyncRequest(n, true)
 		// using len(n.Data) here instead of n.Size before n.Size is populated in n.Append()
 		asyncRequest.ActualSize = needle.GetActualSize(Size(len(n.Data)), v.Version())
 
-		v.asyncRequestAppend(asyncRequest)
+		if !v.asyncRequestAppend(asyncRequest) {
+			return v.syncWrite(n, checkCookie, fsync)
+		}
 		offset, _, isUnchanged, err = asyncRequest.WaitComplete()
 
 		return
@@ -206,7 +273,8 @@ func (v *Volume) doWriteRequest(n *needle.Needle, checkCookie bool) (offset uint
 	// add to needle map
 	if !ok || uint64(nv.Offset.ToActualOffset()) < offset {
 		if err = v.nm.Put(n.Id, ToOffset(int64(offset)), n.Size); err != nil {
-			glog.V(4).Infof("failed to save in needle map %d: %v", n.Id, err)
+			err = fmt.Errorf("index needle %d of volume %d at offset %d: %w", n.Id, v.Id, offset, err)
+			glog.V(0).Info(err)
 		}
 	}
 	if v.lastModifiedTsSeconds < n.LastModified {
@@ -237,7 +305,9 @@ func (v *Volume) deleteNeedle2(n *needle.Needle) (Size, error) {
 		asyncRequest := needle.NewAsyncRequest(n, false)
 		asyncRequest.ActualSize = needle.GetActualSize(0, v.Version())
 
-		v.asyncRequestAppend(asyncRequest)
+		if !v.asyncRequestAppend(asyncRequest) {
+			return v.syncDelete(n)
+		}
 		_, size, _, err := asyncRequest.WaitComplete()
 
 		return Size(size), err
@@ -252,7 +322,7 @@ func (v *Volume) doDeleteRequest(n *needle.Needle) (Size, error) {
 		var offset uint64
 		var err error
 		size := nv.Size
-		if !v.hasRemoteFile {
+		if !v.HasRemoteFile() {
 			n.Data = nil
 			n.UpdateAppendAtNs(v.lastAppendAtNs)
 			offset, _, _, err = n.Append(v.DataBackend, v.Version())
@@ -270,7 +340,19 @@ func (v *Volume) doDeleteRequest(n *needle.Needle) (Size, error) {
 	return 0, nil
 }
 
-func (v *Volume) startWorker() {
+// startWorker returns the volume's batch-write channel, creating it and its
+// goroutine on first use, and nil once stopWorker has run.
+func (v *Volume) startWorker() chan *needle.AsyncRequest {
+	v.asyncWorkerLock.Lock()
+	defer v.asyncWorkerLock.Unlock()
+	if v.asyncWorkerClosed {
+		return nil
+	}
+	if v.asyncRequestsChan != nil {
+		return v.asyncRequestsChan
+	}
+	requests := make(chan *needle.AsyncRequest, 128)
+	v.asyncRequestsChan = requests
 	go func() {
 		chanClosed := false
 		for {
@@ -281,7 +363,7 @@ func (v *Volume) startWorker() {
 			currentRequests := make([]*needle.AsyncRequest, 0, 128)
 			currentBytesToWrite := int64(0)
 			for {
-				request, ok := <-v.asyncRequestsChan
+				request, ok := <-requests
 				// volume may be closed
 				if !ok {
 					chanClosed = true
@@ -296,7 +378,7 @@ func (v *Volume) startWorker() {
 				currentBytesToWrite += request.ActualSize
 				// submit at most 4M bytes or 128 requests at one time to decrease request delay.
 				// it also need to break if there is no data in channel to avoid io hang.
-				if currentBytesToWrite >= 4*1024*1024 || len(currentRequests) >= 128 || len(v.asyncRequestsChan) == 0 {
+				if currentBytesToWrite >= 4*1024*1024 || len(currentRequests) >= 128 || len(requests) == 0 {
 					break
 				}
 			}
@@ -304,7 +386,12 @@ func (v *Volume) startWorker() {
 				continue
 			}
 			v.dataFileAccessLock.Lock()
-			end, _, e := v.DataBackend.GetStat()
+			end, e := int64(0), error(nil)
+			if v.nm == nil || v.DataBackend == nil {
+				e = fmt.Errorf("volume %d is closed", v.Id)
+			} else {
+				end, _, e = v.DataBackend.GetStat()
+			}
 			if e != nil {
 				for i := 0; i < len(currentRequests); i++ {
 					currentRequests[i].Complete(0, 0, false,
@@ -343,12 +430,44 @@ func (v *Volume) startWorker() {
 			v.dataFileAccessLock.Unlock()
 		}
 	}()
+	return requests
+}
+
+// stopWorker closes the batch-write channel so the worker drains what is queued
+// and exits. It stays closed: a destroyed volume takes no more writes.
+func (v *Volume) stopWorker() {
+	v.asyncWorkerLock.Lock()
+	defer v.asyncWorkerLock.Unlock()
+	if v.asyncWorkerClosed {
+		return
+	}
+	v.asyncWorkerClosed = true
+	if v.asyncRequestsChan != nil {
+		close(v.asyncRequestsChan)
+		v.asyncRequestsChan = nil
+	}
 }
 
 func (v *Volume) WriteNeedleBlob(needleId NeedleId, needleBlob []byte, size Size) error {
 
 	v.dataFileAccessLock.Lock()
 	defer v.dataFileAccessLock.Unlock()
+
+	// nm.Put on a read-only volume fails only after the blob is appended to .dat.
+	if v.IsReadOnly() {
+		return fmt.Errorf("volume %d is read only", v.Id)
+	}
+
+	// size indexes the needle and places the v3 append timestamp, so a caller using
+	// the payload-only DataSize corrupts both, silently until the needle is read back.
+	if len(needleBlob) < NeedleHeaderSize {
+		return fmt.Errorf("needle %d blob of %d bytes is shorter than a needle header", needleId, len(needleBlob))
+	}
+	var blobHeader needle.Needle
+	blobHeader.ParseNeedleHeader(needleBlob)
+	if blobHeader.Size != size {
+		return fmt.Errorf("needle %d size %d does not match its blob header size %d", needleId, size, blobHeader.Size)
+	}
 
 	if MaxPossibleVolumeSize < v.nm.ContentSize()+uint64(len(needleBlob)) {
 		return fmt.Errorf("volume size limit %d exceeded! current size is %d", MaxPossibleVolumeSize, v.nm.ContentSize())
@@ -378,7 +497,8 @@ func (v *Volume) WriteNeedleBlob(needleId NeedleId, needleBlob []byte, size Size
 
 	// add to needle map
 	if err = v.nm.Put(needleId, ToOffset(int64(offset)), size); err != nil {
-		glog.V(4).Infof("failed to put in needle map %d: %v", needleId, err)
+		err = fmt.Errorf("index needle %d of volume %d at offset %d: %w", needleId, v.Id, offset, err)
+		glog.V(0).Info(err)
 	}
 
 	return err

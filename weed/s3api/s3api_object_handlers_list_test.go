@@ -44,8 +44,7 @@ type testFilerClient struct {
 
 func (c *testFilerClient) ListEntries(ctx context.Context, in *filer_pb.ListEntriesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[filer_pb.ListEntriesResponse], error) {
 	entries := c.entriesByDir[in.Directory]
-	// Simplified mock: implements basic prefix filtering but ignores Limit, StartFromFileName, and InclusiveStartFrom
-	// to keep test logic focused. Prefix "/" is treated as no filter for bucket root compatibility.
+	// Simplified mock: prefix "/" is treated as no filter for bucket root compatibility.
 	if in.Prefix != "" && in.Prefix != "/" {
 		filtered := make([]*filer_pb.Entry, 0)
 		for _, e := range entries {
@@ -56,7 +55,16 @@ func (c *testFilerClient) ListEntries(ctx context.Context, in *filer_pb.ListEntr
 		entries = filtered
 	}
 
-	// Respect Limit
+	if in.StartFromFileName != "" {
+		filtered := make([]*filer_pb.Entry, 0)
+		for _, e := range entries {
+			if e.Name > in.StartFromFileName || (in.InclusiveStartFrom && e.Name == in.StartFromFileName) {
+				filtered = append(filtered, e)
+			}
+		}
+		entries = filtered
+	}
+
 	if in.Limit > 0 && int(in.Limit) < len(entries) {
 		entries = entries[:in.Limit]
 	}
@@ -158,11 +166,12 @@ func Test_normalizePrefixMarker(t *testing.T) {
 		marker string
 	}
 	tests := []struct {
-		name              string
-		args              args
-		wantAlignedDir    string
-		wantAlignedPrefix string
-		wantAlignedMarker string
+		name                      string
+		args                      args
+		wantAlignedDir            string
+		wantAlignedPrefix         string
+		wantAlignedMarker         string
+		wantPrefixEndsOnDelimiter bool
 	}{
 		{"bucket root listing with delimiter",
 			args{"/",
@@ -170,6 +179,7 @@ func Test_normalizePrefixMarker(t *testing.T) {
 			"",
 			"",
 			"",
+			true,
 		},
 		{"prefix is a directory",
 			args{"/parentDir/data/",
@@ -177,6 +187,7 @@ func Test_normalizePrefixMarker(t *testing.T) {
 			"parentDir",
 			"data",
 			"",
+			true,
 		},
 		{"normal case",
 			args{"/parentDir/data/0",
@@ -184,6 +195,7 @@ func Test_normalizePrefixMarker(t *testing.T) {
 			"parentDir/data",
 			"0",
 			"0e/0e149049a2137b0cc12e",
+			false,
 		},
 		{"empty prefix",
 			args{"",
@@ -191,6 +203,7 @@ func Test_normalizePrefixMarker(t *testing.T) {
 			"",
 			"",
 			"parentDir/data/0e/0e149049a2137b0cc12e",
+			false,
 		},
 		{"empty directory",
 			args{"parent",
@@ -198,35 +211,81 @@ func Test_normalizePrefixMarker(t *testing.T) {
 			"",
 			"parent",
 			"parentDir/data/0e/0e149049a2137b0cc12e",
+			false,
+		},
+		{"partial name prefix, marker resumes inside a matching subdirectory",
+			args{"data/a",
+				"data/a/1"},
+			"data",
+			"a",
+			"a/1",
+			false,
+		},
+		{"partial name prefix, marker resumes inside a matching sibling directory",
+			args{"data/a",
+				"data/ab/1"},
+			"data",
+			"a",
+			"ab/1",
+			false,
+		},
+		{"top-level partial name prefix, marker resumes inside a matching subdirectory",
+			args{"a",
+				"a/1"},
+			"",
+			"a",
+			"a/1",
+			false,
+		},
+		{"marker sorts before the prefix, so it excludes nothing under it",
+			args{"parentDir/data/",
+				"parentDir"},
+			"parentDir",
+			"data",
+			"",
+			true,
+		},
+		{"marker is the prefix directory, whose own key it excludes",
+			args{"parentDir/data/",
+				"parentDir/data/"},
+			"parentDir/data",
+			"",
+			"",
+			false,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotAlignedDir, gotAlignedPrefix, gotAlignedMarker := normalizePrefixMarker(tt.args.prefix, tt.args.marker)
+			gotAlignedDir, gotAlignedPrefix, gotAlignedMarker, gotPrefixEndsOnDelimiter := normalizePrefixMarker(tt.args.prefix, tt.args.marker)
 			assert.Equalf(t, tt.wantAlignedDir, gotAlignedDir, "normalizePrefixMarker(%v, %v)", tt.args.prefix, tt.args.marker)
 			assert.Equalf(t, tt.wantAlignedPrefix, gotAlignedPrefix, "normalizePrefixMarker(%v, %v)", tt.args.prefix, tt.args.marker)
 			assert.Equalf(t, tt.wantAlignedMarker, gotAlignedMarker, "normalizePrefixMarker(%v, %v)", tt.args.prefix, tt.args.marker)
+			assert.Equalf(t, tt.wantPrefixEndsOnDelimiter, gotPrefixEndsOnDelimiter, "normalizePrefixMarker(%v, %v)", tt.args.prefix, tt.args.marker)
 		})
 	}
 }
 
 func TestBuildTruncatedNextMarker(t *testing.T) {
 	t.Run("does not duplicate prefix segment in next continuation token", func(t *testing.T) {
-		prefix := "export_2026-02-10_17-00-23"
 		nextMarker := "export_2026-02-10_17-00-23/4156000e.jpg"
 
-		actual := buildTruncatedNextMarker("xemu", prefix, nextMarker, false, "")
+		actual := buildTruncatedNextMarker("xemu", nextMarker, false, "")
 		assert.Equal(t, "xemu/export_2026-02-10_17-00-23/4156000e.jpg", actual)
 	})
 
 	t.Run("keeps common prefix marker trailing slash", func(t *testing.T) {
-		actual := buildTruncatedNextMarker("xemu", "export_2026-02-10_17-00-23", "", true, "nested")
+		actual := buildTruncatedNextMarker("xemu", "", true, "xemu/export_2026-02-10_17-00-23/nested/")
 		assert.Equal(t, "xemu/export_2026-02-10_17-00-23/nested/", actual)
 	})
 
-	t.Run("includes prefix for common prefix marker when request dir is empty", func(t *testing.T) {
-		actual := buildTruncatedNextMarker("", "foo", "", true, "bar")
+	t.Run("keeps common prefix marker when request dir is empty", func(t *testing.T) {
+		actual := buildTruncatedNextMarker("", "", true, "foo/bar/")
 		assert.Equal(t, "foo/bar/", actual)
+	})
+
+	t.Run("does not fold a partial name prefix into the common prefix marker", func(t *testing.T) {
+		actual := buildTruncatedNextMarker("data", "", true, "data/ab/")
+		assert.Equal(t, "data/ab/", actual)
 	})
 }
 
@@ -300,7 +359,7 @@ func TestDoListFilerEntries_BucketRootPrefixSlashDelimiterSlash_ListsDirectories
 
 	cursor := &ListingCursor{maxKeys: 1000}
 	seen := make([]string, 0)
-	_, err := s3a.doListFilerEntries(client, "/buckets/test-bucket", "/", cursor, "", "/", false, "test-bucket", func(dir string, entry *filer_pb.Entry) {
+	_, err := s3a.doListFilerEntries(context.Background(), client, listDirectoryRequest{dir: "/buckets/test-bucket", prefix: "/", delimiter: "/", bucket: "test-bucket"}, cursor, func(dir string, entry *filer_pb.Entry) {
 		if entry.IsDirectory {
 			seen = append(seen, entry.Name)
 		}
@@ -322,7 +381,7 @@ func TestDoListFilerEntries_ExclusiveStartSkipsMarkerEcho(t *testing.T) {
 
 	cursor := &ListingCursor{maxKeys: 1000}
 	var seen []string
-	nextMarker, err := s3a.doListFilerEntries(client, "/buckets/test-bucket", "", cursor, "test.txt", "", false, "test-bucket", func(dir string, entry *filer_pb.Entry) {
+	nextMarker, err := s3a.doListFilerEntries(context.Background(), client, listDirectoryRequest{dir: "/buckets/test-bucket", marker: "test.txt", bucket: "test-bucket"}, cursor, func(dir string, entry *filer_pb.Entry) {
 		seen = append(seen, entry.Name)
 	})
 
@@ -346,13 +405,123 @@ func TestDoListFilerEntries_ExclusiveStartSkipsMarkerEchoWithSubsequentEntries(t
 
 	cursor := &ListingCursor{maxKeys: 1000}
 	var seen []string
-	nextMarker, err := s3a.doListFilerEntries(client, "/buckets/test-bucket", "", cursor, "test.txt", "", false, "test-bucket", func(dir string, entry *filer_pb.Entry) {
+	nextMarker, err := s3a.doListFilerEntries(context.Background(), client, listDirectoryRequest{dir: "/buckets/test-bucket", marker: "test.txt", bucket: "test-bucket"}, cursor, func(dir string, entry *filer_pb.Entry) {
 		seen = append(seen, entry.Name)
 	})
 
 	assert.NoError(t, err)
 	assert.Equal(t, []string{"zebra.txt"}, seen, "marker should be skipped while subsequent entries are returned")
 	assert.Equal(t, "zebra.txt", nextMarker)
+}
+
+func TestDoListFilerEntries_EmptyDirectoriesDoNotHideLaterEntries(t *testing.T) {
+	// With maxKeys=1 the listing window is 3 entries. The first window holds only
+	// empty directories, so the real object further down must still be found.
+	s3a := &S3ApiServer{}
+	client := &testFilerClient{
+		entriesByDir: map[string][]*filer_pb.Entry{
+			"/buckets/test-bucket": {
+				{Name: "00-empty-1", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+				{Name: "00-empty-2", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+				{Name: "00-empty-3", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+				{Name: "00-empty-4", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+				{Name: "00-empty-5", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+				{Name: "zz-real", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+			},
+			"/buckets/test-bucket/zz-real": {
+				{Name: "file.log", Attributes: &filer_pb.FuseAttributes{}},
+			},
+		},
+	}
+
+	cursor := &ListingCursor{maxKeys: 1}
+	var seen []string
+	_, err := s3a.doListFilerEntries(context.Background(), client, listDirectoryRequest{dir: "/buckets/test-bucket", bucket: "test-bucket"}, cursor, func(dir string, entry *filer_pb.Entry) {
+		seen = append(seen, dir+"/"+entry.Name)
+		cursor.maxKeys--
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"/buckets/test-bucket/zz-real/file.log"}, seen)
+	assert.False(t, cursor.isTruncated)
+}
+
+func TestDoListFilerEntries_EmptyDirectoriesInSubdirectoryDoNotHideSiblings(t *testing.T) {
+	// The recursion into "logs" gets its own listing window; empty subdirectories
+	// filling that window must not skip the object behind them.
+	s3a := &S3ApiServer{}
+	client := &testFilerClient{
+		entriesByDir: map[string][]*filer_pb.Entry{
+			"/buckets/test-bucket": {
+				{Name: "logs", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+			},
+			"/buckets/test-bucket/logs": {
+				{Name: "00-empty-1", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+				{Name: "00-empty-2", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+				{Name: "00-empty-3", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+				{Name: "00-empty-4", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+				{Name: "00-empty-5", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+				{Name: "zz.log", Attributes: &filer_pb.FuseAttributes{}},
+			},
+		},
+	}
+
+	cursor := &ListingCursor{maxKeys: 1}
+	var seen []string
+	_, err := s3a.doListFilerEntries(context.Background(), client, listDirectoryRequest{dir: "/buckets/test-bucket", bucket: "test-bucket"}, cursor, func(dir string, entry *filer_pb.Entry) {
+		seen = append(seen, dir+"/"+entry.Name)
+		cursor.maxKeys--
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"/buckets/test-bucket/logs/zz.log"}, seen)
+	assert.False(t, cursor.isTruncated)
+}
+
+func TestDoListFilerEntries_TruncationAcrossEmptyDirectories(t *testing.T) {
+	// Two real objects separated by empty directories: the first fills the quota
+	// and the listing must report truncation with a resumable marker.
+	s3a := &S3ApiServer{}
+	client := &testFilerClient{
+		entriesByDir: map[string][]*filer_pb.Entry{
+			"/buckets/test-bucket": {
+				{Name: "00-empty-1", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+				{Name: "00-empty-2", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+				{Name: "00-empty-3", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+				{Name: "mm-real", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+				{Name: "pp-empty", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+				{Name: "zz-real", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{}},
+			},
+			"/buckets/test-bucket/mm-real": {
+				{Name: "file.log", Attributes: &filer_pb.FuseAttributes{}},
+			},
+			"/buckets/test-bucket/zz-real": {
+				{Name: "file.log", Attributes: &filer_pb.FuseAttributes{}},
+			},
+		},
+	}
+
+	cursor := &ListingCursor{maxKeys: 1}
+	var seen []string
+	nextMarker, err := s3a.doListFilerEntries(context.Background(), client, listDirectoryRequest{dir: "/buckets/test-bucket", bucket: "test-bucket"}, cursor, func(dir string, entry *filer_pb.Entry) {
+		seen = append(seen, dir+"/"+entry.Name)
+		cursor.maxKeys--
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"/buckets/test-bucket/mm-real/file.log"}, seen)
+	assert.True(t, cursor.isTruncated)
+
+	cursor = &ListingCursor{maxKeys: 1}
+	seen = nil
+	_, err = s3a.doListFilerEntries(context.Background(), client, listDirectoryRequest{dir: "/buckets/test-bucket", marker: nextMarker, bucket: "test-bucket"}, cursor, func(dir string, entry *filer_pb.Entry) {
+		seen = append(seen, dir+"/"+entry.Name)
+		cursor.maxKeys--
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"/buckets/test-bucket/zz-real/file.log"}, seen)
+	assert.False(t, cursor.isTruncated)
 }
 
 func TestAllowUnorderedWithDelimiterValidation(t *testing.T) {
@@ -765,7 +934,7 @@ func TestListObjectsV2_Regression(t *testing.T) {
 	// Call doListFilerEntries directly to unit test listing logic in isolation,
 	// simulating parameters passed from listFilerEntries for prefix "reports/".
 
-	_, err := s3a.doListFilerEntries(client, "/buckets/reports", "reports", cursor, "", "", false, "reports", func(dir string, entry *filer_pb.Entry) {
+	_, err := s3a.doListFilerEntries(context.Background(), client, listDirectoryRequest{dir: "/buckets/reports", prefix: "reports", bucket: "reports"}, cursor, func(dir string, entry *filer_pb.Entry) {
 		if !entry.IsDirectory {
 			results = append(results, entry.Name)
 		}
@@ -803,7 +972,7 @@ func TestListObjectsV2_Regression_Sorting(t *testing.T) {
 	// Without the fix, Limit=1 would cause the lister to stop after "reports-archive",
 	// missing the intended "reports" directory.
 
-	_, err := s3a.doListFilerEntries(client, "/buckets/reports", "reports", cursor, "", "", false, "reports", func(dir string, entry *filer_pb.Entry) {
+	_, err := s3a.doListFilerEntries(context.Background(), client, listDirectoryRequest{dir: "/buckets/reports", prefix: "reports", bucket: "reports"}, cursor, func(dir string, entry *filer_pb.Entry) {
 		if !entry.IsDirectory {
 			results = append(results, entry.Name)
 		}
@@ -846,7 +1015,7 @@ func TestListObjectsV2_PrefixEndingWithSlash_DoesNotMatchSiblings(t *testing.T) 
 	cursor := &ListingCursor{maxKeys: 1000, prefixEndsOnDelimiter: true}
 	var results []string
 
-	_, err := s3a.doListFilerEntries(client, "/buckets/bucket/path/to/list", "1", cursor, "", "", false, "bucket", func(dir string, entry *filer_pb.Entry) {
+	_, err := s3a.doListFilerEntries(context.Background(), client, listDirectoryRequest{dir: "/buckets/bucket/path/to/list", prefix: "1", bucket: "bucket"}, cursor, func(dir string, entry *filer_pb.Entry) {
 		if !entry.IsDirectory {
 			results = append(results, entry.Name)
 		}
@@ -878,7 +1047,7 @@ func TestListObjectsV2_PrefixEndingWithSlash_WithDelimiter(t *testing.T) {
 	cursor := &ListingCursor{maxKeys: 1000, prefixEndsOnDelimiter: true}
 	var results []string
 
-	_, err := s3a.doListFilerEntries(client, "/buckets/bucket/path/to/list", "1", cursor, "", "/", false, "bucket", func(dir string, entry *filer_pb.Entry) {
+	_, err := s3a.doListFilerEntries(context.Background(), client, listDirectoryRequest{dir: "/buckets/bucket/path/to/list", prefix: "1", delimiter: "/", bucket: "bucket"}, cursor, func(dir string, entry *filer_pb.Entry) {
 		results = append(results, entry.Name)
 	})
 

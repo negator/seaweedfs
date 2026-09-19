@@ -131,9 +131,16 @@ func parseDurationSecondsWithBounds(r *http.Request, minSec, maxSec int64) (*int
 	return &ds, "", nil
 }
 
-// parseDurationSeconds parses DurationSeconds for AssumeRole (15 min to 12 hours)
-func parseDurationSeconds(r *http.Request) (*int64, STSErrorCode, error) {
-	return parseDurationSecondsWithBounds(r, minDurationSeconds, maxDurationSeconds)
+// parseDurationSeconds parses DurationSeconds for AssumeRole (15 min to MaxSessionLength)
+func (h *STSHandlers) parseDurationSeconds(r *http.Request) (*int64, STSErrorCode, error) {
+	maxSec := maxDurationSeconds
+	if h.stsService != nil && h.stsService.Config != nil && h.stsService.Config.MaxSessionLength.Duration > 0 {
+		configuredMax := int64(h.stsService.Config.MaxSessionLength.Duration / time.Second)
+		if configuredMax >= minDurationSeconds {
+			maxSec = configuredMax
+		}
+	}
+	return parseDurationSecondsWithBounds(r, minDurationSeconds, maxSec)
 }
 
 // Removed generateSecureCredentials - now using STS service's JWT token generation
@@ -159,6 +166,16 @@ func (h *STSHandlers) getAccountID() string {
 		return h.stsService.Config.AccountId
 	}
 	return defaultAccountID
+}
+
+// callerPrincipalArn resolves the identity's principal ARN, synthesizing the
+// canonical user ARN when one was not set (e.g. legacy static identities) so
+// trust policies that name a concrete principal still match.
+func (h *STSHandlers) callerPrincipalArn(identity *Identity) string {
+	if identity.PrincipalArn != "" {
+		return identity.PrincipalArn
+	}
+	return fmt.Sprintf("arn:aws:iam::%s:user/%s", h.getAccountID(), identity.Name)
 }
 
 // assumeRoleWithWebIdentity dispatches the request through the IAMManager
@@ -243,7 +260,7 @@ func (h *STSHandlers) handleAssumeRoleWithWebIdentity(w http.ResponseWriter, r *
 	}
 
 	// Parse and validate DurationSeconds using helper
-	durationSeconds, errCode, err := parseDurationSeconds(r)
+	durationSeconds, errCode, err := h.parseDurationSeconds(r)
 	if err != nil {
 		h.writeSTSErrorResponse(w, r, errCode, err)
 		return
@@ -340,7 +357,7 @@ func (h *STSHandlers) handleAssumeRole(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Parse and validate DurationSeconds using helper
-	durationSeconds, errCode, err := parseDurationSeconds(r)
+	durationSeconds, errCode, err := h.parseDurationSeconds(r)
 	if err != nil {
 		h.writeSTSErrorResponse(w, r, errCode, err)
 		return
@@ -375,38 +392,46 @@ func (h *STSHandlers) handleAssumeRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Record the caller so the audit entry for the AssumeRole call itself names
+	// who asked for the session, not just the session it minted.
+	r = r.WithContext(recordIdentityInContext(r, identity))
+
 	glog.V(2).Infof("AssumeRole: caller identity=%s, roleArn=%s, sessionName=%s",
 		identity.Name, roleArn, roleSessionName)
 
-	// Check if the caller is authorized to assume the role (sts:AssumeRole permission)
-	// This validates that the caller has a policy allowing sts:AssumeRole on the target role
-	// Check authorizations
+	assumesSelf := roleArn == ""
+
+	// A named role is authorized by its trust policy, which declares which
+	// principals may assume it, so no separate identity-side sts:AssumeRole allow
+	// is required. An explicit identity-side deny still wins (deny-always-wins).
+	// Without a RoleArn the caller assumes a session for itself.
 	if roleArn != "" {
-		// Check if the caller is authorized to assume the role (sts:AssumeRole permission)
-		if authErr := h.iam.VerifyActionPermission(r, identity, Action(sts.ActionAssumeRole), "", roleArn); authErr != s3err.ErrNone {
-			glog.V(2).Infof("AssumeRole: caller %s is not authorized to assume role %s", identity.Name, roleArn)
+		// An ARN that names something other than a role can never resolve to one,
+		// and reporting that as "not authorized" sends the caller looking for a
+		// permission problem they do not have.
+		if utils.ExtractRoleNameFromArn(roleArn) == "" {
+			h.writeSTSErrorResponse(w, r, STSErrInvalidParameterValue,
+				fmt.Errorf("RoleArn %q is not an IAM role ARN, expected arn:aws:iam::<account>:role/<name>", roleArn))
+			return
+		}
+		callerArn := h.callerPrincipalArn(identity)
+		if err := h.iam.ValidateTrustPolicyForPrincipal(r.Context(), roleArn, callerArn); err != nil {
+			glog.V(2).Infof("AssumeRole: %s not authorized to assume %s: %v", identity.Name, roleArn, err)
 			h.writeSTSErrorResponse(w, r, STSErrAccessDenied,
 				fmt.Errorf("user %s is not authorized to assume role %s", identity.Name, roleArn))
 			return
 		}
-
-		// Validate that the target role trusts the caller (Trust Policy)
-		if err := h.iam.ValidateTrustPolicyForPrincipal(r.Context(), roleArn, identity.PrincipalArn); err != nil {
-			glog.V(2).Infof("AssumeRole: trust policy validation failed for %s to assume %s: %v", identity.Name, roleArn, err)
-			h.writeSTSErrorResponse(w, r, STSErrAccessDenied, fmt.Errorf("trust policy denies access"))
+		if h.iam.isActionExplicitlyDeniedByIAM(r, identity, callerArn, sts.ActionAssumeRole, roleArn) {
+			glog.V(2).Infof("AssumeRole: identity policy explicitly denies %s assuming %s", identity.Name, roleArn)
+			h.writeSTSErrorResponse(w, r, STSErrAccessDenied,
+				fmt.Errorf("user %s is not authorized to assume role %s", identity.Name, roleArn))
 			return
 		}
 	} else {
-		// If RoleArn is missing, default to the caller's identity (User Context)
-		// This allows the user to "assume" a session for themselves, inheriting their own permissions.
-		roleArn = identity.PrincipalArn
+		// Synthesize the caller ARN when the identity carries none, else the
+		// session ends up with an empty role name in its assumed-role ARN.
+		roleArn = h.callerPrincipalArn(identity)
 		glog.V(2).Infof("AssumeRole: no RoleArn provided, defaulting to caller identity: %s", roleArn)
-
-		// We still enforce a global "sts:AssumeRole" check, similar to how we'd check if they can assume *any* role.
-		// However, for self-assumption, this might be implicit.
-		// For safety/consistency with previous logic, we keep the check but strictly it might not be required by AWS for GetSessionToken.
-		// But since this IS AssumeRole, let's keep it.
-		// Admin/Global check when no specific role is requested
 		if authErr := h.iam.VerifyActionPermission(r, identity, Action(sts.ActionAssumeRole), "", ""); authErr != s3err.ErrNone {
 			glog.Warningf("AssumeRole: caller %s attempted to assume role without RoleArn and lacks global sts:AssumeRole permission", identity.Name)
 			h.writeSTSErrorResponse(w, r, STSErrAccessDenied, fmt.Errorf("access denied"))
@@ -421,9 +446,12 @@ func (h *STSHandlers) handleAssumeRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Prepare custom claims for the session
+	// is_admin lets the session bypass base policy evaluation, so it may only
+	// travel into a session the caller assumed for itself — a legacy static admin
+	// carries no IAM policies for such a session to inherit. Assuming a named role
+	// scopes the session to that role's policies, admin caller or not.
 	var modifyClaims func(claims *sts.STSSessionClaims)
-	if identity.isAdmin() {
+	if assumesSelf && identity.isAdmin() {
 		modifyClaims = func(claims *sts.STSSessionClaims) {
 			if claims.RequestContext == nil {
 				claims.RequestContext = make(map[string]interface{})
@@ -485,7 +513,7 @@ func (h *STSHandlers) handleAssumeRoleWithLDAPIdentity(w http.ResponseWriter, r 
 	}
 
 	// Parse and validate DurationSeconds using helper
-	durationSeconds, errCode, err := parseDurationSeconds(r)
+	durationSeconds, errCode, err := h.parseDurationSeconds(r)
 	if err != nil {
 		h.writeSTSErrorResponse(w, r, errCode, err)
 		return
@@ -668,6 +696,8 @@ func (h *STSHandlers) handleGetFederationToken(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	r = r.WithContext(recordIdentityInContext(r, identity))
+
 	glog.V(2).Infof("GetFederationToken: caller identity=%s, name=%s", identity.Name, name)
 
 	// Check if the caller is authorized to call GetFederationToken
@@ -772,7 +802,7 @@ func (h *STSHandlers) handleGetFederationToken(w http.ResponseWriter, r *http.Re
 	}
 
 	// Generate temporary credentials
-	stsCredGen := sts.NewCredentialGenerator()
+	stsCredGen := h.stsService.GetCredentialGenerator()
 	stsCredsDet, err := stsCredGen.GenerateTemporaryCredentials(sessionId, expiration)
 	if err != nil {
 		h.writeSTSErrorResponse(w, r, STSErrInternalError,
@@ -891,7 +921,7 @@ func (h *STSHandlers) prepareSTSCredentials(ctx context.Context, roleArn, roleSe
 	}
 
 	// Generate temporary credentials (deterministic based on sessionId)
-	stsCredGen := sts.NewCredentialGenerator()
+	stsCredGen := h.stsService.GetCredentialGenerator()
 	stsCredsDet, err := stsCredGen.GenerateTemporaryCredentials(sessionId, expiration)
 	if err != nil {
 		return STSCredentials{}, nil, fmt.Errorf("failed to generate temporary credentials: %w", err)
@@ -938,13 +968,10 @@ func (h *STSHandlers) handleGetCallerIdentity(w http.ResponseWriter, r *http.Req
 	}
 
 	accountID := h.getAccountID()
-
-	arn := identity.PrincipalArn
-	if arn == "" {
-		arn = fmt.Sprintf("arn:aws:iam::%s:user/%s", accountID, identity.Name)
-	}
-
+	arn := h.callerPrincipalArn(identity)
 	userId := identity.Name
+
+	r = r.WithContext(recordIdentityInContext(r, identity))
 
 	glog.V(2).Infof("GetCallerIdentity: identity=%s, arn=%s, account=%s", identity.Name, arn, accountID)
 

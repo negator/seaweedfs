@@ -3,7 +3,10 @@ package operation
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -28,18 +31,37 @@ import (
 	util_http_client "github.com/seaweedfs/seaweedfs/weed/util/http/client"
 )
 
+// GenUploadUrlProxy returns a function that builds a chunk upload URL via the
+// filer proxy.  Identical to the inline logic used by weed mount -filerProxy
+// and weed filer gateway:
+//
+//   - without filerProxy: "http://{host}/{fileId}"
+//   - with filerProxy:     "http://{filerAddress}/?proxyChunkId={fileId}"
+func GenUploadUrlProxy(filerAddress string) func(host, fileId string) string {
+	return func(host, fileId string) string {
+		if filerAddress == "" {
+			return fmt.Sprintf("http://%s/%s", host, fileId)
+		}
+		return util_http.ProxyChunkUrl(filerAddress, fileId)
+	}
+}
+
 type UploadOption struct {
 	UploadUrl         string
 	Filename          string
 	Cipher            bool
 	IsInputCompressed bool
+	IsReplication     bool // preserve the source needle's compression state
 	MimeType          string
 	PairMap           map[string]string
 	Jwt               security.EncodedJwt
 	RetryForever      bool
 	Md5               string
+	WantMd5           bool // compute Content-MD5 from the data when Md5 is unset and the upload is not ciphered
 	BytesBuffer       *bytes.Buffer
-	SourceUrl         string // optional: for logging when reading from a remote source
+	SourceUrl         string                           // optional: for logging when reading from a remote source
+	MaxAttempts       int                              // <=0 uses the default
+	GenUploadUrl      func(host, fileId string) string // if nil → fallback "http://{host}/{fileId}"
 }
 
 type UploadResult struct {
@@ -97,12 +119,40 @@ var (
 	once        sync.Once
 )
 
-var uploadRetryableAssignErrList = []string{
-	"transport",
-	"is read only",
-	"failed to write to local disk",
-	"Volume Size ",
+// uploadStatusError carries the volume-server HTTP status of a failed upload so
+// the retry gate can decide on the status code instead of the message text.
+// StatusCode 0 means the request never got a response — a transport failure.
+type uploadStatusError struct {
+	StatusCode int
+	err        error
 }
+
+func (e *uploadStatusError) Error() string { return e.err.Error() }
+func (e *uploadStatusError) Unwrap() error { return e.err }
+
+// ShouldReassignUpload reports whether an upload error means the client should
+// ask for a fresh volume assignment and retry on another volume.
+//
+// On the write path a volume server only 5xxs on a ReplicatedWrite failure
+// (local disk, replica peer down, or under-replication) — all of which a
+// different volume dodges — so any 5xx is reassignable. A status of 0 means the
+// assigned target never answered (down/unreachable), also reassignable. A 4xx
+// is a genuine client error and is surfaced. Errors without a status come from
+// the AssignVolume RPC or request setup; retry only transient transport ones.
+func ShouldReassignUpload(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se *uploadStatusError
+	if errors.As(err, &se) {
+		return se.StatusCode == 0 || se.StatusCode >= 500
+	}
+	return strings.Contains(err.Error(), "transport")
+}
+
+// assignVolumeTimeout bounds a single AssignVolume RPC so an overwhelmed filer
+// can't block the caller forever. Overridable in tests.
+var assignVolumeTimeout = 30 * time.Second
 
 // HTTPClient interface for testing
 type HTTPClient interface {
@@ -144,7 +194,7 @@ func NewUploaderWithHttpClient(httpClient HTTPClient) *Uploader {
 	}
 }
 
-func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, host string, auth security.EncodedJwt, err error), uploadOption *UploadOption, genFileUrlFn func(host, fileId string) string, data []byte) (fileId string, uploadResult *UploadResult, err error) {
+func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, host string, auth security.EncodedJwt, err error), uploadOption *UploadOption, data []byte) (fileId string, uploadResult *UploadResult, err error) {
 	doUploadFunc := func() error {
 		var host string
 		var auth security.EncodedJwt
@@ -153,8 +203,18 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, ho
 			return err
 		}
 
-		uploadOption.UploadUrl = genFileUrlFn(host, fileId)
+		genUrl := uploadOption.GenUploadUrl
+		if genUrl == nil {
+			genUrl = func(host, fileId string) string { return fmt.Sprintf("http://%s/%s", host, fileId) }
+		}
+		uploadOption.UploadUrl = genUrl(host, fileId)
 		uploadOption.Jwt = auth
+		if util_http.IsProxyChunkUrl(uploadOption.UploadUrl) {
+			// The request addresses the filer, which authorizes it and mints the
+			// volume credential itself. The AssignVolume token is not a filer
+			// credential and gets the caller nowhere here.
+			uploadOption.Jwt = security.EncodedJwt(util_http.JwtForFilerServer(true))
+		}
 
 		uploadResult, err = uploader.retriedUploadData(context.Background(), data, uploadOption)
 		return err
@@ -166,7 +226,7 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, ho
 			return true
 		})
 	} else {
-		err = util.MultiRetry("uploadWithRetry", uploadRetryableAssignErrList, doUploadFunc)
+		err = util.RetryOnError("uploadWithRetry", ShouldReassignUpload, doUploadFunc)
 	}
 
 	return
@@ -174,7 +234,7 @@ func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, ho
 
 // UploadWithRetry will retry both assigning volume request and uploading content
 // The option parameter does not need to specify UploadUrl and Jwt, which will come from assigning volume.
-func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assignRequest *filer_pb.AssignVolumeRequest, uploadOption *UploadOption, genFileUrlFn func(host, fileId string) string, reader io.Reader) (fileId string, uploadResult *UploadResult, err error, data []byte) {
+func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assignRequest *filer_pb.AssignVolumeRequest, uploadOption *UploadOption, reader io.Reader) (fileId string, uploadResult *UploadResult, err error, data []byte) {
 	bytesReader, ok := reader.(*util.BytesReader)
 	if ok {
 		data = bytesReader.Bytes
@@ -194,10 +254,21 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 		assignRequest.ExpectedDataSize = uint64(len(data))
 	}
 
+	// Hash the buffer we already hold so the server echoes Content-MD5 back as
+	// the chunk ETag (std-base64 of the raw digest, the form ParseUpload
+	// verifies). Under cipher the server never sees the header, but the digest
+	// still becomes the chunk ETag.
+	if uploadOption.WantMd5 && uploadOption.Md5 == "" {
+		digest := md5.Sum(data)
+		uploadOption.Md5 = base64.StdEncoding.EncodeToString(digest[:])
+	}
+
 	fileId, uploadResult, err = uploader.uploadWithRetryData(func() (fileId string, host string, auth security.EncodedJwt, err error) {
 		// grpc assign volume
 		if grpcAssignErr := filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-			resp, assignErr := client.AssignVolume(context.Background(), assignRequest)
+			assignCtx, assignCancel := context.WithTimeout(context.Background(), assignVolumeTimeout)
+			defer assignCancel()
+			resp, assignErr := client.AssignVolume(assignCtx, assignRequest)
 			if assignErr != nil {
 				glog.V(0).Infof("assign volume failure %v: %v", assignRequest, assignErr)
 				return assignErr
@@ -215,7 +286,7 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 			err = fmt.Errorf("filerGrpcAddress assign volume: %w", grpcAssignErr)
 		}
 		return
-	}, uploadOption, genFileUrlFn, data)
+	}, uploadOption, data)
 	return
 }
 
@@ -247,14 +318,25 @@ func (uploader *Uploader) doUpload(ctx context.Context, reader io.Reader, option
 }
 
 func (uploader *Uploader) retriedUploadData(ctx context.Context, data []byte, option *UploadOption) (uploadResult *UploadResult, err error) {
-	for i := 0; i < 3; i++ {
+	maxAttempts := option.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
+	for i := 0; i < maxAttempts; i++ {
 		if i > 0 {
-			time.Sleep(time.Millisecond * time.Duration(237*(i+1)))
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Millisecond * time.Duration(237*(i+1))):
+			}
 		}
 		uploadResult, err = uploader.doUploadData(ctx, data, option)
 		if err == nil {
 			uploadResult.RetryCount = i
 			return
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 		glog.WarningfCtx(ctx, "uploading %d to %s: %v", i, option.UploadUrl, err)
 	}
@@ -264,7 +346,7 @@ func (uploader *Uploader) retriedUploadData(ctx context.Context, data []byte, op
 func (uploader *Uploader) doUploadData(ctx context.Context, data []byte, option *UploadOption) (uploadResult *UploadResult, err error) {
 	contentIsGzipped := option.IsInputCompressed
 	shouldGzipNow := false
-	if !option.IsInputCompressed {
+	if !option.IsInputCompressed && !option.IsReplication {
 		if option.MimeType == "" {
 			option.MimeType = http.DetectContentType(data)
 			// println("detect1 mimetype to", MimeType)
@@ -299,8 +381,8 @@ func (uploader *Uploader) doUploadData(ctx context.Context, data []byte, option 
 				contentIsGzipped = true
 			}
 		}
-	} else if option.IsInputCompressed {
-		// just to get the clear data length
+	} else if option.IsInputCompressed && !option.IsReplication {
+		// decompress only to report the clear data length; replication discards the result, so skip it
 		clearData, err = util.DecompressData(data)
 		if err == nil {
 			clearDataLen = len(clearData)
@@ -337,6 +419,9 @@ func (uploader *Uploader) doUploadData(ctx context.Context, data []byte, option 
 		uploadResult.Name = option.Filename
 		uploadResult.Mime = option.MimeType
 		uploadResult.CipherKey = cipherKey
+		// The volume server only ever hashes the ciphertext it stored, so the
+		// chunk ETag has to come from the caller's plaintext digest.
+		uploadResult.ContentMd5 = option.Md5
 		uploadResult.Size = uint32(clearDataLen)
 		if contentIsGzipped {
 			uploadResult.Gzip = 1
@@ -428,7 +513,7 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 		req.Header.Set(k, v)
 	}
 	if option.Jwt != "" {
-		req.Header.Set("Authorization", "BEARER "+string(option.Jwt))
+		req.Header.Set("Authorization", security.BearerPrefix+string(option.Jwt))
 	}
 
 	request_id.InjectToRequest(ctx, req)
@@ -465,7 +550,7 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 	}
 	if post_err != nil {
 		stats.UploadErrorCounter.WithLabelValues("0").Inc()
-		return nil, fmt.Errorf("upload %s %d bytes to %v: %v", option.Filename, originalDataSize, option.UploadUrl, post_err)
+		return nil, &uploadStatusError{StatusCode: 0, err: fmt.Errorf("upload %s %d bytes to %v: %v", option.Filename, originalDataSize, option.UploadUrl, post_err)}
 	}
 	// print("-")
 
@@ -480,18 +565,18 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 	resp_body, ra_err := io.ReadAll(resp.Body)
 	if ra_err != nil {
 		stats.UploadErrorCounter.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
-		return nil, fmt.Errorf("read response body %v: %w", option.UploadUrl, ra_err)
+		return nil, &uploadStatusError{StatusCode: resp.StatusCode, err: fmt.Errorf("read response body %v: %w", option.UploadUrl, ra_err)}
 	}
 
 	unmarshal_err := json.Unmarshal(resp_body, &ret)
 	if unmarshal_err != nil {
 		stats.UploadErrorCounter.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
 		glog.ErrorfCtx(ctx, "unmarshal %s: %v", option.UploadUrl, string(resp_body))
-		return nil, fmt.Errorf("unmarshal %v: %w", option.UploadUrl, unmarshal_err)
+		return nil, &uploadStatusError{StatusCode: resp.StatusCode, err: fmt.Errorf("unmarshal %v: %w", option.UploadUrl, unmarshal_err)}
 	}
 	if ret.Error != "" {
 		stats.UploadErrorCounter.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
-		return nil, fmt.Errorf("unmarshalled error %v: %v", option.UploadUrl, ret.Error)
+		return nil, &uploadStatusError{StatusCode: resp.StatusCode, err: fmt.Errorf("unmarshalled error %v: %v", option.UploadUrl, ret.Error)}
 	}
 	ret.ETag = etag
 	ret.ContentMd5 = resp.Header.Get("Content-MD5")

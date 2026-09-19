@@ -66,6 +66,15 @@ func FormatLocation(loc *remote_pb.RemoteStorageLocation) string {
 
 type VisitFunc func(dir string, name string, isDirectory bool, remoteEntry *filer_pb.RemoteEntry) error
 
+// EntryContentEncoding returns the Content-Encoding stored in the entry
+// extended attributes, for clients to set on uploaded remote objects.
+func EntryContentEncoding(entry *filer_pb.Entry) string {
+	if entry == nil {
+		return ""
+	}
+	return string(entry.Extended["Content-Encoding"])
+}
+
 type Bucket struct {
 	Name      string
 	CreatedAt time.Time
@@ -93,6 +102,30 @@ type RemoteStorageClient interface {
 // that support configurable download concurrency for multipart downloads.
 type RemoteStorageConcurrentReader interface {
 	ReadFileWithConcurrency(loc *remote_pb.RemoteStorageLocation, offset int64, size int64, concurrency int) (data []byte, err error)
+}
+
+// RemoteStorageStreamReader is an optional interface for remote storage clients
+// that support streaming reads with io.Reader for efficient memory usage.
+type RemoteStorageStreamReader interface {
+	ReadFileAsStream(ctx context.Context, loc *remote_pb.RemoteStorageLocation, offset int64, size int64) (reader io.ReadCloser, err error)
+}
+
+// CacheWaitTimeout is how long a read of an uncached remote-only object waits
+// for the local cache before serving another way: small files wait longer since
+// their cache completes quickly, large files fail fast for better TTFB. A mount
+// carrying cache_wait_ms replaces the size tiers, and 0 means never wait.
+func CacheWaitTimeout(remoteSize int64, mountedLocation *remote_pb.RemoteStorageLocation) time.Duration {
+	if mountedLocation != nil && mountedLocation.CacheWaitMs != nil {
+		return max(0, time.Duration(*mountedLocation.CacheWaitMs)*time.Millisecond)
+	}
+	switch {
+	case remoteSize > 500*1024*1024:
+		return 2 * time.Second
+	case remoteSize > 0 && remoteSize < 50*1024*1024:
+		return 10 * time.Second
+	default:
+		return 5 * time.Second
+	}
 }
 
 type RemoteStorageClientMaker interface {

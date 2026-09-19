@@ -110,7 +110,7 @@ func TestEnsureVisitedReplaysBufferedEventsAfterSnapshot(t *testing.T) {
 		},
 	}
 
-	if err := EnsureVisited(mc, accessor, util.FullPath("/dir")); err != nil {
+	if err := EnsureVisited(mc, accessor, util.FullPath("/dir"), 0); err != nil {
 		t.Fatalf("ensure visited: %v", err)
 	}
 	if applyErr != nil {
@@ -120,7 +120,7 @@ func TestEnsureVisitedReplaysBufferedEventsAfterSnapshot(t *testing.T) {
 		t.Fatal("directory /dir should be cached after build completes")
 	}
 
-	baseEntry, err := mc.FindEntry(context.Background(), util.FullPath("/dir/base.txt"))
+	baseEntry, _, err := mc.FindEntry(context.Background(), util.FullPath("/dir/base.txt"))
 	if err != nil {
 		t.Fatalf("find base entry: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestEnsureVisitedReplaysBufferedEventsAfterSnapshot(t *testing.T) {
 		t.Fatalf("base entry size = %d, want 3", baseEntry.FileSize)
 	}
 
-	afterEntry, err := mc.FindEntry(context.Background(), util.FullPath("/dir/after.txt"))
+	afterEntry, _, err := mc.FindEntry(context.Background(), util.FullPath("/dir/after.txt"))
 	if err != nil {
 		t.Fatalf("find replayed entry: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestDirectoryNotificationsSuppressedDuringBuild(t *testing.T) {
 			Mode:     0100644,
 			FileSize: 100,
 		},
-	}); err != nil {
+	}, 0); err != nil {
 		t.Fatalf("insert entry during build: %v", err)
 	}
 
@@ -199,7 +199,7 @@ func TestDirectoryNotificationsSuppressedDuringBuild(t *testing.T) {
 	}
 
 	// The entry inserted during the build must still be present
-	entry, err := mc.FindEntry(context.Background(), util.FullPath("/dir/existing.txt"))
+	entry, _, err := mc.FindEntry(context.Background(), util.FullPath("/dir/existing.txt"))
 	if err != nil {
 		t.Fatalf("entry wiped during build: %v", err)
 	}
@@ -208,12 +208,12 @@ func TestDirectoryNotificationsSuppressedDuringBuild(t *testing.T) {
 	}
 
 	// Complete the build — buffered events should be replayed
-	if err := mc.CompleteDirectoryBuild(context.Background(), util.FullPath("/dir"), 150); err != nil {
+	if err := mc.CompleteDirectoryBuild(context.Background(), util.FullPath("/dir"), 150, nil); err != nil {
 		t.Fatalf("complete build: %v", err)
 	}
 
 	// After build completes, the entry from the listing should still exist
-	entry, err = mc.FindEntry(context.Background(), util.FullPath("/dir/existing.txt"))
+	entry, _, err = mc.FindEntry(context.Background(), util.FullPath("/dir/existing.txt"))
 	if err != nil {
 		t.Fatalf("entry lost after build completion: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestDirectoryNotificationsSuppressedDuringBuild(t *testing.T) {
 	// Buffered events with TsNs > snapshotTsNs (150) should have been replayed
 	for i := 0; i < 5; i++ {
 		name := fmt.Sprintf("new-%d.txt", i)
-		e, err := mc.FindEntry(context.Background(), util.FullPath("/dir/"+name))
+		e, _, err := mc.FindEntry(context.Background(), util.FullPath("/dir/"+name))
 		if err != nil {
 			t.Fatalf("replayed entry %s not found: %v", name, err)
 		}
@@ -274,14 +274,14 @@ func TestEmptyDirectoryBuildReplaysAllBufferedEvents(t *testing.T) {
 	}
 
 	// Complete with snapshotTsNs=0 — simulates empty directory listing
-	if err := mc.CompleteDirectoryBuild(context.Background(), util.FullPath("/empty"), 0); err != nil {
+	if err := mc.CompleteDirectoryBuild(context.Background(), util.FullPath("/empty"), 0, nil); err != nil {
 		t.Fatalf("complete build: %v", err)
 	}
 
 	// Every buffered event must have been replayed, regardless of TsNs
 	for i := range tsValues {
 		name := fmt.Sprintf("file-%d.txt", i)
-		e, err := mc.FindEntry(context.Background(), util.FullPath("/empty/"+name))
+		e, _, err := mc.FindEntry(context.Background(), util.FullPath("/empty/"+name))
 		if err != nil {
 			t.Fatalf("replayed entry %s not found: %v", name, err)
 		}
@@ -318,7 +318,7 @@ func TestBuildCompletionSurvivesCallerCancellation(t *testing.T) {
 			Mode:     0100644,
 			FileSize: 42,
 		},
-	}); err != nil {
+	}, 0); err != nil {
 		t.Fatalf("insert entry: %v", err)
 	}
 
@@ -350,7 +350,7 @@ func TestBuildCompletionSurvivesCallerCancellation(t *testing.T) {
 	// ctx.Done() first, but the operation itself still completes in the
 	// apply loop. Poll for the observable side effect instead of using
 	// a fixed sleep.
-	_ = mc.CompleteDirectoryBuild(cancelledCtx, util.FullPath("/dir"), 100)
+	_ = mc.CompleteDirectoryBuild(cancelledCtx, util.FullPath("/dir"), 100, nil)
 
 	// Poll until the build completes or a deadline elapses.
 	deadline := time.After(2 * time.Second)
@@ -364,7 +364,7 @@ func TestBuildCompletionSurvivesCallerCancellation(t *testing.T) {
 	}
 
 	// The pre-existing entry must survive
-	entry, findErr := mc.FindEntry(context.Background(), util.FullPath("/dir/kept.txt"))
+	entry, _, findErr := mc.FindEntry(context.Background(), util.FullPath("/dir/kept.txt"))
 	if findErr != nil {
 		t.Fatalf("find kept entry: %v", findErr)
 	}
@@ -373,7 +373,7 @@ func TestBuildCompletionSurvivesCallerCancellation(t *testing.T) {
 	}
 
 	// The buffered event (TsNs 200 > snapshot 100) must have been replayed
-	buffered, findErr := mc.FindEntry(context.Background(), util.FullPath("/dir/buffered.txt"))
+	buffered, _, findErr := mc.FindEntry(context.Background(), util.FullPath("/dir/buffered.txt"))
 	if findErr != nil {
 		t.Fatalf("find buffered entry: %v", findErr)
 	}
@@ -397,7 +397,7 @@ func TestBufferedRenameUpdatesOtherDirectoryBeforeBuildCompletes(t *testing.T) {
 			Mode:     0100644,
 			FileSize: 7,
 		},
-	}); err != nil {
+	}, 0); err != nil {
 		t.Fatalf("insert source entry: %v", err)
 	}
 
@@ -429,7 +429,7 @@ func TestBufferedRenameUpdatesOtherDirectoryBeforeBuildCompletes(t *testing.T) {
 		t.Fatalf("apply rename: %v", err)
 	}
 
-	oldEntry, err := mc.FindEntry(context.Background(), util.FullPath("/src/from.txt"))
+	oldEntry, _, err := mc.FindEntry(context.Background(), util.FullPath("/src/from.txt"))
 	if err != filer_pb.ErrNotFound {
 		t.Fatalf("find old path error = %v, want %v", err, filer_pb.ErrNotFound)
 	}
@@ -437,7 +437,7 @@ func TestBufferedRenameUpdatesOtherDirectoryBeforeBuildCompletes(t *testing.T) {
 		t.Fatalf("old path should be removed before build completes: %+v", oldEntry)
 	}
 
-	newEntry, err := mc.FindEntry(context.Background(), util.FullPath("/dst/to.txt"))
+	newEntry, _, err := mc.FindEntry(context.Background(), util.FullPath("/dst/to.txt"))
 	if err != filer_pb.ErrNotFound {
 		t.Fatalf("find buffered new path error = %v, want %v", err, filer_pb.ErrNotFound)
 	}
@@ -445,15 +445,191 @@ func TestBufferedRenameUpdatesOtherDirectoryBeforeBuildCompletes(t *testing.T) {
 		t.Fatalf("new path should stay hidden until build completes: %+v", newEntry)
 	}
 
-	if err := mc.CompleteDirectoryBuild(context.Background(), util.FullPath("/dst"), 100); err != nil {
+	if err := mc.CompleteDirectoryBuild(context.Background(), util.FullPath("/dst"), 100, nil); err != nil {
 		t.Fatalf("complete build: %v", err)
 	}
 
-	newEntry, err = mc.FindEntry(context.Background(), util.FullPath("/dst/to.txt"))
+	newEntry, _, err = mc.FindEntry(context.Background(), util.FullPath("/dst/to.txt"))
 	if err != nil {
 		t.Fatalf("find replayed new path: %v", err)
 	}
 	if newEntry.FileSize != 12 {
 		t.Fatalf("replayed new path size = %d, want 12", newEntry.FileSize)
+	}
+}
+
+// TestEnsureVisitedPreservesLocalOnlyEntry reproduces the residual coherence
+// gap behind the FUSE ConcurrentReadWrite ENOENT flake.
+//
+// A FUSE create on the writeback/deferFilerCreate path inserts the entry into
+// the local store directly (weedfs_file_mkrm.go createFile), off the metaCache
+// apply loop, before the filer holds it. A concurrent rebuild of the parent —
+// triggered when the directory falls out of cache (idle evict, hot-dir
+// read-through) — wipes the store and refills it from a filer listing that does
+// not yet include the un-flushed local create, then publishes the directory
+// authoritatively cached (markCachedFn). The local entry vanishes although the
+// client created it: lookupEntry then returns an authoritative ENOENT for it.
+func TestEnsureVisitedPreservesLocalOnlyEntry(t *testing.T) {
+	mc, _, _, _ := newTestMetaCache(t, map[util.FullPath]bool{"/": true})
+	defer mc.Shutdown()
+
+	// The mount pins the un-flushed create (open dirty handle / pending flush),
+	// keyed off the inode the entry carries so a kernel Forget that dropped the
+	// path→inode mapping cannot unpin an in-flight create.
+	mc.SetPinnedChildFn(func(e *filer.Entry) bool { return e.Attr.Inode == 42 })
+
+	// A deferred local create lands before the rebuild; /dir is not yet cached.
+	// It carries its allocated inode, as createFile's placeholder does.
+	if err := mc.InsertEntry(context.Background(), &filer.Entry{
+		FullPath: "/dir/pending.txt",
+		Attr:     filer.Attr{Crtime: time.Unix(1, 0), Mtime: time.Unix(1, 0), Mode: 0100644, FileSize: 1, Inode: 42},
+	}, 0); err != nil {
+		t.Fatalf("insert pending entry: %v", err)
+	}
+
+	// A concurrent rebuild lists the filer, whose snapshot pre-dates the
+	// un-flushed create, so it returns only the already-persisted sibling.
+	accessor := &buildFilerAccessor{client: &buildListClient{
+		responses: []*filer_pb.ListEntriesResponse{{
+			Entry: &filer_pb.Entry{
+				Name: "base.txt",
+				Attributes: &filer_pb.FuseAttributes{
+					Crtime:   1,
+					Mtime:    1,
+					FileMode: 0100644,
+					FileSize: 3,
+				},
+			},
+			SnapshotTsNs: 100,
+		}},
+	}}
+
+	if err := EnsureVisited(mc, accessor, util.FullPath("/dir"), 0); err != nil {
+		t.Fatalf("ensure visited: %v", err)
+	}
+	if !mc.IsDirectoryCached(util.FullPath("/dir")) {
+		t.Fatal("/dir should be cached after build completes")
+	}
+
+	// base.txt from the listing is present.
+	if _, _, err := mc.FindEntry(context.Background(), util.FullPath("/dir/base.txt")); err != nil {
+		t.Fatalf("listed entry missing after build: %v", err)
+	}
+
+	// The un-flushed local create must survive the rebuild. With /dir now
+	// authoritatively cached, losing it is the file-vanishes flake.
+	if _, _, err := mc.FindEntry(context.Background(), util.FullPath("/dir/pending.txt")); err != nil {
+		t.Fatalf("local-only entry lost across concurrent rebuild: %v", err)
+	}
+}
+
+// TestEnsureVisitedDropsUnpinnedStaleEntry guards the preservation's selectivity:
+// a cached child the filer listing no longer returns and that is NOT pinned must
+// still be wiped, so the rebuild can't resurrect a deleted/renamed entry.
+func TestEnsureVisitedDropsUnpinnedStaleEntry(t *testing.T) {
+	mc, _, _, _ := newTestMetaCache(t, map[util.FullPath]bool{"/": true})
+	defer mc.Shutdown()
+
+	mc.SetPinnedChildFn(func(*filer.Entry) bool { return false })
+
+	// A stale child sits in the cache; the filer no longer has it.
+	insertCacheEntry(t, mc, "/dir/stale.txt")
+
+	accessor := &buildFilerAccessor{client: &buildListClient{
+		responses: []*filer_pb.ListEntriesResponse{{
+			Entry: &filer_pb.Entry{
+				Name: "base.txt",
+				Attributes: &filer_pb.FuseAttributes{
+					Crtime:   1,
+					Mtime:    1,
+					FileMode: 0100644,
+					FileSize: 3,
+				},
+			},
+			SnapshotTsNs: 100,
+		}},
+	}}
+
+	if err := EnsureVisited(mc, accessor, util.FullPath("/dir"), 0); err != nil {
+		t.Fatalf("ensure visited: %v", err)
+	}
+	if entry, _, err := mc.FindEntry(context.Background(), util.FullPath("/dir/stale.txt")); err != filer_pb.ErrNotFound || entry != nil {
+		t.Fatalf("unpinned stale entry survived rebuild = %+v, %v; want nil, %v", entry, err, filer_pb.ErrNotFound)
+	}
+}
+
+// sequencedListClient returns a different ListEntries result per call (repeating
+// the last), modelling a filer that lists empty transiently then the real entries.
+type sequencedListClient struct {
+	filer_pb.SeaweedFilerClient
+	mu      sync.Mutex
+	perCall [][]*filer_pb.ListEntriesResponse
+	calls   int
+}
+
+func (c *sequencedListClient) ListEntries(ctx context.Context, in *filer_pb.ListEntriesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[filer_pb.ListEntriesResponse], error) {
+	c.mu.Lock()
+	idx := c.calls
+	if idx >= len(c.perCall) {
+		idx = len(c.perCall) - 1
+	}
+	c.calls++
+	resp := c.perCall[idx]
+	c.mu.Unlock()
+	return &buildListStream{responses: resp}, nil
+}
+
+// TestEnsureVisitedConfirmsTransientEmptyListing: a rebuild whose first filer
+// listing comes back empty must re-read and cache the real entries, not strand
+// the directory cached over an empty store (the ConcurrentReadWrite ENOENT flake).
+func TestEnsureVisitedConfirmsTransientEmptyListing(t *testing.T) {
+	mc, _, _, _ := newTestMetaCache(t, map[util.FullPath]bool{"/": true})
+	defer mc.Shutdown()
+
+	entry := &filer_pb.Entry{
+		Name:       "keep.txt",
+		Attributes: &filer_pb.FuseAttributes{Crtime: 1, Mtime: 1, FileMode: 0100644, FileSize: 7},
+	}
+	accessor := &buildFilerAccessor{client: &sequencedListClient{
+		perCall: [][]*filer_pb.ListEntriesResponse{
+			{},                                  // first read: transient empty
+			{{Entry: entry, SnapshotTsNs: 100}}, // confirm read: the real entry
+		},
+	}}
+
+	if err := EnsureVisited(mc, accessor, util.FullPath("/dir"), 0); err != nil {
+		t.Fatalf("ensure visited: %v", err)
+	}
+	if !mc.IsDirectoryCached(util.FullPath("/dir")) {
+		t.Fatal("/dir should be cached after build completes")
+	}
+	if _, _, err := mc.FindEntry(context.Background(), util.FullPath("/dir/keep.txt")); err != nil {
+		t.Fatalf("/dir/keep.txt stranded after transient empty listing: %v", err)
+	}
+}
+
+// TestEnsureVisitedCachesGenuinelyEmptyDirectory: a really-empty directory lists
+// empty on every confirm and must still end up cached.
+func TestEnsureVisitedCachesGenuinelyEmptyDirectory(t *testing.T) {
+	mc, _, _, _ := newTestMetaCache(t, map[util.FullPath]bool{"/": true})
+	defer mc.Shutdown()
+
+	client := &sequencedListClient{
+		perCall: [][]*filer_pb.ListEntriesResponse{{}}, // always empty
+	}
+	accessor := &buildFilerAccessor{client: client}
+
+	if err := EnsureVisited(mc, accessor, util.FullPath("/empty"), 0); err != nil {
+		t.Fatalf("ensure visited: %v", err)
+	}
+	if !mc.IsDirectoryCached(util.FullPath("/empty")) {
+		t.Fatal("/empty should be cached even though it has no entries")
+	}
+	// The empty result must have been confirmed, not trusted on the first read.
+	client.mu.Lock()
+	calls := client.calls
+	client.mu.Unlock()
+	if calls != emptyRebuildConfirmations+1 {
+		t.Fatalf("list calls = %d, want %d (initial + confirmations)", calls, emptyRebuildConfirmations+1)
 	}
 }

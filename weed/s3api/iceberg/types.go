@@ -7,6 +7,7 @@ import (
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
+	"github.com/apache/iceberg-go/view"
 )
 
 // CatalogConfig is returned by GET /v1/config.
@@ -62,6 +63,19 @@ type GetNamespaceResponse struct {
 	Properties map[string]string `json:"properties"`
 }
 
+// UpdateNamespacePropertiesRequest is sent to POST /v1/namespaces/{namespace}/properties.
+type UpdateNamespacePropertiesRequest struct {
+	Removals []string          `json:"removals,omitempty"`
+	Updates  map[string]string `json:"updates,omitempty"`
+}
+
+// UpdateNamespacePropertiesResponse is returned by POST /v1/namespaces/{namespace}/properties.
+type UpdateNamespacePropertiesResponse struct {
+	Removed []string `json:"removed"`
+	Updated []string `json:"updated"`
+	Missing []string `json:"missing"`
+}
+
 // ListTablesResponse is returned by GET /v1/namespaces/{namespace}/tables.
 type ListTablesResponse struct {
 	NextPageToken string            `json:"next-page-token,omitempty"`
@@ -80,17 +94,32 @@ type CreateTableRequest struct {
 	Properties    iceberg.Properties     `json:"properties,omitempty"`
 }
 
+// RegisterTableRequest is sent to POST /v1/namespaces/{namespace}/register.
+type RegisterTableRequest struct {
+	Name             string `json:"name"`
+	MetadataLocation string `json:"metadata-location"`
+}
+
 type LoadTableResult struct {
-	MetadataLocation string             `json:"metadata-location,omitempty"`
-	Metadata         table.Metadata     `json:"metadata"`
-	Config           iceberg.Properties `json:"config"`
+	MetadataLocation   string              `json:"metadata-location,omitempty"`
+	Metadata           table.Metadata      `json:"metadata"`
+	Config             iceberg.Properties  `json:"config"`
+	StorageCredentials []StorageCredential `json:"storage-credentials,omitempty"`
+}
+
+// StorageCredential is one set of credentials scoped to a location prefix, as
+// returned to clients that asked for credential vending.
+type StorageCredential struct {
+	Prefix string             `json:"prefix"`
+	Config iceberg.Properties `json:"config"`
 }
 
 // loadTableResultAlias is used for custom JSON unmarshaling.
 type loadTableResultAlias struct {
-	MetadataLocation string             `json:"metadata-location,omitempty"`
-	RawMetadata      json.RawMessage    `json:"metadata"`
-	Config           iceberg.Properties `json:"config,omitempty"`
+	MetadataLocation   string              `json:"metadata-location,omitempty"`
+	RawMetadata        json.RawMessage     `json:"metadata"`
+	Config             iceberg.Properties  `json:"config,omitempty"`
+	StorageCredentials []StorageCredential `json:"storage-credentials,omitempty"`
 }
 
 // MarshalJSON serializes LoadTableResult while backfilling spec-required
@@ -106,13 +135,15 @@ func (r LoadTableResult) MarshalJSON() ([]byte, error) {
 	metaBytes = ensureMetadataSpecCompliance(metaBytes)
 
 	return json.Marshal(struct {
-		MetadataLocation string             `json:"metadata-location,omitempty"`
-		Metadata         json.RawMessage    `json:"metadata"`
-		Config           iceberg.Properties `json:"config"`
+		MetadataLocation   string              `json:"metadata-location,omitempty"`
+		Metadata           json.RawMessage     `json:"metadata"`
+		Config             iceberg.Properties  `json:"config"`
+		StorageCredentials []StorageCredential `json:"storage-credentials,omitempty"`
 	}{
-		MetadataLocation: r.MetadataLocation,
-		Metadata:         metaBytes,
-		Config:           r.Config,
+		MetadataLocation:   r.MetadataLocation,
+		Metadata:           metaBytes,
+		Config:             r.Config,
+		StorageCredentials: r.StorageCredentials,
 	})
 }
 
@@ -126,6 +157,7 @@ func (r *LoadTableResult) UnmarshalJSON(data []byte) error {
 
 	r.MetadataLocation = alias.MetadataLocation
 	r.Config = alias.Config
+	r.StorageCredentials = alias.StorageCredentials
 
 	if len(alias.RawMetadata) > 0 {
 		metadata, err := table.ParseMetadataBytes(alias.RawMetadata)
@@ -136,6 +168,12 @@ func (r *LoadTableResult) UnmarshalJSON(data []byte) error {
 	}
 
 	return nil
+}
+
+// RenameTableRequest is sent to POST /v1/tables/rename.
+type RenameTableRequest struct {
+	Source      TableIdentifier `json:"source"`
+	Destination TableIdentifier `json:"destination"`
 }
 
 // CommitTableRequest is sent to POST /v1/namespaces/{namespace}/tables/{table}.
@@ -194,4 +232,58 @@ func (r *CommitTableResponse) UnmarshalJSON(data []byte) error {
 	}
 
 	return nil
+}
+
+// ListViewsResponse is returned by GET /v1/namespaces/{namespace}/views.
+type ListViewsResponse struct {
+	NextPageToken string            `json:"next-page-token,omitempty"`
+	Identifiers   []TableIdentifier `json:"identifiers"`
+}
+
+// CreateViewRequest is sent to POST /v1/namespaces/{namespace}/views.
+type CreateViewRequest struct {
+	Name        string             `json:"name"`
+	Schema      *iceberg.Schema    `json:"schema"`
+	Location    string             `json:"location,omitempty"`
+	Properties  iceberg.Properties `json:"properties,omitempty"`
+	ViewVersion *view.Version      `json:"view-version"`
+}
+
+// ViewResponse is returned by view create/update and load operations.
+type ViewResponse struct {
+	MetadataLocation string             `json:"metadata-location"`
+	Metadata         view.Metadata      `json:"metadata"`
+	Config           iceberg.Properties `json:"config"`
+}
+
+// viewResponseAlias is used for custom JSON unmarshaling.
+type viewResponseAlias struct {
+	MetadataLocation string             `json:"metadata-location"`
+	RawMetadata      json.RawMessage    `json:"metadata"`
+	Config           iceberg.Properties `json:"config,omitempty"`
+}
+
+// UnmarshalJSON parses view.Metadata using iceberg-go's view parser.
+func (r *ViewResponse) UnmarshalJSON(data []byte) error {
+	var alias viewResponseAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+	r.MetadataLocation = alias.MetadataLocation
+	r.Config = alias.Config
+	if len(alias.RawMetadata) > 0 {
+		metadata, err := view.ParseMetadataBytes(alias.RawMetadata)
+		if err != nil {
+			return err
+		}
+		r.Metadata = metadata
+	}
+	return nil
+}
+
+// UpdateViewRequest is sent to POST /v1/namespaces/{namespace}/views/{view}.
+type UpdateViewRequest struct {
+	Identifier   *TableIdentifier  `json:"identifier,omitempty"`
+	Requirements view.Requirements `json:"requirements"`
+	Updates      view.Updates      `json:"updates"`
 }

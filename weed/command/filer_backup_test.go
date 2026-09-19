@@ -77,15 +77,153 @@ func TestIsIgnorable404_NonIgnorableError(t *testing.T) {
 	}
 }
 
+// Regression for the partial-landing swallow: transient volume-lookup races
+// ("LookupFileId ... failed", "volume id N not found") raised while replicating
+// a checkpoint write burst must NOT be classified as a genuine source 404.
+// They previously matched isIgnorable404 by substring, so the event was treated
+// as a deletion — the subscription offset advanced and the file (typically a
+// large manifest-backed .pt) was never replicated, with no error logged. They
+// are now propagated so the offset stays put and the event is reprocessed; only
+// a genuinely-gone source (verified live by the filer sink) is ever skipped.
+func TestIsIgnorable404_TransientLookupNotSwallowed(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{
+			"lookup file id race",
+			fmt.Errorf("create entry1 : %w",
+				fmt.Errorf("replicate manifest data chunks 3,01abc: LookupFileId 3,01abc failed, err: context deadline exceeded")),
+		},
+		{
+			"volume id not found race",
+			fmt.Errorf("create entry1 : %w",
+				fmt.Errorf("replicate entry chunks /buckets/x/model.pt: copy 7,02def: read part 7,02def: volume id 7 not found")),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if isIgnorable404(tc.err) {
+				t.Errorf("transient lookup race must not be ignorable (would swallow a live file): %v", tc.err)
+			}
+			if !isSourceLookupError(tc.err) {
+				t.Errorf("lookup race must classify as a source lookup error (resolved via the live source): %v", tc.err)
+			}
+		})
+	}
+}
+
+func TestErrorClassifiersNilSafe(t *testing.T) {
+	if isIgnorable404(nil) {
+		t.Error("isIgnorable404(nil) must be false")
+	}
+	if isSourceLookupError(nil) {
+		t.Error("isSourceLookupError(nil) must be false")
+	}
+}
+
+func TestIsSourceLookupError_NonLookupErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"genuine S3 404", fmt.Errorf("upload part: 404 Not Found: not found")},
+		{"network error", fmt.Errorf("dial tcp 10.0.0.1:8080: connection refused")},
+		{"plain not found without volume id", fmt.Errorf("entry not found")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if isSourceLookupError(tc.err) {
+				t.Errorf("must not classify as a source lookup error: %v", tc.err)
+			}
+		})
+	}
+}
+
+// Legacy events carry an empty NewParentPath; the probe must fall back to
+// resp.Directory instead of building "/<name>", which would read as "gone"
+// and skip a live file.
+func TestEventSupersessionProbe_PathDerivation(t *testing.T) {
+	entry := &filer_pb.Entry{
+		Name:       "f",
+		Attributes: &filer_pb.FuseAttributes{Mtime: 123},
+	}
+	cases := []struct {
+		name string
+		resp *filer_pb.SubscribeMetadataResponse
+		want string
+	}{
+		{
+			"legacy event without NewParentPath",
+			&filer_pb.SubscribeMetadataResponse{
+				Directory:         "/buckets/x",
+				EventNotification: &filer_pb.EventNotification{NewEntry: entry},
+			},
+			"/buckets/x/f",
+		},
+		{
+			"rename event with NewParentPath",
+			&filer_pb.SubscribeMetadataResponse{
+				Directory: "/buckets/x",
+				EventNotification: &filer_pb.EventNotification{
+					NewParentPath: "/buckets/y",
+					NewEntry:      entry,
+				},
+			},
+			"/buckets/y/f",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path, mtimeNs, ok := eventSupersessionProbe(tc.resp)
+			if !ok {
+				t.Fatal("probe must succeed when NewEntry is present")
+			}
+			if string(path) != tc.want {
+				t.Errorf("path = %q, want %q", path, tc.want)
+			}
+			if mtimeNs != 123*int64(1e9) {
+				t.Errorf("mtimeNs = %d, want %d", mtimeNs, 123*int64(1e9))
+			}
+		})
+	}
+}
+
+// When supersession cannot be proven, never skip — that would drop a live file.
+func TestEventSourceSuperseded_Guards(t *testing.T) {
+	if eventSourceSuperseded(nil, nil) {
+		t.Error("nil response must not be skippable")
+	}
+	if eventSourceSuperseded(nil, &filer_pb.SubscribeMetadataResponse{
+		EventNotification: &filer_pb.EventNotification{},
+	}) {
+		t.Error("event without NewEntry must not be skippable")
+	}
+	if eventSourceSuperseded(nil, &filer_pb.SubscribeMetadataResponse{
+		EventNotification: &filer_pb.EventNotification{
+			NewParentPath: "/buckets/x",
+			NewEntry: &filer_pb.Entry{
+				Name:       "model.pt",
+				Attributes: &filer_pb.FuseAttributes{Mtime: 1234567890},
+			},
+		},
+	}) {
+		t.Error("nil filerSource must not be skippable")
+	}
+}
+
 // stubSink is a minimal ReplicationSink used to exercise initialSnapshotTargetKey
-// without standing up a real sink. Only the two methods read by the key builder
-// (GetName, IsIncremental) need meaningful behavior; the rest satisfy the interface.
+// and backupCheckpointIds without standing up a real sink; the methods those
+// read (GetName, IsIncremental, GetSinkToDirectory, GetDestinationIdentity)
+// reflect the fields, the rest satisfy the interface.
 type stubSink struct {
 	name          string
+	dir           string
+	destination   string
 	isIncremental bool
 }
 
-func (s *stubSink) GetName() string                           { return s.name }
+func (s *stubSink) GetName() string                             { return s.name }
 func (s *stubSink) Initialize(util.Configuration, string) error { return nil }
 func (s *stubSink) DeleteEntry(string, bool, bool, []int32) error {
 	return nil
@@ -94,9 +232,10 @@ func (s *stubSink) CreateEntry(string, *filer_pb.Entry, []int32) error { return 
 func (s *stubSink) UpdateEntry(string, *filer_pb.Entry, string, *filer_pb.Entry, bool, []int32) (bool, error) {
 	return false, nil
 }
-func (s *stubSink) GetSinkToDirectory() string       { return "" }
+func (s *stubSink) GetSinkToDirectory() string         { return s.dir }
+func (s *stubSink) GetDestinationIdentity() string     { return s.destination }
 func (s *stubSink) SetSourceFiler(*source.FilerSource) {}
-func (s *stubSink) IsIncremental() bool              { return s.isIncremental }
+func (s *stubSink) IsIncremental() bool                { return s.isIncremental }
 
 var _ sink.ReplicationSink = (*stubSink)(nil)
 
@@ -137,5 +276,70 @@ func TestInitialSnapshotTargetKey(t *testing.T) {
 	}
 	if got := initialSnapshotTargetKey(mirror, "/backup", "/data/", util.FullPath("/data"), &filer_pb.Entry{}); got != "/backup" {
 		t.Errorf("sourceKey == sourcePath (trailing slash mismatch): got %q, want %q", got, "/backup")
+	}
+}
+
+// The scenario from the collision report: two backups to different S3
+// endpoints/buckets that share the destination directory "/" must not share
+// a checkpoint, or the stopped one resumes from the other's position and
+// skips changes.
+func TestBackupCheckpointIds_DistinctDestinations(t *testing.T) {
+	backupA := &stubSink{name: "s3", dir: "/", destination: "s3.us-west-004.backblazeb2.com|seaweed-backup-a|/"}
+	backupB := &stubSink{name: "s3", dir: "/", destination: "s3.us-east-005.backblazeb2.com|seaweed-backup-b|/"}
+
+	idA, legacyA := backupCheckpointIds("/", backupA)
+	idB, legacyB := backupCheckpointIds("/", backupB)
+
+	if idA == idB {
+		t.Errorf("backups to different destinations share checkpoint id %d", idA)
+	}
+	// Both historically hashed to the same key — that is the bug the
+	// destination-scoped key fixes, and the shared value both fall back to.
+	if legacyA != legacyB {
+		t.Errorf("legacy ids differ: %d vs %d", legacyA, legacyB)
+	}
+}
+
+// Two backups of different source paths to the same destination must not
+// share a checkpoint either: each stream sees a different event subset, so a
+// shared offset lets the faster one push the slower one past unseen events.
+func TestBackupCheckpointIds_DistinctSourcePaths(t *testing.T) {
+	s := &stubSink{name: "s3", dir: "/", destination: "endpoint|bucket|/"}
+	idA, _ := backupCheckpointIds("/buckets/a", s)
+	idB, _ := backupCheckpointIds("/buckets/b", s)
+	if idA == idB {
+		t.Errorf("backups of different source paths share checkpoint id %d", idA)
+	}
+}
+
+// The fallback key must keep the exact historical formula
+// hash(GetName() + GetSinkToDirectory()) truncated to int32, or existing
+// backups lose their checkpoint on upgrade and replay from zero.
+func TestBackupCheckpointIds_LegacyFormulaUnchanged(t *testing.T) {
+	s := &stubSink{name: "s3", dir: "/data", destination: "endpoint|bucket|/data"}
+	_, legacy := backupCheckpointIds("/", s)
+	if want := int32(util.HashStringToLong("s3" + "/data")); legacy != want {
+		t.Errorf("legacy id = %d, want historical formula value %d", legacy, want)
+	}
+}
+
+// The NUL joins keep the hash input injective: field values spelling out
+// other fields' content must not concatenate to the same input.
+func TestBackupCheckpointIds_NoAliasing(t *testing.T) {
+	idA, _ := backupCheckpointIds("/src", &stubSink{name: "s3", dir: "/", destination: "/d=>s3|/other"})
+	idB, _ := backupCheckpointIds("/src=>s3|/d", &stubSink{name: "s3", dir: "/", destination: "/other"})
+	if idA == idB {
+		t.Errorf("field content spelling a separator aliases checkpoint id %d", idA)
+	}
+}
+
+// Restarting the same configuration must derive the same key, or every
+// restart would orphan its checkpoint.
+func TestBackupCheckpointIds_Stable(t *testing.T) {
+	s := &stubSink{name: "s3", dir: "/", destination: "endpoint|bucket|/"}
+	id1, legacy1 := backupCheckpointIds("/buckets/a", s)
+	id2, legacy2 := backupCheckpointIds("/buckets/a", s)
+	if id1 != id2 || legacy1 != legacy2 {
+		t.Errorf("ids not stable: (%d,%d) vs (%d,%d)", id1, legacy1, id2, legacy2)
 	}
 }

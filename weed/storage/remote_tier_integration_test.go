@@ -16,6 +16,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 // In-process integration tests for cloud-tiered ("remote") volumes.
@@ -50,7 +52,7 @@ func (b *localDirBackend) NewStorageFile(key string, tierInfo *volume_server_pb.
 	return &localDirBackendFile{backend: b, key: key, tierInfo: tierInfo}
 }
 
-func (b *localDirBackend) CopyFile(f *os.File, fn func(progressed int64, percentage float32) error) (key string, size int64, err error) {
+func (b *localDirBackend) CopyFile(f *os.File, fn func(progressed int64, percentage float32) error, concurrency int) (key string, size int64, err error) {
 	key = fmt.Sprintf("obj-%d-%d", time.Now().UnixNano(), os.Getpid())
 	dst := filepath.Join(b.root, key)
 	out, err := os.Create(dst)
@@ -71,7 +73,7 @@ func (b *localDirBackend) CopyFile(f *os.File, fn func(progressed int64, percent
 	return key, written, nil
 }
 
-func (b *localDirBackend) DownloadFile(fileName string, key string, fn func(progressed int64, percentage float32) error) (size int64, err error) {
+func (b *localDirBackend) DownloadFile(fileName string, key string, fn func(progressed int64, percentage float32) error, concurrency int) (size int64, err error) {
 	src := filepath.Join(b.root, key)
 	in, err := os.Open(src)
 	if err != nil {
@@ -145,9 +147,9 @@ func (f *localDirBackendFile) Truncate(off int64) error {
 	return os.Truncate(filepath.Join(f.backend.root, f.key), off)
 }
 
-func (f *localDirBackendFile) Close() error                                 { return nil }
-func (f *localDirBackendFile) Name() string                                 { return f.key }
-func (f *localDirBackendFile) Sync() error                                  { return nil }
+func (f *localDirBackendFile) Close() error { return nil }
+func (f *localDirBackendFile) Name() string { return f.key }
+func (f *localDirBackendFile) Sync() error  { return nil }
 func (f *localDirBackendFile) GetStat() (int64, time.Time, error) {
 	files := f.tierInfo.GetFiles()
 	if len(files) == 0 {
@@ -172,24 +174,26 @@ func registerTestBackend(t *testing.T, b *localDirBackend) {
 	})
 }
 
-// tierUpVolume creates a real on-disk volume, writes a few needles, then
-// uploads the .dat to the fake backend and rewrites the volume in remote
-// mode (mirrors the production flow in volume_grpc_tier_upload.go but
-// in-process).
-func tierUpVolume(t *testing.T, dir string, vid needle.VolumeId, b *localDirBackend) (collection string, key string) {
+// tierUpVolumeLive creates a real on-disk volume, writes a few needles, then
+// uploads the .dat to the fake backend and rewrites the volume in remote mode
+// (mirrors the production flow in volume_grpc_tier_upload.go but in-process).
+// It returns the still-open volume, exactly as a volume server holds it after a
+// live `volume.tier.upload` — no reload. Callers that want the on-disk state a
+// server sees after restart use tierUpVolume, which closes it.
+func tierUpVolumeLive(t *testing.T, dir string, vid needle.VolumeId, b *localDirBackend) (v *Volume, key string) {
 	t.Helper()
 	v, err := NewVolume(dir, dir, "", vid, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
 	require.NoError(t, err)
 
 	for i := 1; i <= 5; i++ {
-		_, _, _, err := v.writeNeedle2(newRandomNeedle(uint64(i)), true, false)
+		_, _, _, err := v.writeNeedle2(newRandomNeedle(uint64(i)), true, false, false)
 		require.NoError(t, err)
 	}
 
 	diskFile, ok := v.DataBackend.(*backend.DiskFile)
 	require.True(t, ok, "expected on-disk backend before tier-up")
 
-	uploadKey, size, err := b.CopyFile(diskFile.File, nil)
+	uploadKey, size, err := b.CopyFile(diskFile.File, nil, 0)
 	require.NoError(t, err)
 
 	bType, bId := backend.BackendNameToTypeId(testBackendName)
@@ -206,10 +210,16 @@ func tierUpVolume(t *testing.T, dir string, vid needle.VolumeId, b *localDirBack
 	require.NoError(t, v.LoadRemoteFile())
 	require.NoError(t, os.Remove(v.FileName(".dat")))
 
-	// Close the volume cleanly. Tests below reload it from disk to mirror
-	// what a volume server does on restart with a tiered volume.
-	v.Close()
+	return v, uploadKey
+}
 
+// tierUpVolume runs tierUpVolumeLive then closes the volume. Tests using it
+// reload from disk to mirror what a volume server does on restart with a
+// tiered volume.
+func tierUpVolume(t *testing.T, dir string, vid needle.VolumeId, b *localDirBackend) (collection string, key string) {
+	t.Helper()
+	v, uploadKey := tierUpVolumeLive(t, dir, vid, b)
+	v.Close()
 	return v.Collection, uploadKey
 }
 
@@ -221,6 +231,101 @@ func reloadVolume(t *testing.T, dir string, vid needle.VolumeId) *Volume {
 	v, err := NewVolume(dir, dir, "", vid, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
 	require.NoError(t, err)
 	return v
+}
+
+// TestRemoteTier_DiskScanLoadsRemoteOnlyVolume locks in that the disk scan
+// (loadExistingVolume) loads a remote-only volume — a .vif pointing at remote
+// files with no local .dat — instead of skipping it as a lone sidecar. The
+// phantom-.dat guard must let remote volumes through.
+func TestRemoteTier_DiskScanLoadsRemoteOnlyVolume(t *testing.T) {
+	b := newLocalDirBackend(t)
+	registerTestBackend(t, b)
+
+	dir := t.TempDir()
+	const vid = needle.VolumeId(44)
+	tierUpVolume(t, dir, vid, b) // leaves .vif (remote) + .idx, no .dat
+
+	require.False(t, util.FileExists(filepath.Join(dir, "44.dat")), "tier-up should have removed the local .dat")
+
+	loc := &DiskLocation{
+		Directory:              dir,
+		DirectoryUuid:          "test-uuid",
+		IdxDirectory:           dir,
+		DiskType:               types.HddType,
+		MaxVolumeCount:         100,
+		OriginalMaxVolumeCount: 100,
+		MinFreeSpace:           util.MinFreeSpace{Type: util.AsPercent, Percent: 1, Raw: "1"},
+	}
+	loc.volumes = make(map[needle.VolumeId]*Volume)
+	loc.ecVolumes = make(map[needle.VolumeId]*erasure_coding.EcVolume)
+
+	loc.loadExistingVolumes(NeedleMapInMemory, 0)
+
+	v, ok := loc.volumes[vid]
+	require.True(t, ok, "remote-only volume must be loaded by the disk scan, not skipped by the phantom-.dat guard")
+	require.True(t, v.HasRemoteFile(), "loaded volume should be in remote mode")
+	v.Close()
+}
+
+// TestRemoteTier_LiveTierUpload_StillReportsToMaster covers a live
+// `volume.tier.upload`: the .dat is removed and the volume serves from remote,
+// but the same in-memory Volume keeps heartbeating with no reload. The
+// phantom-.dat guard must not suppress it just because .dat is gone —
+// LoadRemoteFile has flipped it into remote mode, so ToVolumeInformationMessage
+// must still report it to the master. If HasRemoteFile stayed false the volume
+// would vanish from the topology ("volume not found").
+func TestRemoteTier_LiveTierUpload_StillReportsToMaster(t *testing.T) {
+	b := newLocalDirBackend(t)
+	registerTestBackend(t, b)
+
+	dir := t.TempDir()
+	const vid = needle.VolumeId(67)
+	v, _ := tierUpVolumeLive(t, dir, vid, b)
+	defer v.Close()
+	// A store-owned volume always carries its DiskLocation; NewVolume leaves it
+	// nil, so give it one for the IsReadOnly disk-space check inside the heartbeat.
+	v.location = &DiskLocation{Directory: dir, DiskType: types.HddType}
+
+	require.True(t, v.HasRemoteFile(), "a tier-uploaded volume is in remote mode even before any reload")
+	require.False(t, util.FileExists(v.FileName(".dat")), "tier-up should have removed the local .dat")
+
+	_, msg := v.ToVolumeInformationMessage(nil)
+	require.NotNil(t, msg, "tier-uploaded volume must still report to master")
+	require.NotEmpty(t, msg.RemoteStorageName, "reported volume must carry its remote backend name")
+}
+
+// TestRemoteTier_ReloadUnderDataLock_NoDeadlock guards the reload-under-lock
+// path: CommitCompact holds dataFileAccessLock and calls v.load(), which for a
+// remote-tiered volume swaps the data backend. That swap must go through the
+// lock-free loadRemoteFileLocked; if load() instead used the public
+// LoadRemoteFile (which takes dataFileAccessLock), it would re-enter the held
+// lock and deadlock.
+func TestRemoteTier_ReloadUnderDataLock_NoDeadlock(t *testing.T) {
+	b := newLocalDirBackend(t)
+	registerTestBackend(t, b)
+
+	dir := t.TempDir()
+	const vid = needle.VolumeId(68)
+	v, _ := tierUpVolumeLive(t, dir, vid, b)
+	v.location = &DiskLocation{Directory: dir, DiskType: types.HddType}
+	require.True(t, v.HasRemoteFile())
+
+	done := make(chan error, 1)
+	go func() {
+		// Mirror CommitCompact: hold the data lock across the reload.
+		v.dataFileAccessLock.Lock()
+		defer v.dataFileAccessLock.Unlock()
+		done <- v.load(true, false, v.needleMapKind, 0, v.Version())
+	}()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+		require.True(t, v.HasRemoteFile(), "volume must stay remote-tiered after reload")
+		v.Close()
+	case <-time.After(10 * time.Second):
+		t.Fatal("reload under dataFileAccessLock deadlocked: load() re-entered the held lock via LoadRemoteFile")
+	}
 }
 
 // TestRemoteTier_Move_KeepsRemoteObject simulates the move-on-source-after-copy
@@ -299,7 +404,7 @@ func TestRemoteTier_ECEncode_RequiresLocalDat(t *testing.T) {
 	tierUpVolume(t, dir, vid, b)
 
 	baseFileName := filepath.Join(dir, fmt.Sprintf("%d", uint32(vid)))
-	err := erasure_coding.WriteEcFiles(baseFileName)
+	_, err := erasure_coding.WriteEcFiles(baseFileName, erasure_coding.BackgroundECContext())
 	require.Error(t, err, "EC encoder must not run with .dat missing — caller is expected to download first")
 	require.Contains(t, err.Error(), ".dat")
 }
@@ -317,11 +422,12 @@ func TestRemoteTier_ECEncodeDecode_AfterDownload(t *testing.T) {
 
 	baseFileName := filepath.Join(dir, fmt.Sprintf("%d", uint32(vid)))
 	datPath := baseFileName + ".dat"
-	_, err := b.DownloadFile(datPath, key, nil)
+	_, err := b.DownloadFile(datPath, key, nil, 0)
 	require.NoError(t, err)
 
 	require.NoError(t, erasure_coding.WriteSortedFileFromIdx(baseFileName, ".ecx"))
-	require.NoError(t, erasure_coding.WriteEcFiles(baseFileName))
+	_, ecErr := erasure_coding.WriteEcFiles(baseFileName, erasure_coding.BackgroundECContext())
+	require.NoError(t, ecErr)
 
 	for i := 0; i < erasure_coding.TotalShardsCount; i++ {
 		shardPath := fmt.Sprintf("%s.ec%02d", baseFileName, i)
@@ -335,7 +441,7 @@ func TestRemoteTier_ECEncodeDecode_AfterDownload(t *testing.T) {
 		shardPath := fmt.Sprintf("%s.ec%02d", baseFileName, i)
 		require.NoError(t, os.Remove(shardPath))
 	}
-	rebuilt, err := erasure_coding.RebuildEcFiles(baseFileName)
+	rebuilt, err := erasure_coding.RebuildEcFiles(baseFileName, erasure_coding.BackgroundECContext(), false)
 	require.NoError(t, err)
 	require.NotEmpty(t, rebuilt, "rebuild should report which parity shards were regenerated")
 	for i := erasure_coding.DataShardsCount; i < erasure_coding.TotalShardsCount; i++ {

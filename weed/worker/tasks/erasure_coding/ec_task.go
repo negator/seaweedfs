@@ -41,10 +41,21 @@ type ErasureCodingTask struct {
 	dataShards       int32
 	parityShards     int32
 	sourceDiskType   string                  // source volume's disk type, forwarded to Mount RPC (#9423)
+	encodeTsNs       int64                   // admin-issued encode generation; stamps the .vif and fences the stale-shard cleanup. 0 => unfenced (legacy/shell)
 	targets          []*worker_pb.TaskTarget // Unified targets for EC shards
 	sources          []*worker_pb.TaskSource // Unified sources for cleanup
 	shardAssignment  map[string][]string     // destination -> assigned shard types
 	readonlyReplicas []pb.ServerAddress      // replicas marked readonly, for rollback
+
+	// Replica servers whose original volume was an empty stub, deleted in the
+	// pre-distribute sweep. deleteOriginalVolume skips these so it does not
+	// re-delete and remove the now-EC .vif those servers share.
+	emptyReplicasDeleted map[string]bool
+
+	// encodedBlockSize is the shard block layout WriteEcFiles actually encoded
+	// with, read back off the EC context. Every holder must report serving the
+	// same one before the source volume may be deleted.
+	encodedBlockSize int64
 }
 
 // NewErasureCodingTask creates a new unified EC task instance
@@ -74,6 +85,7 @@ func (t *ErasureCodingTask) Execute(ctx context.Context, params *worker_pb.TaskP
 	t.dataShards = ecParams.DataShards
 	t.parityShards = ecParams.ParityShards
 	t.sourceDiskType = ecParams.SourceDiskType
+	t.encodeTsNs = ecParams.EncodeTsNs
 	t.workDir = ecParams.WorkingDir
 	t.targets = params.Targets // Get unified targets
 	t.sources = params.Sources // Get unified sources
@@ -119,7 +131,7 @@ func (t *ErasureCodingTask) Execute(ctx context.Context, params *worker_pb.TaskP
 	}
 	taskWorkDir := filepath.Join(baseWorkDir, fmt.Sprintf("vol_%d_%d", t.volumeID, time.Now().Unix()))
 	if err := os.MkdirAll(taskWorkDir, 0755); err != nil {
-		return fmt.Errorf("failed to create task working directory %s: %v", taskWorkDir, err)
+		return fmt.Errorf("failed to create task working directory %s: %w", taskWorkDir, err)
 	}
 	glog.V(1).Infof("Created working directory: %s", taskWorkDir)
 
@@ -150,6 +162,17 @@ func (t *ErasureCodingTask) Execute(ctx context.Context, params *worker_pb.TaskP
 		}
 	}()
 
+	// Step 0: Establish start-of-task invariants before any destructive step.
+	// Verify the plan is complete and clear EC shards left by a prior
+	// interrupted encode of this volume, so the encode begins from a clean
+	// slate. Failing here returns before the source is marked readonly or
+	// copied — nothing to roll back.
+	t.ReportProgressWithStage(5.0, "Verifying preconditions and clearing stale EC state")
+	t.GetLogger().Info("Verifying preconditions and clearing stale EC state")
+	if err := t.ensureCleanEcStart(ctx); err != nil {
+		return fmt.Errorf("EC preflight failed for volume %d: %w", t.volumeID, err)
+	}
+
 	// Step 1: Mark all replicas readonly, then reconcile them and select the most
 	// complete replica as the encode source. Encoding a stale replica and then
 	// deleting the originals would silently lose entries that exist only on another
@@ -160,11 +183,11 @@ func (t *ErasureCodingTask) Execute(ctx context.Context, params *worker_pb.TaskP
 	if err := t.markReplicasReadonly(ctx); err != nil {
 		// Marking can fail partway; restore the replicas already marked readonly.
 		t.rollbackReadonly(ctx)
-		return fmt.Errorf("failed to mark volume readonly: %v", err)
+		return fmt.Errorf("failed to mark volume readonly: %w", err)
 	}
 	if err := t.syncAndSelectSourceReplica(); err != nil {
 		t.rollbackReadonly(ctx)
-		return fmt.Errorf("failed to sync and select source replica: %v", err)
+		return fmt.Errorf("failed to sync and select source replica: %w", err)
 	}
 
 	// Step 2: Copy volume files to worker
@@ -178,7 +201,7 @@ func (t *ErasureCodingTask) Execute(ctx context.Context, params *worker_pb.TaskP
 	localFiles, err := t.copyVolumeFilesToWorker(ctx, taskWorkDir)
 	if err != nil {
 		t.rollbackReadonly(ctx)
-		return fmt.Errorf("failed to copy volume files: %v", err)
+		return fmt.Errorf("failed to copy volume files: %w", err)
 	}
 
 	// Step 3: Generate EC shards locally
@@ -187,31 +210,48 @@ func (t *ErasureCodingTask) Execute(ctx context.Context, params *worker_pb.TaskP
 	shardFiles, err := t.generateEcShardsLocally(localFiles, taskWorkDir)
 	if err != nil {
 		t.rollbackReadonly(ctx)
-		return fmt.Errorf("failed to generate EC shards: %v", err)
+		return fmt.Errorf("failed to generate EC shards: %w", err)
 	}
 
-	// Clear partial EC shards left over on destinations from a prior failed
-	// encode so distributeEcShards' ReceiveFile is not refused by the
-	// mounted-volume guard.
-	t.ReportProgressWithStage(55.0, "Clearing stale EC shards on destinations")
-	t.GetLogger().Info("Clearing stale EC shards on destinations")
-	if err := t.cleanupStaleEcShards(ctx); err != nil {
+	// Stale EC shards from a prior interrupted encode were already cleared in
+	// the Step 0 preflight, before the source was marked readonly. The admin
+	// dedupe key (erasure_coding:<vid>:<collection>) prevents a concurrent
+	// same-volume encode, so no destination can regain stale shards between
+	// the preflight and distributeEcShards below.
+
+	// Delete 0-byte stub replicas left by an interrupted encode before the new
+	// EC files land. A stub shares the <collection>_<vid>.vif path the EC
+	// volume will use; deleting it after distribute (in deleteOriginalVolume)
+	// would remove that .vif and damage the freshly written shards. OnlyEmpty
+	// keeps data-bearing replicas, which are deleted later after verify.
+	t.ReportProgressWithStage(57.0, "Removing empty stub replicas")
+	t.GetLogger().Info("Removing empty stub replicas before distribute")
+	if err := t.sweepEmptyReplicas(ctx); err != nil {
 		t.rollbackReadonly(ctx)
-		return fmt.Errorf("failed to clear stale EC shards on destinations: %v", err)
+		return fmt.Errorf("failed to remove empty stub replicas: %w", err)
 	}
 
-	// Step 4: Distribute shards to destinations
+	// Step 4: Distribute shards to destinations.
+	// From here on a failure has written shards to destinations. Until verify
+	// passes we are not committed to the EC copy, so a failure must roll the
+	// attempt back — tear down the shards it distributed and restore the
+	// sources to writable — otherwise a terminally-failed encode (a
+	// single-attempt job, or the last of a retry series, which has no successor
+	// to clean up at its Step 0 preflight) strands orphan shards and a source
+	// fenced readonly.
 	t.ReportProgressWithStage(60.0, "Distributing EC shards to destinations")
 	t.GetLogger().Info("Distributing EC shards to destinations")
 	if err := t.distributeEcShards(shardFiles); err != nil {
-		return fmt.Errorf("failed to distribute EC shards: %v", err)
+		t.rollbackDistribute(ctx)
+		return fmt.Errorf("failed to distribute EC shards: %w", err)
 	}
 
 	// Step 5: Mount EC shards
 	t.ReportProgressWithStage(80.0, "Mounting EC shards")
 	t.GetLogger().Info("Mounting EC shards")
 	if err := t.mountEcShards(); err != nil {
-		return fmt.Errorf("failed to mount EC shards: %v", err)
+		t.rollbackDistribute(ctx)
+		return fmt.Errorf("failed to mount EC shards: %w", err)
 	}
 
 	// Without this gate, a partial distribute/mount lets the next step
@@ -219,14 +259,18 @@ func (t *ErasureCodingTask) Execute(ctx context.Context, params *worker_pb.TaskP
 	t.ReportProgressWithStage(85.0, "Verifying EC shards across destinations")
 	t.GetLogger().Info("Verifying EC shards across destinations")
 	if err := t.verifyEcShardsBeforeDelete(ctx); err != nil {
+		t.rollbackDistribute(ctx)
 		return fmt.Errorf("EC shard verification failed; refusing to delete source volume %d: %w", t.volumeID, err)
 	}
+	// Past verify the EC copy is recoverable; a Step 7 failure must NOT tear the
+	// shards down — the remaining source replicas are cleaned by the next
+	// detection's cleanupOrphanSourceReplicas instead.
 
 	// Step 7: Delete original volume
 	t.ReportProgressWithStage(90.0, "Deleting original volume")
 	t.GetLogger().Info("Deleting original volume")
 	if err := t.deleteOriginalVolume(ctx); err != nil {
-		return fmt.Errorf("failed to delete original volume: %v", err)
+		return fmt.Errorf("failed to delete original volume: %w", err)
 	}
 
 	t.ReportProgressWithStage(100.0, "EC processing complete")
@@ -325,7 +369,10 @@ func (t *ErasureCodingTask) markReplicasReadonly(ctx context.Context) error {
 		addr := loc.ServerAddress()
 		err := operation.WithVolumeServerClient(false, addr, t.grpcDialOption,
 			func(client volume_server_pb.VolumeServerClient) error {
-				_, e := client.VolumeMarkReadonly(ctx, &volume_server_pb.VolumeMarkReadonlyRequest{VolumeId: t.volumeID})
+				// Persist the readonly mark so a source-server restart during or
+				// after encoding cannot silently reopen the volume to writes that
+				// the EC shards would not contain. rollbackReadonly clears it.
+				_, e := client.VolumeMarkReadonly(ctx, &volume_server_pb.VolumeMarkReadonlyRequest{VolumeId: t.volumeID, Persist: true})
 				return e
 			})
 		if err != nil {
@@ -393,7 +440,7 @@ func (t *ErasureCodingTask) copyVolumeFilesToWorker(ctx context.Context, workDir
 
 	fileStatus, err := t.readSourceVolumeFileStatus(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read source volume file status: %v", err)
+		return nil, fmt.Errorf("failed to read source volume file status: %w", err)
 	}
 
 	t.GetLogger().WithFields(map[string]interface{}{
@@ -409,7 +456,7 @@ func (t *ErasureCodingTask) copyVolumeFilesToWorker(ctx context.Context, workDir
 	// the .dat copy will include the new data but .idx won't reference it.
 	idxFile := filepath.Join(workDir, fmt.Sprintf("%d.idx", t.volumeID))
 	if err := t.copyFileFromSource(ctx, ".idx", idxFile, fileStatus.GetCompactionRevision(), fileStatus.GetIdxFileSize()); err != nil {
-		return nil, fmt.Errorf("failed to copy .idx file: %v", err)
+		return nil, fmt.Errorf("failed to copy .idx file: %w", err)
 	}
 	localFiles["idx"] = idxFile
 
@@ -425,7 +472,7 @@ func (t *ErasureCodingTask) copyVolumeFilesToWorker(ctx context.Context, workDir
 	// Copy .dat file SECOND — guaranteed to have at least as much data as .idx references.
 	datFile := filepath.Join(workDir, fmt.Sprintf("%d.dat", t.volumeID))
 	if err := t.copyFileFromSource(ctx, ".dat", datFile, fileStatus.GetCompactionRevision(), fileStatus.GetDatFileSize()); err != nil {
-		return nil, fmt.Errorf("failed to copy .dat file: %v", err)
+		return nil, fmt.Errorf("failed to copy .dat file: %w", err)
 	}
 	localFiles["dat"] = datFile
 
@@ -475,13 +522,13 @@ func (t *ErasureCodingTask) copyFileFromSource(ctx context.Context, ext, localPa
 				StopOffset:         stopOffset,
 			})
 			if err != nil {
-				return fmt.Errorf("failed to initiate file copy: %v", err)
+				return fmt.Errorf("failed to initiate file copy: %w", err)
 			}
 
 			// Create local file
 			localFile, err := os.Create(localPath)
 			if err != nil {
-				return fmt.Errorf("failed to create local file %s: %v", localPath, err)
+				return fmt.Errorf("failed to create local file %s: %w", localPath, err)
 			}
 			defer localFile.Close()
 
@@ -493,13 +540,13 @@ func (t *ErasureCodingTask) copyFileFromSource(ctx context.Context, ext, localPa
 					break
 				}
 				if err != nil {
-					return fmt.Errorf("failed to receive file data: %v", err)
+					return fmt.Errorf("failed to receive file data: %w", err)
 				}
 
 				if len(resp.FileContent) > 0 {
 					written, writeErr := localFile.Write(resp.FileContent)
 					if writeErr != nil {
-						return fmt.Errorf("failed to write to local file: %v", writeErr)
+						return fmt.Errorf("failed to write to local file: %w", writeErr)
 					}
 					totalBytes += int64(written)
 				}
@@ -532,17 +579,33 @@ func (t *ErasureCodingTask) generateEcShardsLocally(localFiles map[string]string
 	// Since they were copied as separate network transfers, the .idx may have
 	// entries pointing past the end of .dat if a write landed between the copies.
 	if err := verifyDatIdxConsistency(datFile, idxFile); err != nil {
-		return nil, fmt.Errorf("dat/idx consistency check failed: %v", err)
+		return nil, fmt.Errorf("dat/idx consistency check failed: %w", err)
 	}
 
 	// Generate .ecx file from .idx BEFORE EC shards to prevent inconsistency.
 	if err := erasure_coding.WriteSortedFileFromIdx(baseName, ".ecx"); err != nil {
-		return nil, fmt.Errorf("failed to generate .ecx file: %v", err)
+		return nil, fmt.Errorf("failed to generate .ecx file: %w", err)
 	}
 
 	// Generate EC shard files (.ec00 ~ .ec13)
-	if err := erasure_coding.WriteEcFiles(baseName); err != nil {
-		return nil, fmt.Errorf("failed to generate EC shard files: %v", err)
+	ecCtx := erasure_coding.BackgroundECContext()
+	ecBitrot, err := erasure_coding.WriteEcFiles(baseName, ecCtx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate EC shard files: %w", err)
+	}
+	// The layout the shards were actually written in, for the holder agreement
+	// check before the source is deleted.
+	t.encodedBlockSize = ecCtx.BlockSize
+	// Persist the bitrot checksum sidecar (generation 0) alongside the shards so
+	// it travels with them during distribution. Protection was asked for, and
+	// this write is orders of magnitude smaller than the shards that just
+	// landed: if it fails the disk is in trouble, and continuing would delete
+	// the source replicas in exchange for a generation that is both unprotected
+	// and missing the geometry record the .vif fallback reads.
+	if erasure_coding.BitrotProtectionEnabled && ecBitrot != nil {
+		if serr := erasure_coding.SaveBitrotSidecar(erasure_coding.BitrotSidecarPath(baseName, 0), ecBitrot); serr != nil {
+			return nil, fmt.Errorf("write EC bitrot sidecar for %s: %w", baseName, serr)
+		}
 	}
 
 	// Collect generated shard file paths and log details
@@ -590,22 +653,76 @@ func (t *ErasureCodingTask) generateEcShardsLocally(localFiles map[string]string
 		}).Info("EC journal file generated")
 	}
 
-	// Generate .vif file (volume info)
+	// Always stamp the encode identity into the .vif so the read guard stays on.
+	// The ratio is the resolved one from the encoder's protection, defaulting to
+	// the context this path encodes with (not t.dataShards, which this path does
+	// not pass to the encoder).
 	vifFile := baseName + ".vif"
-	volumeInfo := &volume_server_pb.VolumeInfo{
-		Version: uint32(needle.GetCurrentVersion()),
+	defaultCtx := erasure_coding.NewDefaultECContext("", 0)
+	// Use the admin-issued generation when present so the distributed .vif carries
+	// the same generation the stale-shard cleanup fences on; fall back to a local
+	// timestamp only for the unfenced legacy/shell path (keeps the read guard on).
+	encodeTsNs := t.encodeTsNs
+	if encodeTsNs == 0 {
+		encodeTsNs = time.Now().UnixNano()
 	}
-	if err := volume_info.SaveVolumeInfo(vifFile, volumeInfo); err != nil {
-		glog.Warningf("Failed to create .vif file: %v", err)
+	ecShardConfig := &volume_server_pb.EcShardConfig{
+		DataShards:   uint32(defaultCtx.DataShards),
+		ParityShards: uint32(defaultCtx.ParityShards),
+		EncodeTsNs:   encodeTsNs,
+	}
+	if ecBitrot != nil && ecBitrot.EcShardConfig != nil {
+		ecShardConfig.DataShards = ecBitrot.EcShardConfig.DataShards
+		ecShardConfig.ParityShards = ecBitrot.EcShardConfig.ParityShards
+		ecShardConfig.BlockSize = ecBitrot.EcShardConfig.BlockSize
+	}
+	volumeInfo := &volume_server_pb.VolumeInfo{
+		Version:       uint32(needle.GetCurrentVersion()),
+		EcShardConfig: ecShardConfig,
+	}
+	// The decoder resolves the shard block layout from the encode-time .dat
+	// size; without it, decoding falls back to inferring the layout from the
+	// shard size, which is ambiguous when that is a large-block multiple.
+	if info, err := os.Stat(datFile); err == nil {
+		volumeInfo.DatFileSize = info.Size()
 	} else {
-		shardFiles["vif"] = vifFile
-		if info, err := os.Stat(vifFile); err == nil {
-			t.GetLogger().WithFields(map[string]interface{}{
-				"file_type":  "vif",
-				"file_path":  vifFile,
-				"size_bytes": info.Size(),
-			}).Info("Volume info file generated")
-		}
+		glog.Warningf("stat %s for .vif dat file size: %v", datFile, err)
+	}
+	// The .vif carries the shard block layout the holders will read through, so
+	// neither the write nor the inclusion below is optional: an encode that
+	// distributed shards without it would leave every reader falling back to
+	// the legacy layout, and the task deletes the source replicas afterwards.
+	if err := volume_info.SaveVolumeInfo(vifFile, volumeInfo); err != nil {
+		return nil, fmt.Errorf("write %s: %w", vifFile, err)
+	}
+	vifInfo, err := os.Stat(vifFile)
+	if err != nil {
+		return nil, fmt.Errorf("stat %s for distribution: %w", vifFile, err)
+	}
+	shardFiles["vif"] = vifFile
+	t.GetLogger().WithFields(map[string]interface{}{
+		"file_type":  "vif",
+		"file_path":  vifFile,
+		"size_bytes": vifInfo.Size(),
+	}).Info("Volume info file generated")
+
+	// Add the generation-0 bitrot checksum sidecar so it is distributed with
+	// the shards (DistributeEcShards only ships files present in shardFiles).
+	// Strict when protection is enabled and the encoder produced a manifest —
+	// the write above already failed the encode otherwise — so the holders
+	// cannot end up with shards whose checksums stayed behind on the worker.
+	ecsumFile := erasure_coding.BitrotSidecarPath(baseName, 0)
+	ecsumInfo, ecsumErr := os.Stat(ecsumFile)
+	if ecsumErr != nil && erasure_coding.BitrotProtectionEnabled && ecBitrot != nil {
+		return nil, fmt.Errorf("stat %s for distribution: %w", ecsumFile, ecsumErr)
+	}
+	if ecsumErr == nil {
+		shardFiles["ecsum"] = ecsumFile
+		t.GetLogger().WithFields(map[string]interface{}{
+			"file_type":  "ecsum",
+			"file_path":  ecsumFile,
+			"size_bytes": ecsumInfo.Size(),
+		}).Info("EC bitrot checksum sidecar generated")
 	}
 
 	// Log summary of generation
@@ -654,7 +771,8 @@ func (t *ErasureCodingTask) verifyEcShardsBeforeDelete(ctx context.Context) erro
 		"per_server":    summary,
 	}).Info("EC shard inventory before source deletion")
 
-	if err := erasure_coding.RequireFullShardSet(t.volumeID, union, totalShards); err != nil {
+	degraded, err := erasure_coding.RequireRecoverableShardSet(t.volumeID, union, int(t.dataShards), totalShards)
+	if err != nil {
 		t.GetLogger().WithFields(map[string]interface{}{
 			"volume_id":  t.volumeID,
 			"per_server": summary,
@@ -662,6 +780,31 @@ func (t *ErasureCodingTask) verifyEcShardsBeforeDelete(ctx context.Context) erro
 		}).Error("EC shard verification failed — source volume will be kept")
 		return err
 	}
+	if degraded {
+		// Enough shards to reconstruct; the missing ones can be rebuilt from
+		// the survivors, while keeping the source next to live shards is the
+		// more dangerous mixed state.
+		t.GetLogger().WithFields(map[string]interface{}{
+			"volume_id":    t.volumeID,
+			"shards_seen":  union.Count(),
+			"shards_total": totalShards,
+			"per_server":   summary,
+		}).Warning("EC shard set incomplete but recoverable; proceeding with source deletion")
+	}
+
+	// Before anything irreversible: every holder that answered must report
+	// serving the layout these shards were encoded in. A holder too old to
+	// know the uniform layout mounts them as legacy and returns wrong bytes,
+	// and the source volume is the only remaining correct copy.
+	if err := erasure_coding.RequireAgreedBlockLayout(t.volumeID, t.encodedBlockSize, perServer); err != nil {
+		t.GetLogger().WithFields(map[string]interface{}{
+			"volume_id":  t.volumeID,
+			"per_server": summary,
+			"error":      err.Error(),
+		}).Error("EC holders disagree on the shard block layout — source volume will be kept")
+		return err
+	}
+
 	return nil
 }
 
@@ -673,6 +816,14 @@ func (t *ErasureCodingTask) deleteOriginalVolume(ctx context.Context) error {
 	if len(replicas) == 0 {
 		glog.Warningf("No replicas found for volume %d, falling back to source server only", t.volumeID)
 		replicas = []string{t.server}
+	}
+
+	// Empty stub replicas were already removed before distribute; skip them so
+	// VolumeDelete does not run on a server that now holds only EC shards.
+	replicas = replicasPendingDelete(replicas, t.emptyReplicasDeleted)
+	if len(replicas) == 0 {
+		glog.V(0).Infof("EC volume %d: all original replicas were empty stubs removed before distribute", t.volumeID)
+		return nil
 	}
 
 	t.GetLogger().WithFields(map[string]interface{}{
@@ -762,16 +913,159 @@ func (t *ErasureCodingTask) getReplicas() []string {
 	return replicas
 }
 
-// cleanupStaleEcShards unmounts and deletes any EC shards still mounted on
-// destinations from a previous failed encode of this volume. Targets every
-// node we plan to write to (t.targets) plus every node detection saw EC
-// shards on (t.sources with ShardIds set), and issues the cleanup over the
-// full shard range so a stale topology snapshot — or shards landed by a
-// prior attempt that haven't heartbeated yet — cannot leave the
-// mounted-volume guard tripped during distributeEcShards. Safe by ordering:
-// runs after the source .dat is in the worker's workdir and a full local
-// shard set is generated. Per-destination errors are aggregated, not
-// short-circuited.
+// sweepEmptyReplicas deletes any original replica that is an empty 0-byte stub
+// (OnlyEmpty so a data-bearing replica is refused and kept for the post-verify
+// delete). Run before distribute: a stub shares the <collection>_<vid>.vif the
+// EC volume reuses, so removing it afterwards would strip that .vif. Servers
+// whose stub was deleted are recorded so deleteOriginalVolume skips them.
+//
+// A refusal (volume not empty) or an already-gone volume is expected and left
+// for the later delete. Any other error means the node's state is unknown; we
+// fail rather than proceed to distribute and a force-delete that could strip a
+// shared .vif.
+func (t *ErasureCodingTask) sweepEmptyReplicas(ctx context.Context) error {
+	for _, node := range t.getReplicas() {
+		err := operation.WithVolumeServerClient(false, pb.ServerAddress(node), t.grpcDialOption,
+			func(client volume_server_pb.VolumeServerClient) error {
+				_, e := client.VolumeDelete(ctx, &volume_server_pb.VolumeDeleteRequest{
+					VolumeId:  t.volumeID,
+					OnlyEmpty: true,
+				})
+				return e
+			})
+		switch {
+		case err == nil:
+			if t.emptyReplicasDeleted == nil {
+				t.emptyReplicasDeleted = make(map[string]bool)
+			}
+			t.emptyReplicasDeleted[node] = true
+			glog.V(0).Infof("EC volume %d: removed empty stub replica on %s before distribute", t.volumeID, node)
+		case isExpectedSweepSkip(err):
+			glog.V(1).Infof("EC volume %d: empty-replica sweep left %s in place: %v", t.volumeID, node, err)
+		default:
+			return fmt.Errorf("empty-replica sweep on %s: %w", node, err)
+		}
+	}
+	return nil
+}
+
+// isExpectedSweepSkip reports whether a VolumeDelete(OnlyEmpty) error is the
+// expected leave-in-place case: the replica still holds data (refused) or no
+// longer exists. Other errors (e.g. an unreachable node) leave its state
+// unknown and must not be swallowed.
+func isExpectedSweepSkip(err error) bool {
+	s := err.Error()
+	return strings.Contains(s, "volume not empty") || strings.Contains(s, "not found")
+}
+
+// replicasPendingDelete returns replicas not already removed by the
+// pre-distribute empty-stub sweep.
+func replicasPendingDelete(replicas []string, alreadyDeleted map[string]bool) []string {
+	if len(alreadyDeleted) == 0 {
+		return replicas
+	}
+	pending := make([]string, 0, len(replicas))
+	for _, r := range replicas {
+		if alreadyDeleted[r] {
+			continue
+		}
+		pending = append(pending, r)
+	}
+	return pending
+}
+
+// ensureCleanEcStart runs first, before any destructive step, to establish
+// the invariants a fresh encode depends on:
+//   - a target set exists: an empty or malformed plan must fail here, not
+//     after the source has been marked readonly and copied;
+//   - a source replica exists to encode from;
+//   - no EC shards from a prior interrupted encode of this volume survive on
+//     the nodes this task will touch. Leftover partial shards trip the
+//     mounted-volume guard in distributeEcShards' ReceiveFile, are loaded as
+//     orphans on the next volume-server restart, and make detection refuse the
+//     volume ("Manual intervention required"). cleanupStaleEcShards blanket-
+//     wipes this volume's EC state on every touched node regardless of shard
+//     generation (a retried attempt's shards share this job's encodeTsNs, and
+//     an interrupted distribute often leaves shards with an unreadable
+//     generation — a fenced teardown would strand both).
+//
+// Cleaning at the start (rather than just before distribute) means the encode
+// begins from a clean slate and a preflight failure leaves the source
+// untouched — there is nothing to roll back. It is safe to delete stale shards
+// this early: the source's regular replica still holds the data until the
+// post-verify delete in Step 7.
+func (t *ErasureCodingTask) ensureCleanEcStart(ctx context.Context) error {
+	if len(t.targets) == 0 {
+		return fmt.Errorf("no EC shard targets for volume %d; refusing to mark source readonly", t.volumeID)
+	}
+	// A non-empty slice is not enough: a target with an empty Node (or no
+	// assigned shards) is silently skipped by cleanupStaleEcShards and by
+	// distributeEcShards, so a plan of only such entries would pass the length
+	// check and mark the source readonly before failing. Reject any malformed
+	// target here, before the first destructive step.
+	for i, target := range t.targets {
+		if target == nil || target.Node == "" || len(target.ShardIds) == 0 {
+			return fmt.Errorf("malformed EC shard target %d for volume %d; refusing to mark source readonly", i, t.volumeID)
+		}
+	}
+	if t.server == "" && len(t.getReplicas()) == 0 {
+		return fmt.Errorf("no source replica for volume %d", t.volumeID)
+	}
+	return t.cleanupStaleEcShards(ctx)
+}
+
+// rollbackDistribute undoes a failed attempt that had already begun writing EC
+// shards to destinations but had not yet committed to the EC copy (verify not
+// passed, so the sources are intact). It tears down the shards this attempt
+// distributed and restores the sources to writable, so a terminally-failed
+// encode — a single-attempt job, or the last of a retry series — leaves no
+// orphan shards and no source stuck readonly. On a retry the next attempt's
+// Step 0 preflight would also clear the shards, but the final attempt has no
+// successor; this makes every post-distribute failure self-cleaning.
+// cleanupStaleEcShards blanket-wipes this volume's EC state regardless of shard
+// generation — necessary because an interrupted distribute leaves shards whose
+// .vif generation is unreadable, which a fenced teardown would preserve.
+// Best-effort and uses a fresh context since the caller's may already be
+// cancelled (the very failure that brought us here).
+func (t *ErasureCodingTask) rollbackDistribute(_ context.Context) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := t.cleanupStaleEcShards(ctx); err != nil {
+		// The teardown could not fully clear this volume's EC shards (e.g. an
+		// unreachable destination, or a shard that failed to unmount). Leave the
+		// source readonly rather than expose it for writes while stale shards
+		// linger: a writable source beside mounted stale shards would let reads
+		// and writes diverge, and orphan cleanup will not remove a writable
+		// source. The next encode's Step 0 preflight (or an operator) reconciles
+		// the state once the shards are reachable.
+		glog.Warningf("rollback: EC shard teardown incomplete for volume %d; leaving source readonly for reconciliation: %v", t.volumeID, err)
+		return
+	}
+	t.rollbackReadonly(ctx)
+}
+
+// cleanupStaleEcShards unmounts and deletes any EC shards for this volume on
+// destinations from a previous failed encode. Targets every node we plan to
+// write to (t.targets) plus every node detection saw EC shards on (t.sources
+// with ShardIds set), and issues the cleanup over the full shard range so a
+// stale topology snapshot — or shards landed by a prior attempt that haven't
+// heartbeated yet — cannot leave the mounted-volume guard tripped during
+// distributeEcShards. Called from the Step 0 preflight (ensureCleanEcStart) and
+// from rollbackDistribute.
+//
+// Teardown is UNFENCED (encodeTsNs=0 -> the server's blanket teardown), which
+// wipes every EC artifact for this volume on every disk regardless of
+// generation. A generation fence is wrong here for two reasons: (1) a retried
+// encode's prior attempt shares this job's encodeTsNs, and the server's fence
+// preserves same-or-newer, so a fenced teardown would strand it; (2) shards
+// left by an interrupted distribute often have an UNREADABLE .vif generation
+// (the sidecar never landed), which the fence also preserves. This is a
+// pre-encode / rollback wipe of a volume we are (re)encoding or abandoning, so
+// clearing all of its EC state is correct — the admin dedupe key
+// (erasure_coding:<vid>:<collection>) guarantees no concurrent newer encode of
+// this volume, and the blanket teardown's own replacement check aborts rather
+// than clobber a live newer mount. This mirrors the shell ec.encode pre-encode
+// cleanup. Per-destination errors are aggregated, not short-circuited.
 func (t *ErasureCodingTask) cleanupStaleEcShards(ctx context.Context) error {
 	nodes := make(map[string]struct{})
 	for _, source := range t.sources {
@@ -800,7 +1094,10 @@ func (t *ErasureCodingTask) cleanupStaleEcShards(ctx context.Context) error {
 			"shard_ids":   allShards,
 		}).Info("Clearing stale EC shards on destination before re-distribute")
 
-		if err := unmountAndDeleteEcShards(ctx, t.grpcDialOption, node, t.volumeID, t.collection, allShards); err != nil {
+		// encodeTsNs=0 selects the server's blanket (generation-independent)
+		// teardown; see erasure_coding.UnmountAndDeleteEcShards for why the
+		// fence is intentionally not used here.
+		if err := erasure_coding.UnmountAndDeleteEcShards(ctx, t.grpcDialOption, pb.ServerAddress(node), t.collection, t.volumeID, allShards, 0); err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Sprintf("%s: %v", node, err))
 			t.GetLogger().WithFields(map[string]interface{}{
 				"volume_id":   t.volumeID,
@@ -835,62 +1132,32 @@ func fullShardIdRange(dataShards, parityShards int32) []uint32 {
 	return ids
 }
 
-// unmountAndDeleteEcShards unmounts then deletes the named shards on one
-// destination. Unmount must precede delete (delete requires the shard be
-// unmounted); both RPCs are idempotent against missing shards.
-func unmountAndDeleteEcShards(
-	ctx context.Context,
-	dialOption grpc.DialOption,
-	destination string,
-	volumeID uint32,
-	collection string,
-	shardIds []uint32,
-) error {
-	return operation.WithVolumeServerClient(false, pb.ServerAddress(destination), dialOption,
-		func(client volume_server_pb.VolumeServerClient) error {
-			if _, err := client.VolumeEcShardsUnmount(ctx, &volume_server_pb.VolumeEcShardsUnmountRequest{
-				VolumeId: volumeID,
-				ShardIds: shardIds,
-			}); err != nil {
-				return fmt.Errorf("unmount: %w", err)
-			}
-			if _, err := client.VolumeEcShardsDelete(ctx, &volume_server_pb.VolumeEcShardsDeleteRequest{
-				VolumeId:   volumeID,
-				Collection: collection,
-				ShardIds:   shardIds,
-			}); err != nil {
-				return fmt.Errorf("delete: %w", err)
-			}
-			return nil
-		})
-}
-
 // verifyDatIdxConsistency checks that all .idx entries reference data within the
 // .dat file. Since .dat and .idx are copied as separate network transfers, the
 // .idx may have entries from writes that landed after the .dat was copied.
 func verifyDatIdxConsistency(datFile, idxFile string) error {
 	datInfo, err := os.Stat(datFile)
 	if err != nil {
-		return fmt.Errorf("stat dat file: %v", err)
+		return fmt.Errorf("stat dat file: %w", err)
 	}
 	datSize := datInfo.Size()
 
 	// Read volume version from superblock to compute actual needle sizes
 	df, err := os.Open(datFile)
 	if err != nil {
-		return fmt.Errorf("open dat file: %v", err)
+		return fmt.Errorf("open dat file: %w", err)
 	}
 	defer df.Close()
 
 	versionBytes := make([]byte, 1)
 	if _, err := df.ReadAt(versionBytes, 0); err != nil {
-		return fmt.Errorf("read version byte: %v", err)
+		return fmt.Errorf("read version byte: %w", err)
 	}
 	version := needle.Version(versionBytes[0])
 
 	idxF, err := os.Open(idxFile)
 	if err != nil {
-		return fmt.Errorf("open idx file: %v", err)
+		return fmt.Errorf("open idx file: %w", err)
 	}
 	defer idxF.Close()
 
@@ -910,7 +1177,7 @@ func verifyDatIdxConsistency(datFile, idxFile string) error {
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("walk idx file: %v", err)
+		return fmt.Errorf("walk idx file: %w", err)
 	}
 
 	if maxEnd > datSize {

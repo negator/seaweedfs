@@ -18,6 +18,7 @@ import (
 type AccountManager interface {
 	GetAccountNameById(canonicalId string) string
 	GetAccountIdByEmail(email string) string
+	GetAccountIdByIdentityName(name string) string
 }
 
 // ExtractAcl extracts the acl from the request body, or from the header if request body is empty
@@ -308,15 +309,57 @@ func ValidateAndTransferGrants(accountManager AccountManager, grants []*s3.Grant
 	return result, s3err.ErrNone
 }
 
+// buildAccessControlList converts stored ACP grants into the XML response form.
+// When no grants are stored it falls back to a single full-control grant for the
+// owner, matching AWS's default private ACL.
+func buildAccessControlList(accountManager AccountManager, grants []*s3.Grant, ownerId, ownerDisplayName string) AccessControlList {
+	if len(grants) == 0 {
+		return AccessControlList{Grant: []Grant{{
+			Grantee: Grantee{
+				ID:          ownerId,
+				DisplayName: ownerDisplayName,
+				Type:        "CanonicalUser",
+				XMLXSI:      "CanonicalUser",
+				XMLNS:       "http://www.w3.org/2001/XMLSchema-instance",
+			},
+			Permission: Permission(s3_constants.PermissionFullControl),
+		}}}
+	}
+
+	var acl AccessControlList
+	for _, grant := range grants {
+		localGrant := Grant{Permission: Permission(*grant.Permission)}
+		if grant.Grantee != nil {
+			localGrant.Grantee = Grantee{
+				Type:   *grant.Grantee.Type,
+				XMLXSI: *grant.Grantee.Type,
+				XMLNS:  "http://www.w3.org/2001/XMLSchema-instance",
+			}
+			if grant.Grantee.ID != nil {
+				localGrant.Grantee.ID = *grant.Grantee.ID
+				localGrant.Grantee.DisplayName = accountManager.GetAccountNameById(*grant.Grantee.ID)
+			}
+			if grant.Grantee.URI != nil {
+				localGrant.Grantee.URI = *grant.Grantee.URI
+			}
+		}
+		acl.Grant = append(acl.Grant, localGrant)
+	}
+	return acl
+}
+
 // GetAcpGrants return grants parsed from entry
 func GetAcpGrants(entryExtended map[string][]byte) []*s3.Grant {
-	acpBytes, ok := entryExtended[s3_constants.ExtAmzAclKey]
-	if ok && len(acpBytes) > 0 {
-		var grants []*s3.Grant
-		err := json.Unmarshal(acpBytes, &grants)
-		if err == nil {
-			return grants
-		}
+	return parseAclGrants(entryExtended[s3_constants.ExtAmzAclKey])
+}
+
+func parseAclGrants(acpBytes []byte) []*s3.Grant {
+	if len(acpBytes) == 0 {
+		return nil
+	}
+	var grants []*s3.Grant
+	if err := json.Unmarshal(acpBytes, &grants); err == nil {
+		return grants
 	}
 	return nil
 }

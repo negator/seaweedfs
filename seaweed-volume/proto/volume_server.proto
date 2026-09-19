@@ -45,6 +45,8 @@ service VolumeServer {
     }
     rpc VolumeUnmount (VolumeUnmountRequest) returns (VolumeUnmountResponse) {
     }
+    rpc VolumeConsolidateIndex (VolumeConsolidateIndexRequest) returns (VolumeConsolidateIndexResponse) {
+    }
     rpc VolumeDelete (VolumeDeleteRequest) returns (VolumeDeleteResponse) {
     }
     rpc VolumeMarkReadonly (VolumeMarkReadonlyRequest) returns (VolumeMarkReadonlyResponse) {
@@ -234,6 +236,7 @@ message VolumeIncrementalCopyResponse {
 
 message VolumeMountRequest {
     uint32 volume_id = 1;
+    optional string collection = 2;
 }
 message VolumeMountResponse {
 }
@@ -242,6 +245,12 @@ message VolumeUnmountRequest {
     uint32 volume_id = 1;
 }
 message VolumeUnmountResponse {
+}
+
+message VolumeConsolidateIndexRequest {
+    uint32 volume_id = 1;
+}
+message VolumeConsolidateIndexResponse {
 }
 
 message VolumeDeleteRequest {
@@ -257,6 +266,8 @@ message VolumeDeleteResponse {
 message VolumeMarkReadonlyRequest {
     uint32 volume_id = 1;
     bool persist = 2;
+    // reject writes but keep accepting deletes, so expiring data can drain the volume
+    bool can_delete = 3;
 }
 message VolumeMarkReadonlyResponse {
 }
@@ -343,6 +354,13 @@ message ReceiveFileInfo {
     uint32 shard_id = 5;
     uint64 file_size = 6;
     uint32 disk_id = 7;  // EC shard disk; 0 = auto-select (see VolumeEcShardsCopyRequest.disk_id)
+
+    // Field numbers 8-11 are reserved for versioned-EC; disk_type stays at 12.
+    // Staged-new-volume mode (EC decode onto a clean peer): set on a non-EC push
+    // whose volume does not yet exist on this server. The server picks a disk
+    // location of this medium with a free slot and writes <base><ext>.copying,
+    // finalized by VolumeEcShardsToVolume(from_staged).
+    string disk_type = 12;
 }
 
 message ReceiveFileResponse {
@@ -442,6 +460,7 @@ message VolumeEcShardsCopyRequest {
     bool copy_ecj_file = 6;
     bool copy_vif_file = 7;
     uint32 disk_id = 8;  // Target disk ID for storing EC shards
+    bool copy_ecsum_file = 9; // copy the bitrot checksum sidecar (.ecsum) when present; tolerant of a missing source (no-op), since this non-2PC path has no Prepare backstop
 }
 message VolumeEcShardsCopyResponse {
 }
@@ -450,8 +469,11 @@ message VolumeEcShardsDeleteRequest {
     uint32 volume_id = 1;
     string collection = 2;
     repeated uint32 shard_ids = 3;
+    bool full_teardown = 4; // pre-encode cleanup: wipe every EC artifact + generation for this volume, not just shard_ids
+    int64 encode_ts_ns = 5; // full_teardown generation fence: delete only a disk whose .vif generation is strictly OLDER than this; preserve same-or-newer, generation 0, and an unreadable .vif. 0 => wipe-all (shell pre-encode / pre-upgrade)
 }
 message VolumeEcShardsDeleteResponse {
+    bool full_teardown_done = 1; // set by a new server that performed full_teardown; absent from an old server lets the caller detect the silent no-op
 }
 
 message VolumeEcShardsMountRequest {
@@ -459,6 +481,7 @@ message VolumeEcShardsMountRequest {
     string collection = 2;
     repeated uint32 shard_ids = 3;
     string source_disk_type = 4; // disk type of the source volume, applied to the in-memory EC volume so heartbeats report under it (#9423)
+    bool recover_missing_index = 5; // first fetch a missing .ecx index from a peer so on-disk shards without a local index become mountable (#10104)
 }
 message VolumeEcShardsMountResponse {
 }
@@ -466,6 +489,7 @@ message VolumeEcShardsMountResponse {
 message VolumeEcShardsUnmountRequest {
     uint32 volume_id = 1;
     repeated uint32 shard_ids = 3;
+    int64 encode_ts_ns = 4; // generation fence: skip a disk whose mounted EC volume is this generation or newer (0 = unfenced, unmount all)
 }
 message VolumeEcShardsUnmountResponse {
 }
@@ -476,10 +500,13 @@ message VolumeEcShardReadRequest {
     int64 offset = 3;
     int64 size = 4;
     uint64 file_key = 5;
+    reserved 6;
+    int64 encode_ts_ns = 7; // caller's expected encode time; the server rejects a shard from a different encode run
 }
 message VolumeEcShardReadResponse {
     bytes data = 1;
     bool is_deleted = 2;
+    int64 encode_ts_ns = 3; // identity of the shard actually served; client rejects a mismatch (0 = pre-upgrade server)
 }
 
 message VolumeEcBlobDeleteRequest {
@@ -494,6 +521,13 @@ message VolumeEcBlobDeleteResponse {
 message VolumeEcShardsToVolumeRequest {
     uint32 volume_id = 1;
     string collection = 2;
+    // Staged mode: the caller already decoded the EC shards off-box and pushed
+    // .dat/.idx/.vif as <base><ext>.copying to this server (ReceiveFile
+    // staged-new-volume mode). Adopt them as a normal volume instead of decoding
+    // local EC shards in place, so <vid> is never registered as both EC and
+    // normal on one disk.
+    bool from_staged = 3;
+    string disk_type = 4; // target medium's disk location for the normal volume (staged mode)
 }
 message VolumeEcShardsToVolumeResponse {
 }
@@ -506,6 +540,7 @@ message VolumeEcShardsInfoResponse {
     uint64 volume_size = 2;
     uint64 file_count = 3;
     uint64 file_deleted_count = 4;
+    EcShardConfig ec_shard_config = 10;  // the layout this holder serves reads through; a binary predating a field reports it as unset
 }
 
 message EcShardInfo {
@@ -571,12 +606,38 @@ message VolumeInfo {
     uint64 expire_at_sec = 6; // expiration time of ec volume
     bool read_only = 7;
     EcShardConfig ec_shard_config = 8; // EC shard configuration (optional, null = use default 10+4)
+    bool read_only_can_delete = 9; // with read_only: writes are rejected but deletes still land
 }
 
 // EcShardConfig specifies erasure coding shard configuration
 message EcShardConfig {
     uint32 data_shards = 1;   // Number of data shards (e.g., 10)
     uint32 parity_shards = 2; // Number of parity shards (e.g., 4)
+    int64 encode_ts_ns = 3;   // encode time (unix nanos); a read served from a shard of a different encode run is rejected
+    int64 block_size = 4;     // uniform block layout: each shard is a single contiguous block of this many bytes; 0 = legacy 1GiB/1MiB two-tier layout
+}
+// EcBitrotProtection is the entire content of a bitrot checksum sidecar
+// (<base>.ecsum for the legacy generation, <base>.ecsum.v<N> for vacuum
+// generation N): per-shard, per-block CRC32C so a CHECKSUM scrub can detect
+// silent bit rot in any shard (including parity) without decoding. Field
+// numbers and types match weed/pb/volume_server.proto byte-for-byte so the
+// serialized sidecar payload is wire-identical across the Go and Rust binaries.
+message EcBitrotProtection {
+    ChecksumAlgorithm algorithm = 1;       // CRC32C (Castagnoli)
+    uint32 block_size = 2;                  // bytes per checksum block; default 16777216 (16 MiB), a power-of-two multiple of 1 MiB
+    uint32 generation = 3;                  // EC vacuum generation these checksums describe (0 = legacy/fresh); must match the sidecar filename version
+    EcShardConfig ec_shard_config = 4;      // data/parity shard counts at encode time
+    repeated EcShardChecksums shards = 5;   // one entry per shard id in the active layout
+    bytes encode_uuid = 6;                  // random per-encode identity, for stale-sidecar detection across in-place re-encodes
+}
+message EcShardChecksums {
+    uint32 shard_id = 1;     // 0..MaxShardCount-1 (custom EC ratios go up to 32)
+    int64 covered_size = 2;  // shard byte length these checksums cover (must equal the on-disk shard length)
+    bytes block_crc32c = 3;  // packed little-endian uint32[] = ceil(covered_size/block_size) entries
+}
+enum ChecksumAlgorithm {
+    CHECKSUM_NONE = 0;
+    CHECKSUM_CRC32C = 1;
 }
 message OldVersionVolumeInfo {
     repeated RemoteFile files = 1;
@@ -655,6 +716,8 @@ enum VolumeScrubMode {
     INDEX = 1;
     FULL = 2;
     LOCAL = 3;
+    CHECKSUM = 4; // EC only: verify each local shard's raw bytes against the bitrot checksum sidecar
+    READS = 5;    // like FULL, but EC intervals no shard can serve are reconstructed from parity
 }
 
 message ScrubVolumeRequest {
@@ -674,6 +737,7 @@ message ScrubEcVolumeRequest {
     VolumeScrubMode mode = 1;
     // optional list of volume IDs to scrub. if empty, all EC volumes for the server are scrubbed.
     repeated uint32 volume_ids = 2;
+    bool force_deleted_needles_check = 3; // FULL mode only; may report false positives when EC indexes disagree
 }
 message ScrubEcVolumeResponse {
     uint64 total_volumes = 1;

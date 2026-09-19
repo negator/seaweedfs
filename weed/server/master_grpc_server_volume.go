@@ -3,7 +3,6 @@ package weed_server
 import (
 	"context"
 	"fmt"
-	"math"
 	"math/rand/v2"
 	"strings"
 	"sync"
@@ -16,6 +15,7 @@ import (
 	"github.com/seaweedfs/raft"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
@@ -42,9 +42,7 @@ func (ms *MasterServer) DoAutomaticVolumeGrow(req *topology.VolumeGrowRequest) {
 		glog.V(1).Infof("automatic volume grow failed: %+v", err)
 		return
 	}
-	for _, newVidLocation := range newVidLocations {
-		ms.broadcastToClients(&master_pb.KeepConnectedResponse{VolumeLocation: newVidLocation})
-	}
+	ms.broadcastVolumeLocationsToClients(newVidLocations)
 }
 
 func (ms *MasterServer) ProcessGrowRequest() {
@@ -71,8 +69,10 @@ func (ms *MasterServer) ProcessGrowRequest() {
 				writable, crowded := vl.GetWritableVolumeCount()
 				mustGrow := int(lastGrowCount) - writable
 				vgr := vlc.ToVolumeGrowRequest()
+				underReplicated := vl.CountUnderReplicatedVolumes()
 				stats.MasterVolumeLayoutWritable.WithLabelValues(vlc.Collection, vgr.DiskType, vgr.Replication, vgr.Ttl).Set(float64(writable))
 				stats.MasterVolumeLayoutCrowded.WithLabelValues(vlc.Collection, vgr.DiskType, vgr.Replication, vgr.Ttl).Set(float64(crowded))
+				stats.MasterUnderReplicatedVolumes.WithLabelValues(vlc.Collection, vgr.DiskType, vgr.Replication, vgr.Ttl).Set(float64(underReplicated))
 
 				switch {
 				case mustGrow > 0:
@@ -91,22 +91,12 @@ func (ms *MasterServer) ProcessGrowRequest() {
 				if err != nil {
 					glog.V(0).Infof("volume grow request failed: %+v", err)
 				}
-				writableVolumes := vl.CloneWritableVolumes()
-				for dcId, racks := range dcs {
-					for _, rackId := range racks {
-						if vl.ShouldGrowVolumesByDcAndRack(&writableVolumes, dcId, rackId) {
-							vgr.DataCenter = string(dcId)
-							vgr.Rack = string(rackId)
-							if lastGrowCount > 0 {
-								vgr.WritableVolumeCount = uint32(math.Ceil(float64(lastGrowCount) / float64(len(dcs)*len(racks))))
-							} else {
-								vgr.WritableVolumeCount = volumeGrowStepCount
-							}
-
-							if _, err = ms.VolumeGrow(ctx, vgr); err != nil {
-								glog.V(0).Infof("volume grow request for dc:%s rack:%s failed: %+v", dcId, rackId, err)
-							}
-						}
+				for _, plan := range vl.PlanRackAwareGrowth(dcs, lastGrowCount, volumeGrowStepCount) {
+					vgr.DataCenter = plan.DataCenter
+					vgr.Rack = plan.Rack
+					vgr.WritableVolumeCount = plan.WritableVolumeCount
+					if _, err = ms.VolumeGrow(ctx, vgr); err != nil {
+						glog.V(0).Infof("volume grow request for dc:%s rack:%s failed: %+v", plan.DataCenter, plan.Rack, err)
 					}
 				}
 			}
@@ -161,6 +151,11 @@ func (ms *MasterServer) ProcessGrowRequest() {
 	}()
 }
 
+// LookupVolume resolves one or more volume ids (or "<vid>,<cookie>" file ids)
+// to their current replica locations on the volume servers. Each returned
+// entry carries DataInRemote per replica so the caller can prefer a local
+// replica; entries carrying a file id also receive a freshly generated read
+// jwt the volume server will accept.
 func (ms *MasterServer) LookupVolume(ctx context.Context, req *master_pb.LookupVolumeRequest) (*master_pb.LookupVolumeResponse, error) {
 
 	resp := &master_pb.LookupVolumeResponse{}
@@ -177,15 +172,18 @@ func (ms *MasterServer) LookupVolume(ctx context.Context, req *master_pb.LookupV
 			var locations []*master_pb.Location
 			for _, loc := range result.Locations {
 				locations = append(locations, &master_pb.Location{
-					Url:        loc.Url,
-					PublicUrl:  loc.PublicUrl,
-					DataCenter: loc.DataCenter,
-					GrpcPort:   uint32(loc.GrpcPort),
+					Url:               loc.Url,
+					PublicUrl:         loc.PublicUrl,
+					DataCenter:        loc.DataCenter,
+					GrpcPort:          uint32(loc.GrpcPort),
+					DataInRemote:      loc.DataInRemote,
+					ReadOnly:          loc.ReadOnly,
+					ReadOnlyCanDelete: loc.ReadOnlyCanDelete,
 				})
 			}
 			var auth string
 			if commaSep > 0 { // this is a file id
-				auth = string(security.GenJwtForVolumeServer(ms.guard.SigningKey, ms.guard.ExpiresAfterSec, result.VolumeOrFileId))
+				auth = string(security.GenJwtForVolumeServer(ms.guard.SigningKey(), ms.guard.ExpiresAfterSec(), result.VolumeOrFileId))
 			}
 			if result.NotFound {
 				notFoundCount++
@@ -199,12 +197,40 @@ func (ms *MasterServer) LookupVolume(ctx context.Context, req *master_pb.LookupV
 		}
 	}
 
-	// Only return Unavailable during warmup when every requested ID was a transient not-found
-	if len(req.VolumeOrFileIds) > 0 && notFoundCount == len(req.VolumeOrFileIds) && ms.Topo.IsLeader() && ms.Topo.IsWarmingUp() {
-		glog.V(0).Infof("lookup volume warming up: topology is still loading (%d not found)", notFoundCount)
+	// While warming up, a not-found may only mean the volume server has not
+	// reported yet, so no part of the answer can be treated as authoritative.
+	// Callers retry Unavailable; a partial answer would let them take a
+	// missing volume as gone.
+	if notFoundCount > 0 && ms.Topo.IsLeader() && ms.Topo.IsWarmingUp() {
+		glog.V(0).Infof("lookup volume warming up: topology is still loading (%d of %d not found)", notFoundCount, len(req.VolumeOrFileIds))
 		return nil, status.Errorf(codes.Unavailable, "master is warming up, topology is still loading")
 	}
 
+	return resp, nil
+}
+
+// CollectionStatistics summarises every collection, so callers tracking usage
+// do not pull the whole volume list to add it up themselves.
+func (ms *MasterServer) CollectionStatistics(ctx context.Context, req *master_pb.CollectionStatisticsRequest) (*master_pb.CollectionStatisticsResponse, error) {
+	if !ms.Topo.IsLeader() {
+		return nil, raft.NotLeaderError
+	}
+
+	stats := ms.Topo.CollectionStatistics()
+	resp := &master_pb.CollectionStatisticsResponse{
+		Collections: make([]*master_pb.CollectionStatistics, 0, len(stats)),
+	}
+	for _, s := range stats {
+		resp.Collections = append(resp.Collections, &master_pb.CollectionStatistics{
+			Collection:       s.Collection,
+			FileCount:        s.FileCount,
+			DeleteCount:      s.DeleteCount,
+			DeletedByteCount: s.DeletedByteCount,
+			Size:             s.Size,
+			PhysicalSize:     s.PhysicalSize,
+			VolumeCount:      s.VolumeCount,
+		})
+	}
 	return resp, nil
 }
 
@@ -214,28 +240,55 @@ func (ms *MasterServer) Statistics(ctx context.Context, req *master_pb.Statistic
 		return nil, raft.NotLeaderError
 	}
 
-	if req.Replication == "" {
-		req.Replication = ms.option.DefaultReplicaPlacement
+	// an empty collection means all collections, and a named collection covers
+	// all its layouts and EC volumes
+	stats := ms.Topo.CollectionVolumeStats(req.Collection)
+	totalSize := uint64(ms.Topo.GetDiskUsages().GetMaxVolumeCount() * int64(ms.option.VolumeSizeLimitMB) * 1024 * 1024)
+	// capacity is cluster-wide, so what is left over is what every collection
+	// has not taken, not just the one asked about
+	clusterUsedSize := stats.UsedSize
+	if req.Collection != "" {
+		clusterUsedSize = ms.Topo.CollectionVolumeStats("").UsedSize
 	}
-	replicaPlacement, err := super_block.NewReplicaPlacementFromString(req.Replication)
-	if err != nil {
-		return nil, err
+	// volume slots are provisioning, not capacity: a cluster configured with
+	// more of them than its disks hold would report space it can never take.
+	// What the disks still have free, on top of what the cluster already wrote,
+	// is the real ceiling.
+	if freeBytes, reported := ms.Topo.FreeBytes(); reported {
+		totalSize = min(totalSize, clusterUsedSize+freeBytes)
 	}
-	ttl, err := needle.ReadTTL(req.Ttl)
-	if err != nil {
-		return nil, err
+	// and the free space holds that many copies fewer of whatever the caller writes
+	var freeSize uint64
+	if totalSize > clusterUsedSize {
+		freeSize = (totalSize - clusterUsedSize) / uint64(ms.replicaCopyCount(req.Replication))
 	}
-
-	volumeLayout := ms.Topo.GetVolumeLayout(req.Collection, replicaPlacement, ttl, types.ToDiskType(req.DiskType))
-	stats := volumeLayout.Stats()
-	totalSize := ms.Topo.GetDiskUsages().GetMaxVolumeCount() * int64(ms.option.VolumeSizeLimitMB) * 1024 * 1024
 	resp := &master_pb.StatisticsResponse{
-		TotalSize: uint64(totalSize),
-		UsedSize:  stats.UsedSize,
-		FileCount: stats.FileCount,
+		TotalSize:        totalSize,
+		UsedSize:         stats.UsedSize,
+		FileCount:        stats.FileCount,
+		LogicalTotalSize: stats.LogicalUsedSize + freeSize,
+		LogicalUsedSize:  stats.LogicalUsedSize,
 	}
 
 	return resp, nil
+}
+
+// replicaCopyCount returns how many copies the given replication makes, falling
+// back to the master default and then to a single copy. Unparsable input is
+// reported rather than failing the call: statistics are informational.
+func (ms *MasterServer) replicaCopyCount(replication string) int {
+	for _, s := range []string{replication, ms.option.DefaultReplicaPlacement} {
+		if s == "" {
+			continue
+		}
+		rp, err := super_block.NewReplicaPlacementFromString(s)
+		if err != nil {
+			glog.V(1).Infof("statistics replication %q: %v", s, err)
+			continue
+		}
+		return rp.GetCopyCount()
+	}
+	return 1
 }
 
 func (ms *MasterServer) VolumeList(ctx context.Context, req *master_pb.VolumeListRequest) (*master_pb.VolumeListResponse, error) {
@@ -244,12 +297,45 @@ func (ms *MasterServer) VolumeList(ctx context.Context, req *master_pb.VolumeLis
 		return nil, raft.NotLeaderError
 	}
 
+	filter, err := topology.NewVolumeFilter(req)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
 	resp := &master_pb.VolumeListResponse{
-		TopologyInfo:      ms.Topo.ToTopologyInfo(),
+		TopologyInfo:      ms.Topo.ToTopologyInfo(filter),
 		VolumeSizeLimitMb: uint64(ms.option.VolumeSizeLimitMB),
 	}
 
 	return resp, nil
+}
+
+// VolumeListStream answers VolumeList without building the whole reply first.
+// The topology goes out on its own, then the volumes in batches, so the master
+// holds one batch rather than every volume in the cluster.
+func (ms *MasterServer) VolumeListStream(req *master_pb.VolumeListRequest, stream master_pb.Seaweed_VolumeListStreamServer) error {
+
+	if !ms.Topo.IsLeader() {
+		return raft.NotLeaderError
+	}
+
+	filter, err := topology.NewVolumeFilter(req)
+	if err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	listed := ms.Topo.ToTopologyInfo(topology.NoVolumes())
+	err = stream.Send(&master_pb.VolumeListStreamResponse{
+		Header: &master_pb.VolumeListResponse{
+			TopologyInfo:      listed,
+			VolumeSizeLimitMb: uint64(ms.option.VolumeSizeLimitMB),
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	return ms.Topo.StreamVolumes(listed, filter, 0, stream.Send)
 }
 
 func (ms *MasterServer) LookupEcVolume(ctx context.Context, req *master_pb.LookupEcVolumeRequest) (*master_pb.LookupEcVolumeResponse, error) {
@@ -334,18 +420,33 @@ func (ms *MasterServer) VolumeMarkReadonly(ctx context.Context, req *master_pb.V
 
 	replicaPlacement, _ := super_block.NewReplicaPlacementFromByte(byte(req.ReplicaPlacement))
 	vl := ms.Topo.GetVolumeLayout(req.Collection, replicaPlacement, needle.LoadTTLFromUint32(req.Ttl), types.ToDiskType(req.DiskType))
-	dataNodes := ms.Topo.Lookup(req.Collection, needle.VolumeId(req.VolumeId))
+	vid := needle.VolumeId(req.VolumeId)
+	dataNodes := ms.Topo.Lookup(req.Collection, vid)
 
+	found := false
 	for _, dn := range dataNodes {
 		if dn.Ip == req.Ip && dn.Port == int(req.Port) {
+			found = true
 			if req.IsReadonly {
-				vid := needle.VolumeId(req.VolumeId)
 				vl.SetVolumeReadOnly(dn, vid)
 				if pending := vl.GetPendingSize(vid); pending > 0 {
 					glog.V(0).Infof("volume %d marked readonly with %d pending bytes", vid, pending)
 				}
 			} else {
-				vl.SetVolumeWritable(dn, needle.VolumeId(req.VolumeId))
+				vl.SetVolumeWritable(dn, vid)
+			}
+		}
+	}
+
+	// A vacuum worker marks the volume writable after a successful commit. If the
+	// index lost it meanwhile (e.g. a disconnect race during the vacuum), the loop
+	// found nothing to update; re-register it from the node that still holds it so
+	// LookupVolume stops returning "not found".
+	if !found && !req.IsReadonly {
+		if dn := ms.Topo.LookupDataNodeByAddress(pb.NewServerAddress(req.Ip, int(req.Port), 0)); dn != nil {
+			if vi, err := dn.GetVolumesById(vid); err == nil {
+				ms.Topo.RegisterVolumeLayout(vi, dn)
+				glog.V(0).Infof("volume %d re-registered from %s:%d, was missing from the lookup index at mark-writable", vid, req.Ip, req.Port)
 			}
 		}
 	}

@@ -2,9 +2,12 @@ package command
 
 import (
 	"container/heap"
+	"errors"
 	"fmt"
 	"testing"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
@@ -580,5 +583,162 @@ func BenchmarkConflictCheck(b *testing.B) {
 			}
 			benchResult = r
 		})
+	}
+}
+
+// TestMetadataProcessorEmptyMarkerKeepsWatermarkStale: the MaxUnsyncedEvents
+// marker (empty EventNotification, fresh timestamp) is dropped by AddSyncJob and
+// does NOT advance processedTsWatermark, so offsetFunc keeps publishing the stale
+// offset. This is why the client must not drive sync_offset off the watermark
+// for these markers.
+func TestMetadataProcessorEmptyMarkerKeepsWatermarkStale(t *testing.T) {
+	const staleOffset = int64(1_000_000_000)
+	freshTs := staleOffset + int64(time.Hour) // a "now"-ish source timestamp
+
+	p := NewMetadataProcessor(func(*filer_pb.SubscribeMetadataResponse) error { return nil }, 4, staleOffset)
+
+	marker := &filer_pb.SubscribeMetadataResponse{
+		TsNs:              freshTs,
+		EventNotification: &filer_pb.EventNotification{},
+	}
+	if !filer_pb.IsEmpty(marker) {
+		t.Fatal("marker should be IsEmpty")
+	}
+
+	p.AddSyncJob(marker)
+
+	if got := p.processedTsWatermark.Load(); got != staleOffset {
+		t.Fatalf("empty marker advanced watermark to %d; want it to stay stale at %d", got, staleOffset)
+	}
+	t.Logf("marker carried fresh ts %d but watermark stayed stale at %d", freshTs, staleOffset)
+}
+
+// waitForJobsToDrain blocks until every job goroutine has finished bookkeeping.
+func waitForJobsToDrain(t *testing.T, p *MetadataProcessor) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		p.activeJobsLock.Lock()
+		remaining := len(p.activeJobs)
+		p.activeJobsLock.Unlock()
+		if remaining == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for sync jobs to drain")
+}
+
+// TestFailedJobHoldsWatermark verifies that a job that returns an error keeps
+// the watermark — and therefore the persisted sync offset — behind the failed
+// event, so a restart replays it. Advancing past it drops the event for good:
+// the file stays local-only and nothing ever retries the upload.
+func TestFailedJobHoldsWatermark(t *testing.T) {
+	const failedTsNs = int64(200)
+	// a permanent error, so util.Retry gives up on the first attempt
+	fn := func(resp *filer_pb.SubscribeMetadataResponse) error {
+		if resp.TsNs == failedTsNs {
+			return errors.New("AccessDenied: Access Denied")
+		}
+		return nil
+	}
+	// concurrency 1 runs the jobs serially in timestamp order
+	p := NewMetadataProcessor(fn, 1, 0)
+
+	p.AddSyncJob(makeResp("/dir", "a.txt", false, 100, true))
+	waitForJobsToDrain(t, p)
+	if got := p.processedTsWatermark.Load(); got != 100 {
+		t.Fatalf("watermark = %d after a successful job, want 100", got)
+	}
+
+	p.AddSyncJob(makeResp("/dir", "b.txt", false, failedTsNs, true))
+	waitForJobsToDrain(t, p)
+	if got := p.processedTsWatermark.Load(); got != 100 {
+		t.Fatalf("watermark = %d after a failed job, want it held at 100", got)
+	}
+
+	// later events keep flowing, but the offset stays behind the failure
+	p.AddSyncJob(makeResp("/dir", "c.txt", false, 300, true))
+	waitForJobsToDrain(t, p)
+	if got := p.processedTsWatermark.Load(); got != 100 {
+		t.Fatalf("watermark = %d after a later success, want it held at 100", got)
+	}
+}
+
+// TestFailedJobHoldsWatermarkAtOldestFailure verifies that the watermark is
+// pinned by the oldest failure, not the most recent one.
+func TestFailedJobHoldsWatermarkAtOldestFailure(t *testing.T) {
+	fn := func(resp *filer_pb.SubscribeMetadataResponse) error {
+		if resp.TsNs == 200 || resp.TsNs == 400 {
+			return errors.New("AccessDenied: Access Denied")
+		}
+		return nil
+	}
+	p := NewMetadataProcessor(fn, 1, 0)
+
+	for _, ts := range []int64{100, 200, 300, 400, 500} {
+		p.AddSyncJob(makeResp("/dir", fmt.Sprintf("f%d.txt", ts), false, ts, true))
+		waitForJobsToDrain(t, p)
+	}
+
+	if got := p.processedTsWatermark.Load(); got != 100 {
+		t.Fatalf("watermark = %d, want it held at 100 by the failure at 200", got)
+	}
+}
+
+// TestSyncStreamMetrics verifies the per-event and byte counters and the
+// in-flight gauges across success and failure outcomes. Bytes count only the
+// chunk delta: the failing create's 40, the successful create's 100, the
+// update's new 60-byte chunk but not its shared one, and nothing for the
+// delete despite its chunk.
+func TestSyncStreamMetrics(t *testing.T) {
+	fn := func(resp *filer_pb.SubscribeMetadataResponse) error {
+		if resp.TsNs == 2 {
+			return errors.New("AccessDenied: Access Denied")
+		}
+		return nil
+	}
+	p := NewMetadataProcessor(fn, 100, 0)
+	p.SetMetrics("srcFiler", "dstFiler", "TestSyncStreamMetrics", "/")
+
+	create := makeResp("/dir1", "a.txt", false, 1, true)
+	create.EventNotification.NewEntry.Chunks = []*filer_pb.FileChunk{{FileId: "1,a0", Size: 100}}
+	failing := makeResp("/dir1", "b.txt", false, 2, true)
+	failing.EventNotification.NewEntry.Chunks = []*filer_pb.FileChunk{{FileId: "2,b0", Size: 40}}
+	shared := &filer_pb.FileChunk{FileId: "3,c0", Size: 30}
+	update := &filer_pb.SubscribeMetadataResponse{
+		Directory: "/dir1",
+		TsNs:      3,
+		EventNotification: &filer_pb.EventNotification{
+			OldEntry:      &filer_pb.Entry{Name: "c.txt", Chunks: []*filer_pb.FileChunk{shared}},
+			NewEntry:      &filer_pb.Entry{Name: "c.txt", Chunks: []*filer_pb.FileChunk{shared, {FileId: "3,c1", Size: 60}}},
+			NewParentPath: "/dir1",
+		},
+	}
+	del := makeResp("/dir1", "d.txt", false, 4, false)
+	del.EventNotification.OldEntry.Chunks = []*filer_pb.FileChunk{{FileId: "4,d0", Size: 999}}
+
+	for _, resp := range []*filer_pb.SubscribeMetadataResponse{create, failing, update, del} {
+		p.AddSyncJob(resp)
+	}
+	waitForJobsToDrain(t, p)
+
+	for _, tc := range []struct {
+		name string
+		got  float64
+		want float64
+	}{
+		{"received", testutil.ToFloat64(p.metrics.received), 4},
+		{"processed", testutil.ToFloat64(p.metrics.processed), 3},
+		{"failed", testutil.ToFloat64(p.metrics.failed), 1},
+		{"in_flight", testutil.ToFloat64(p.metrics.inFlight), 0},
+		{"received_bytes", testutil.ToFloat64(p.metrics.receivedBytes), 200},
+		{"processed_bytes", testutil.ToFloat64(p.metrics.processedBytes), 160},
+		{"failed_bytes", testutil.ToFloat64(p.metrics.failedBytes), 40},
+		{"in_flight_bytes", testutil.ToFloat64(p.metrics.inFlightBytes), 0},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %v, want %v", tc.name, tc.got, tc.want)
+		}
 	}
 }

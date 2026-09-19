@@ -2,9 +2,9 @@ package weed_server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +17,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -48,6 +50,11 @@ func (fs *FilerServer) CacheRemoteObjectToLocalCluster(ctx context.Context, req 
 			glog.V(2).Infof("CacheRemoteObjectToLocalCluster: shared result for %s", cacheKey)
 		}
 		if res.Err != nil {
+			// The sentinel would cross gRPC as codes.Unknown; make it canonical
+			// so remote callers can classify a vanished entry.
+			if errors.Is(res.Err, filer_pb.ErrNotFound) {
+				return nil, status.Error(codes.NotFound, res.Err.Error())
+			}
 			return nil, res.Err
 		}
 		if res.Val == nil {
@@ -64,8 +71,9 @@ func (fs *FilerServer) CacheRemoteObjectToLocalCluster(ctx context.Context, req 
 // doCacheRemoteObjectToLocalCluster performs the actual caching operation.
 // This is called from singleflight, so only one instance runs per object.
 func (fs *FilerServer) doCacheRemoteObjectToLocalCluster(ctx context.Context, req *filer_pb.CacheRemoteObjectToLocalClusterRequest) (*filer_pb.CacheRemoteObjectToLocalClusterResponse, error) {
-	// find the entry first to check if already cached
-	entry, err := fs.filer.FindEntry(ctx, util.JoinPath(req.Directory, req.Name))
+	lockPath := util.JoinPath(req.Directory, req.Name)
+	entry, logTsNs, err := fs.fencedFindEntry(ctx, lockPath)
+
 	if err == filer_pb.ErrNotFound {
 		return nil, err
 	}
@@ -73,7 +81,7 @@ func (fs *FilerServer) doCacheRemoteObjectToLocalCluster(ctx context.Context, re
 		return nil, fmt.Errorf("find entry %s/%s: %v", req.Directory, req.Name, err)
 	}
 
-	resp := &filer_pb.CacheRemoteObjectToLocalClusterResponse{}
+	resp := &filer_pb.CacheRemoteObjectToLocalClusterResponse{LogTsNs: logTsNs, LogSignature: fs.filer.Signature}
 
 	// Early return if not a remote-only object or already cached
 	if entry.Remote == nil || entry.Remote.RemoteSize == 0 {
@@ -89,36 +97,9 @@ func (fs *FilerServer) doCacheRemoteObjectToLocalCluster(ctx context.Context, re
 
 	glog.V(1).Infof("CacheRemoteObjectToLocalCluster: caching %s/%s (remote size: %d)", req.Directory, req.Name, entry.Remote.RemoteSize)
 
-	// load all mappings
-	mappingEntry, err := fs.filer.FindEntry(ctx, util.JoinPath(filer.DirectoryEtcRemote, filer.REMOTE_STORAGE_MOUNT_FILE))
+	storageConf, remoteLocation, err := fs.resolveMountedRemote(ctx, req.Directory, req.Name)
 	if err != nil {
 		return nil, err
-	}
-	mappings, err := filer.UnmarshalRemoteStorageMappings(mappingEntry.Content)
-	if err != nil {
-		return nil, err
-	}
-
-	// find mapping
-	var remoteStorageMountedLocation *remote_pb.RemoteStorageLocation
-	var localMountedDir string
-	for k, loc := range mappings.Mappings {
-		if strings.HasPrefix(req.Directory, k) {
-			localMountedDir, remoteStorageMountedLocation = k, loc
-		}
-	}
-	if localMountedDir == "" {
-		return nil, fmt.Errorf("%s is not mounted", req.Directory)
-	}
-
-	// find storage configuration
-	storageConfEntry, err := fs.filer.FindEntry(ctx, util.JoinPath(filer.DirectoryEtcRemote, remoteStorageMountedLocation.Name+filer.REMOTE_STORAGE_CONF_SUFFIX))
-	if err != nil {
-		return nil, err
-	}
-	storageConf := &remote_pb.RemoteConf{}
-	if unMarshalErr := proto.Unmarshal(storageConfEntry.Content, storageConf); unMarshalErr != nil {
-		return nil, fmt.Errorf("unmarshal remote storage conf %s/%s: %v", filer.DirectoryEtcRemote, remoteStorageMountedLocation.Name+filer.REMOTE_STORAGE_CONF_SUFFIX, unMarshalErr)
 	}
 
 	// detect storage option
@@ -154,8 +135,6 @@ func (fs *FilerServer) doCacheRemoteObjectToLocalCluster(ctx context.Context, re
 	if altRequest != nil {
 		altRequest.ExpectedDataSize = uint64(chunkSize)
 	}
-
-	dest := util.FullPath(remoteStorageMountedLocation.Path).Child(string(util.FullPath(req.Directory).Child(req.Name))[len(localMountedDir):])
 
 	var chunks []*filer_pb.FileChunk
 	var chunksMu sync.Mutex
@@ -238,14 +217,10 @@ func (fs *FilerServer) doCacheRemoteObjectToLocalCluster(ctx context.Context, re
 					Auth:                string(assignResult.Auth),
 					DownloadConcurrency: downloadConcurrency,
 					RemoteConf:          storageConf,
-					RemoteLocation: &remote_pb.RemoteStorageLocation{
-						Name:   remoteStorageMountedLocation.Name,
-						Bucket: remoteStorageMountedLocation.Bucket,
-						Path:   string(dest),
-					},
+					RemoteLocation:      remoteLocation,
 				})
 				if fetchErr != nil {
-					return fmt.Errorf("volume server %s fetchAndWrite %s: %v", assignResult.Url, dest, fetchErr)
+					return fmt.Errorf("volume server %s fetchAndWrite %s: %v", assignResult.Url, remoteLocation.Path, fetchErr)
 				}
 				etag = resp.ETag
 				return nil
@@ -297,6 +272,34 @@ func (fs *FilerServer) doCacheRemoteObjectToLocalCluster(ctx context.Context, re
 		return nil, err
 	}
 
+	// Commit under the mutation path lock so a fenced lookup cannot land
+	// between the store update and its notification, handing out
+	// under-versioned state. Re-read under it: the entry may have changed
+	// during the unlocked download, and the stale base would clobber it.
+	commitLock := fs.entryLockTable.AcquireLock("CacheRemoteObjectToLocalCluster", lockPath, util.ExclusiveLock)
+	defer fs.entryLockTable.ReleaseLock(lockPath, commitLock)
+
+	commitLogTsNs := time.Now().UnixNano()
+	current, err := fs.filer.FindEntry(ctx, lockPath)
+	if err != nil {
+		fs.filer.DeleteUncommittedChunks(ctx, chunks)
+		if err == filer_pb.ErrNotFound {
+			// Deleted while the download ran; keep the sentinel so callers
+			// still surface a 404 rather than a generic failure.
+			return nil, err
+		}
+		return nil, fmt.Errorf("find entry %s before commit: %v", lockPath, err)
+	}
+	if !filer.EqualEntry(current, entry) {
+		// Changed during the download: that writer supersedes the cached
+		// content. Return the current state, fenced at this read.
+		fs.filer.DeleteUncommittedChunks(ctx, chunks)
+		resp.Entry = current.ToProtoEntry()
+		resp.LogTsNs = commitLogTsNs
+		resp.LogSignature = fs.filer.Signature
+		return resp, nil
+	}
+
 	garbage := entry.GetChunks()
 
 	newEntry := entry.ShallowClone()
@@ -317,7 +320,39 @@ func (fs *FilerServer) doCacheRemoteObjectToLocalCluster(ctx context.Context, re
 
 	resp.Entry = newEntry.ToProtoEntry()
 	resp.MetadataEvent = eventSink.Last()
+	resp.LogTsNs = commitLogTsNs
+	resp.LogSignature = fs.filer.Signature
 
 	return resp, nil
 
+}
+
+// resolveMountedRemote reads /etc/remote fresh (so conf changes need no restart)
+// and maps dir/name to its remote storage conf and remote location.
+func (fs *FilerServer) resolveMountedRemote(ctx context.Context, dir, name string) (*remote_pb.RemoteConf, *remote_pb.RemoteStorageLocation, error) {
+	mappingEntry, err := fs.filer.FindEntry(ctx, util.JoinPath(filer.DirectoryEtcRemote, filer.REMOTE_STORAGE_MOUNT_FILE))
+	if err != nil {
+		return nil, nil, err
+	}
+	mappings, err := filer.UnmarshalRemoteStorageMappings(mappingEntry.Content)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	localMountedDir, remoteStorageMountedLocation, err := filer.FindMountedRemoteMapping(mappings, dir)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	storageConfEntry, err := fs.filer.FindEntry(ctx, util.JoinPath(filer.DirectoryEtcRemote, remoteStorageMountedLocation.Name+filer.REMOTE_STORAGE_CONF_SUFFIX))
+	if err != nil {
+		return nil, nil, err
+	}
+	storageConf := &remote_pb.RemoteConf{}
+	if unMarshalErr := proto.Unmarshal(storageConfEntry.Content, storageConf); unMarshalErr != nil {
+		return nil, nil, fmt.Errorf("unmarshal remote storage conf %s/%s: %v", filer.DirectoryEtcRemote, remoteStorageMountedLocation.Name+filer.REMOTE_STORAGE_CONF_SUFFIX, unMarshalErr)
+	}
+
+	remoteLocation := filer.MapFullPathToRemoteStorageLocation(util.FullPath(localMountedDir), remoteStorageMountedLocation, util.FullPath(dir).Child(name))
+	return storageConf, remoteLocation, nil
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/admin/topology"
+	"github.com/seaweedfs/seaweedfs/weed/ec"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -68,7 +69,10 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 		glog.Warningf("EC Detection: replica placement data-center digit (%d) is ignored for EC; only rack/node digits are honored", replicaPlacement.DiffDataCenterCount)
 	}
 
-	allowedCollections := wildcard.CompileWildcardMatchers(ecConfig.CollectionFilter)
+	allowedCollections, err := wildcard.CompileCollectionMatcher(ecConfig.CollectionFilter)
+	if err != nil {
+		return nil, false, err
+	}
 
 	// Cluster node count for the min-node safety gate (mirrors the shell ec.encode
 	// guard that refuses to encode when nodes < parity shards, so shards cannot be
@@ -123,13 +127,10 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 
 		groupMetrics := volumeGroups[volumeID]
 
-		// Find canonical metric (lowest Server ID) to ensure consistent task deduplication
-		metric := groupMetrics[0]
-		for _, m := range groupMetrics {
-			if m.Server < metric.Server {
-				metric = m
-			}
-		}
+		// Prefer the lowest-server credible replica so a 0-byte stub or a
+		// leftover EC shard set on a lower server can't become canonical and
+		// strand the volume in skippedTooSmall / skippedAlreadyEC.
+		metric := selectCanonicalMetric(groupMetrics)
 
 		// Skip if already EC volume
 		if metric.IsECVolume {
@@ -189,7 +190,7 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 		}
 
 		// Check collection filter if specified
-		if len(allowedCollections) > 0 && !wildcard.MatchesAnyWildcard(allowedCollections, metric.Collection) {
+		if !allowedCollections.Matches(metric.Collection) {
 			skippedCollectionFilter++
 			continue
 		}
@@ -310,13 +311,19 @@ func Detection(ctx context.Context, metrics []*types.VolumeHealthMetrics, cluste
 				for _, shard := range existingECShards {
 					key := fmt.Sprintf("%s:%d", shard.ServerID, shard.DiskID)
 					if !duplicateCheck[key] { // Avoid duplicates if EC shards are on same disk as volume replicas
+						shardIds := append([]uint32(nil), shard.ShardIds...)
+						// Free exactly the shards on this disk. Without an explicit
+						// impact the cleanup falls back to CalculateECShardCleanupImpact,
+						// which credits TotalShardsCount (14) regardless of ratio.
+						cleanupImpact := topology.StorageSlotChange{ShardSlots: -int32(len(shardIds))}
 						sources = append(sources, topology.TaskSourceSpec{
-							ServerID:    shard.ServerID,
-							DiskID:      shard.DiskID,
-							DataCenter:  shard.DataCenter,
-							Rack:        shard.Rack,
-							CleanupType: topology.CleanupECShards,
-							ShardIds:    append([]uint32(nil), shard.ShardIds...),
+							ServerID:      shard.ServerID,
+							DiskID:        shard.DiskID,
+							DataCenter:    shard.DataCenter,
+							Rack:          shard.Rack,
+							CleanupType:   topology.CleanupECShards,
+							ShardIds:      shardIds,
+							StorageImpact: &cleanupImpact,
 						})
 						duplicateCheck[key] = true
 					}
@@ -716,8 +723,20 @@ func cleanupOrphanSourceReplicas(ctx context.Context, clusterInfo *types.Cluster
 	var deleteErrors []string
 	for _, replica := range replicas {
 		serverAddress := replica.ServerID
+		var isReadOnly bool
 		err := operation.WithVolumeServerClient(false, pb.ServerAddress(serverAddress), clusterInfo.GrpcDialOption,
 			func(client volume_server_pb.VolumeServerClient) error {
+				// Re-probe before deleting: only a still-readonly source replica is
+				// safe to remove. One that came back writable may have accepted
+				// writes the EC shards do not contain, so deleting it loses data.
+				status, statusErr := client.VolumeStatus(ctx, &volume_server_pb.VolumeStatusRequest{VolumeId: metric.VolumeID})
+				if statusErr != nil {
+					return statusErr
+				}
+				isReadOnly = status.GetIsReadOnly()
+				if !isReadOnly {
+					return nil
+				}
 				_, deleteErr := client.VolumeDelete(ctx, &volume_server_pb.VolumeDeleteRequest{
 					VolumeId:  metric.VolumeID,
 					OnlyEmpty: false,
@@ -726,6 +745,10 @@ func cleanupOrphanSourceReplicas(ctx context.Context, clusterInfo *types.Cluster
 			})
 		if err != nil {
 			deleteErrors = append(deleteErrors, fmt.Sprintf("server %s: %v", serverAddress, err))
+			continue
+		}
+		if !isReadOnly {
+			glog.Warningf("EC Detection: source replica for volume %d on %s is writable; not deleting (may hold writes the EC shards lack)", metric.VolumeID, serverAddress)
 			continue
 		}
 		deleted++
@@ -738,34 +761,12 @@ func cleanupOrphanSourceReplicas(ctx context.Context, clusterInfo *types.Cluster
 	return deleted, nil
 }
 
-// countExistingEcShardsForVolume returns the number of distinct EC shard IDs
-// for (volumeID, collection) present in the topology. Walks every disk's
-// EcIndexBits bitmap rather than trusting len(EcShardInfos), because a single
-// info entry can carry multiple shards. Used by the #9448 guard to decide
-// whether the EC shard set is complete enough that the orphaned regular
-// replica is safe to delete.
+// countExistingEcShardsForVolume counts (volumeID, collection) EC shards in the
+// topology, counting only the single largest encode generation; see
+// ec.CountExistingEcShardsForVolume for the generation semantics.
 func countExistingEcShardsForVolume(activeTopology *topology.ActiveTopology, volumeID uint32, collection string) int {
 	if activeTopology == nil {
 		return 0
 	}
-	topologyInfo := activeTopology.GetTopologyInfo()
-	if topologyInfo == nil {
-		return 0
-	}
-	var seen erasure_coding.ShardBits
-	for _, dc := range topologyInfo.DataCenterInfos {
-		for _, rack := range dc.RackInfos {
-			for _, node := range rack.DataNodeInfos {
-				for _, diskInfo := range node.DiskInfos {
-					for _, ecShardInfo := range diskInfo.EcShardInfos {
-						if ecShardInfo.Id != volumeID || ecShardInfo.Collection != collection {
-							continue
-						}
-						seen |= erasure_coding.ShardBits(ecShardInfo.EcIndexBits)
-					}
-				}
-			}
-		}
-	}
-	return seen.Count()
+	return ec.CountExistingEcShardsForVolume(activeTopology.GetTopologyInfo(), volumeID, collection)
 }

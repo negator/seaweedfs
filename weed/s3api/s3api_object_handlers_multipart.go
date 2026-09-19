@@ -120,6 +120,13 @@ func (s3a *S3ApiServer) NewMultipartUploadHandler(w http.ResponseWriter, r *http
 		return
 	}
 
+	if response.ChecksumAlgorithm != "" {
+		w.Header().Set(s3_constants.AmzChecksumAlgorithm, response.ChecksumAlgorithm)
+		if response.ChecksumType != "" {
+			w.Header().Set(s3_constants.AmzChecksumType, response.ChecksumType)
+		}
+	}
+
 	writeSuccessResponseXML(w, r, response)
 
 }
@@ -178,11 +185,6 @@ func (s3a *S3ApiServer) CompleteMultipartUploadHandler(w http.ResponseWriter, r 
 	// Set version ID in HTTP header if present
 	if response.VersionId != nil {
 		w.Header().Set("x-amz-version-id", *response.VersionId)
-	}
-
-	// Set composite checksum header if present
-	if response.ChecksumHeaderName != "" && response.ChecksumValue != "" {
-		w.Header().Set(response.ChecksumHeaderName, response.ChecksumValue)
 	}
 
 	stats_collect.RecordBucketActiveTime(bucket)
@@ -456,12 +458,18 @@ func (s3a *S3ApiServer) PutObjectPartHandler(w http.ResponseWriter, r *http.Requ
 	// volume TTL: the rule targets the user-visible object, not the
 	// transient .uploads/<id>/<n> path, and a part write would otherwise
 	// start the TTL clock before CompleteMultipartUpload ever assembled
-	// the object.
-	etag, errCode, sseMetadata := s3a.putToFiler(r, filePath, dataReader, bucket, "", partID, 0, nil, false)
+	// the object. filer.conf storage rules are the opposite case: they
+	// place the bytes the part becomes, so they resolve against the object.
+	etag, errCode, sseMetadata := s3a.putToFiler(r, filePath, dataReader, bucket, "", partID, 0, nil, false, s3a.toFilerPath(bucket, object))
 	if errCode != s3err.ErrNone {
 		glog.Errorf("PutObjectPart: putToFiler failed with error code %v for bucket=%s, object=%s, partNumber=%d",
 			errCode, bucket, object, partID)
 		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
+	// the write above re-creates a directory an abort removed mid-body
+	if !s3a.checkUploadStillOpen(w, r, bucket, object, uploadID) {
 		return
 	}
 
@@ -479,6 +487,38 @@ func (s3a *S3ApiServer) PutObjectPartHandler(w http.ResponseWriter, r *http.Requ
 
 func (s3a *S3ApiServer) genUploadsFolder(bucket string) string {
 	return fmt.Sprintf("%s/%s", s3a.bucketDir(bucket), s3_constants.MultipartUploadsFolder)
+}
+
+// isMultipartUploadEntry tells the .uploads/<id> directory createMultipartUpload
+// made from the one a part write re-created on its way to the filer: only the
+// former carries the destination object key.
+func isMultipartUploadEntry(entry *filer_pb.Entry) bool {
+	return entry != nil && len(entry.Extended[s3_constants.ExtMultipartObjectKey]) > 0
+}
+
+// checkUploadStillOpen re-checks the upload after a part landed, and removes the
+// part along with the directory it resurrected when an abort was answered while
+// the part was in flight. It reports whether the caller may answer success.
+func (s3a *S3ApiServer) checkUploadStillOpen(w http.ResponseWriter, r *http.Request, bucket, object, uploadID string) bool {
+	entry, err := s3a.getEntry(s3a.genUploadsFolder(bucket), uploadID)
+	if err != nil && !errors.Is(err, filer_pb.ErrNotFound) {
+		glog.Errorf("checkUploadStillOpen %s/%s: %v", bucket, uploadID, err)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		return false
+	}
+	if isMultipartUploadEntry(entry) {
+		return true
+	}
+	// the upload is gone either way, so the client still hears NoSuchUpload
+	if _, code := s3a.abortMultipartUpload(&s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(bucket),
+		Key:      objectKey(aws.String(object)),
+		UploadId: aws.String(uploadID),
+	}); code != s3err.ErrNone {
+		glog.Warningf("checkUploadStillOpen %s/%s: part left behind, cleanup failed", bucket, uploadID)
+	}
+	s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchUpload)
+	return false
 }
 
 // getMultipartSSEAlgorithm returns the canonical SSE algorithm ("AES256" or
@@ -521,11 +561,30 @@ func (s3a *S3ApiServer) checkUploadId(object string, id string) error {
 
 	hash := s3a.generateUploadID(object)
 
-	if !strings.HasPrefix(id, hash) {
+	// uploadID becomes a filer directory name. Accept the historical hash-only
+	// form and the exact current hash_UUID form, not arbitrary hash-prefixed paths.
+	valid := id == hash // legacy upload IDs generated before the UUID suffix was added
+	if len(id) == len(hash)+1+32 && strings.HasPrefix(id, hash+"_") {
+		valid = isLowerHex(id[len(hash)+1:])
+	}
+	if !valid {
 		glog.Errorf("object %s and uploadID %s are not matched", object, id)
 		return fmt.Errorf("object %s and uploadID %s are not matched", object, id)
 	}
 	return nil
+}
+
+func isLowerHex(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // Parse bucket url queries for ?uploads

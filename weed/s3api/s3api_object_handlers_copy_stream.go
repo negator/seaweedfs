@@ -87,7 +87,7 @@ func (s3a *S3ApiServer) streamCopyChunkRange(
 	}
 	// Child context so a terminal error here unblocks both legs
 	// immediately. Without this, a failed POST closes pipeReader
-	// (which only fails the producer's writes), but the source GET's
+	// (which only fails the producer's writes), but the source GET's  //codespell:ignore
 	// read loop would keep draining srcResp.Body in the background
 	// until EOF — wasting source-volume bandwidth and CPU on a copy
 	// that's already failed. Cancelling streamCtx tears down both the
@@ -106,7 +106,7 @@ func (s3a *S3ApiServer) streamCopyChunkRange(
 		return fmt.Errorf("create source GET: %w", err)
 	}
 	if srcJwt != "" {
-		srcReq.Header.Set("Authorization", "BEARER "+srcJwt)
+		srcReq.Header.Set("Authorization", security.BearerPrefix+srcJwt)
 	}
 	if isFullChunk {
 		// Manually setting Accept-Encoding tells Go's http.Transport that
@@ -188,7 +188,7 @@ func (s3a *S3ApiServer) streamCopyChunkRange(
 	}
 	req.Header.Set("Content-Type", contentType)
 	if dstJwt != "" {
-		req.Header.Set("Authorization", "BEARER "+string(dstJwt))
+		req.Header.Set("Authorization", security.BearerPrefix+string(dstJwt))
 	}
 
 	resp, err := util_http.GetGlobalHttpClient().Do(req)

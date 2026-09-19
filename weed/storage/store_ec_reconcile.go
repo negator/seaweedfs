@@ -3,6 +3,7 @@ package storage
 import (
 	"os"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -10,7 +11,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
-	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 )
 
 // datOwnerInfo records both the disk that holds a .dat for a given
@@ -24,7 +24,7 @@ type datOwnerInfo struct {
 }
 
 // ecKeyForReconcile keys orphan-shard reconciliation by collection + volume
-// id. Per-collection grouping matters because two collections can re-use the
+// id. Per-collection grouping matters because two collections can reuse the
 // same volume id, and we must only pair shards with their own .ecx file.
 type ecKeyForReconcile struct {
 	collection string
@@ -155,17 +155,13 @@ func (s *Store) indexEcxOwners() map[ecKeyForReconcile]ecxOwnerInfo {
 				continue
 			}
 			seen[scan] = true
-			entries, err := os.ReadDir(scan)
-			if err != nil {
-				continue
-			}
-			for _, entry := range entries {
+			if err := eachDirEntry(scan, func(entry os.DirEntry) bool {
 				if entry.IsDir() {
-					continue
+					return true
 				}
 				name := entry.Name()
 				if !strings.HasSuffix(name, ".ecx") {
-					continue
+					return true
 				}
 				// A 0-byte .ecx is a corrupt stub from a failed copy and
 				// not a credible owner — skip it so the scan keeps looking
@@ -176,17 +172,20 @@ func (s *Store) indexEcxOwners() map[ecKeyForReconcile]ecxOwnerInfo {
 				// shards unloaded even when a valid index exists nearby.
 				info, statErr := entry.Info()
 				if statErr != nil || info.Size() == 0 {
-					continue
+					return true
 				}
 				base := name[:len(name)-len(".ecx")]
 				collection, vid, err := parseCollectionVolumeId(base)
 				if err != nil {
-					continue
+					return true
 				}
 				key := ecKeyForReconcile{collection: collection, vid: vid}
 				if _, exists := owners[key]; !exists {
 					owners[key] = ecxOwnerInfo{location: loc, idxDir: scan}
 				}
+				return true
+			}); err != nil {
+				glog.Warningf("scan %s for .ecx owners: %v", scan, err)
 			}
 		}
 	}
@@ -216,20 +215,55 @@ func (s *Store) indexEcxOwners() map[ecKeyForReconcile]ecxOwnerInfo {
 // also fall through unchanged because the lookup in the .dat index below
 // will simply not find a match.
 //
-// Before deleting any EC files we also check that the sibling .dat is
-// plausibly the encoding source: at least super_block.SuperBlockSize
-// bytes long, and — when the EC's .vif recorded a non-zero source size
-// in datFileSize — at least that many bytes. A zero-byte shell or a
-// truncated .dat does not justify wiping the partial EC, because that
-// EC shard may still combine usefully with shards on other servers in
-// a recoverable distributed-EC layout.
+// The sibling .dat must be a credible encoding source before we delete
+// anything: at least the size .vif recorded at encode time, or — when
+// unknown (0) — more than a bare superblock so an empty 8-byte stub
+// can't pass. A truncated .dat leaves the partial EC alone; those shards
+// may still reconstruct from other servers.
 //
 // We push DeletedEcShardsChan for every pruned shard so the master is told
 // to forget the registrations the per-disk pass already emitted on
 // NewEcShardsChan during startup, instead of waiting for the first
 // periodic heartbeat to reconcile.
+// countEcShardsNodeWide returns the distinct EC shard ids for (collection, vid)
+// across every disk on this store. Shards can be split across sibling disks, so
+// a per-disk count understates a node-wide-recoverable set. Caller must not hold
+// any DiskLocation.ecVolumesLock (this takes them).
+func (s *Store) countEcShardsNodeWide(collection string, vid needle.VolumeId) int {
+	seen := make(map[erasure_coding.ShardId]struct{})
+	for _, loc := range s.Locations {
+		loc.ecVolumesLock.RLock()
+		if ev, ok := loc.ecVolumes[vid]; ok && ev.Collection == collection {
+			for _, sh := range ev.Shards {
+				seen[sh.ShardId] = struct{}{}
+			}
+		}
+		loc.ecVolumesLock.RUnlock()
+	}
+	return len(seen)
+}
+
+// hasEcVolumes reports whether any disk on this store has an EC volume loaded.
+func (s *Store) hasEcVolumes() bool {
+	for _, loc := range s.Locations {
+		loc.ecVolumesLock.RLock()
+		count := len(loc.ecVolumes)
+		loc.ecVolumesLock.RUnlock()
+		if count > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) pruneIncompleteEcWithSiblingDat() {
 	if len(s.Locations) < 2 {
+		return
+	}
+	// Only loaded EC volumes are ever pruned, so a store holding none has
+	// nothing to decide — and indexDatOwners below would otherwise walk every
+	// disk and key a map by every .dat on the server to answer no question.
+	if !s.hasEcVolumes() {
 		return
 	}
 
@@ -247,12 +281,19 @@ func (s *Store) pruneIncompleteEcWithSiblingDat() {
 			messages   []*master_pb.VolumeEcShardInformationMessage
 			datDir     string
 			shardCount int
+			dataShards int
 		}
 		var victims []victim
 		loc.ecVolumesLock.RLock()
 		for vid, ev := range loc.ecVolumes {
 			shardCount := len(ev.Shards)
-			if shardCount >= erasure_coding.DataShardsCount {
+			// Use the volume's own ratio, not the OSS default, so a full
+			// custom-ratio data set (e.g. 9 of a 9+3) is not mistaken for a leftover.
+			dataShards := erasure_coding.DataShardsCount
+			if ev.ECContext != nil && ev.ECContext.DataShards > 0 {
+				dataShards = ev.ECContext.DataShards
+			}
+			if shardCount >= dataShards {
 				continue
 			}
 			key := ecKeyForReconcile{collection: ev.Collection, vid: vid}
@@ -260,17 +301,13 @@ func (s *Store) pruneIncompleteEcWithSiblingDat() {
 			if !hasDat || owner.location == loc {
 				continue
 			}
-			// Decide whether the sibling .dat is a credible source.
-			// Prefer the size baked into .vif at encode time; fall
-			// back to "at least a superblock" for old EC volumes
-			// whose .vif predates the field.
-			requiredDatSize := ev.DatFileSize()
-			if requiredDatSize <= 0 {
-				requiredDatSize = int64(super_block.SuperBlockSize)
-			}
-			if owner.size < requiredDatSize {
-				glog.Warningf("ec volume %d (collection=%q) on %s has only %d shards but sibling .dat on %s is %d bytes (need >= %d); leaving partial EC in place so distributed reconstruction is still possible",
-					vid, ev.Collection, loc.Directory, shardCount, owner.location.Directory, owner.size, requiredDatSize)
+			// Delete only against a byte-exact committed source: the sibling
+			// .dat must equal the size .vif recorded at encode time. An unknown
+			// (0) or mismatched size cannot prove the .dat holds this data.
+			datFileSize := ev.DatFileSize()
+			if datFileSize <= 0 || owner.size != datFileSize {
+				glog.Warningf("ec volume %d (collection=%q) on %s has only %d shards; sibling .dat on %s is %d bytes but .vif recorded %d (need byte-exact match); leaving partial EC in place",
+					vid, ev.Collection, loc.Directory, shardCount, owner.location.Directory, owner.size, datFileSize)
 				continue
 			}
 			victims = append(victims, victim{
@@ -279,18 +316,27 @@ func (s *Store) pruneIncompleteEcWithSiblingDat() {
 				messages:   ev.ToVolumeEcShardInformationMessage(uint32(diskId)),
 				datDir:     owner.location.Directory,
 				shardCount: shardCount,
+				dataShards: dataShards,
 			})
 		}
 		loc.ecVolumesLock.RUnlock()
 
 		for _, v := range victims {
-			glog.Warningf("ec volume %d (collection=%q) on %s has only %d shards (need %d) while a healthy .dat exists on sibling disk %s; cleaning up leftover EC files (issue 9478)",
-				v.vid, v.collection, loc.Directory, v.shardCount, erasure_coding.DataShardsCount, v.datDir)
+			// Never prune when the shards are recoverable node-wide (a set
+			// split across sibling disks summing to >= dataShards); they may
+			// be sole copies of a distributed volume.
+			if nodeWide := s.countEcShardsNodeWide(v.collection, v.vid); nodeWide >= v.dataShards {
+				glog.Warningf("ec volume %d (collection=%q): %d shards present node-wide (>= %d) are independently recoverable; leaving EC in place despite a sibling .dat",
+					v.vid, v.collection, nodeWide, v.dataShards)
+				continue
+			}
+			glog.Warningf("ec volume %d (collection=%q) on %s has only %d shards (need %d) while a byte-exact source .dat exists on sibling disk %s; cleaning up leftover EC files",
+				v.vid, v.collection, loc.Directory, v.shardCount, v.dataShards, v.datDir)
 			loc.unloadEcVolume(v.vid)
 			loc.removeEcVolumeFiles(v.collection, v.vid)
 			for _, msg := range v.messages {
 				select {
-				case s.DeletedEcShardsChan <- *msg:
+				case s.DeletedEcShardsChan <- msg:
 				default:
 					// Channel full during startup is fine — the next
 					// periodic heartbeat reports the full ecVolumes
@@ -317,31 +363,30 @@ func (s *Store) pruneIncompleteEcWithSiblingDat() {
 func (s *Store) indexDatOwners() map[ecKeyForReconcile]datOwnerInfo {
 	owners := make(map[ecKeyForReconcile]datOwnerInfo)
 	for _, loc := range s.Locations {
-		entries, err := os.ReadDir(loc.Directory)
-		if err != nil {
-			continue
-		}
-		for _, entry := range entries {
+		if err := eachDirEntry(loc.Directory, func(entry os.DirEntry) bool {
 			if entry.IsDir() {
-				continue
+				return true
 			}
 			name := entry.Name()
 			if !strings.HasSuffix(name, ".dat") {
-				continue
+				return true
 			}
 			base := name[:len(name)-len(".dat")]
 			collection, vid, err := parseCollectionVolumeId(base)
 			if err != nil {
-				continue
+				return true
 			}
 			info, err := entry.Info()
 			if err != nil {
-				continue
+				return true
 			}
 			key := ecKeyForReconcile{collection: collection, vid: vid}
 			if _, exists := owners[key]; !exists {
 				owners[key] = datOwnerInfo{location: loc, size: info.Size()}
 			}
+			return true
+		}); err != nil {
+			glog.Warningf("scan %s for .dat owners: %v", loc.Directory, err)
 		}
 	}
 	return owners
@@ -355,38 +400,42 @@ func (s *Store) indexDatOwners() map[ecKeyForReconcile]datOwnerInfo {
 // Zero-byte shard files are ignored — loadAllEcShards already treats them
 // as cleanup-worthy noise and we want the same shape here.
 func (l *DiskLocation) collectOrphanEcShards() map[ecKeyForReconcile][]string {
-	entries, err := os.ReadDir(l.Directory)
-	if err != nil {
-		return nil
-	}
 	orphans := make(map[ecKeyForReconcile][]string)
-	for _, entry := range entries {
+	if err := eachDirEntry(l.Directory, func(entry os.DirEntry) bool {
 		if entry.IsDir() {
-			continue
+			return true
 		}
 		name := entry.Name()
 		ext := path.Ext(name)
 		if !re.MatchString(ext) {
-			continue
+			return true
 		}
 		info, err := entry.Info()
 		if err != nil || info.Size() == 0 {
-			continue
+			return true
 		}
 		shardId, err := strconv.ParseInt(ext[3:], 10, 64)
 		if err != nil || shardId < 0 || shardId > 255 {
-			continue
+			return true
 		}
 		base := name[:len(name)-len(ext)]
 		collection, vid, err := parseCollectionVolumeId(base)
 		if err != nil {
-			continue
+			return true
 		}
 		if _, loaded := l.FindEcShard(vid, erasure_coding.ShardId(shardId)); loaded {
-			continue
+			return true
 		}
 		key := ecKeyForReconcile{collection: collection, vid: vid}
 		orphans[key] = append(orphans[key], name)
+		return true
+	}); err != nil {
+		return nil
+	}
+	// os.ReadDir used to hand these back sorted; the shard lists are logged
+	// and mounted in order, so keep them so.
+	for _, shards := range orphans {
+		slices.Sort(shards)
 	}
 	return orphans
 }

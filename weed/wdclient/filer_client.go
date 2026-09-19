@@ -17,6 +17,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 // UrlPreference controls which URL to use for volume access
@@ -467,6 +468,7 @@ func (fc *FilerClient) GetLookupFileIdFunction() LookupFileIdFunctionType {
 
 		// Build URLs with publicUrl preference, and also prefer same DC
 		var sameDcUrls, otherDcUrls []string
+		localUrls := make(map[string]bool)
 		dataCenter := fc.GetDataCenter()
 		for _, loc := range locations {
 			url := loc.PublicUrl
@@ -474,6 +476,10 @@ func (fc *FilerClient) GetLookupFileIdFunction() LookupFileIdFunctionType {
 				url = loc.Url
 			}
 			httpUrl := "http://" + url + "/" + fileId
+			glog.V(4).Infof("lookup %s => %s, data in remote storage tier: %v", fileId, url, loc.DataInRemote)
+			if !loc.DataInRemote {
+				localUrls[httpUrl] = true
+			}
 			if dataCenter != "" && dataCenter == loc.DataCenter {
 				sameDcUrls = append(sameDcUrls, httpUrl)
 			} else {
@@ -483,7 +489,13 @@ func (fc *FilerClient) GetLookupFileIdFunction() LookupFileIdFunctionType {
 		// Shuffle to distribute load across volume servers
 		rand.Shuffle(len(sameDcUrls), func(i, j int) { sameDcUrls[i], sameDcUrls[j] = sameDcUrls[j], sameDcUrls[i] })
 		rand.Shuffle(len(otherDcUrls), func(i, j int) { otherDcUrls[i], otherDcUrls[j] = otherDcUrls[j], otherDcUrls[i] })
-		// Prefer same data center
+		// Local replicas go first inside each data center, but never ahead of
+		// the data-center preference itself. Mirrors
+		// vidMap.LookupVolumeServerUrl so all client lookup paths agree.
+		if len(localUrls) > 0 {
+			sameDcUrls = util.ReorderToFront(localUrls, sameDcUrls)
+			otherDcUrls = util.ReorderToFront(localUrls, otherDcUrls)
+		}
 		fullUrls = append(sameDcUrls, otherDcUrls...)
 		return fullUrls, nil
 	}
@@ -519,12 +531,27 @@ func isRetryableGrpcError(err error) bool {
 		}
 	}
 
-	// Fallback to string matching for non-gRPC errors (e.g., network errors)
-	errStr := err.Error()
-	return strings.Contains(errStr, "transport") ||
+	// Fallback for non-gRPC errors (e.g. network errors). "connection" and
+	// "timeout" are deliberately broader than the shared classifier: a volume
+	// lookup is a cheap read-only call, so leaning towards a retry is fine.
+	errStr := strings.ToLower(err.Error())
+	return util.IsTransientError(err) ||
 		strings.Contains(errStr, "connection") ||
-		strings.Contains(errStr, "timeout") ||
-		strings.Contains(errStr, "unavailable")
+		strings.Contains(errStr, "timeout")
+}
+
+// jitter returns a duration in the range [d/2, d) using equal jitter.
+// This prevents thundering herds when many clients retry simultaneously
+// after a transient failure (e.g., network partition healing).
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	half := d / 2
+	if half <= 0 {
+		return d
+	}
+	return half + time.Duration(rand.Int63n(int64(half)))
 }
 
 // shouldSkipUnhealthyFiler checks if we should skip a filer based on recent failures
@@ -694,9 +721,16 @@ func (p *filerVolumeProvider) LookupVolumeIds(ctx context.Context, volumeIds []s
 
 		// Transient error - retry if we have attempts left
 		if retry < maxRetries-1 {
+			jitteredWait := jitter(waitTime)
 			glog.V(1).Infof("FilerClient: all %d filer(s) failed with retryable error (attempt %d/%d), retrying in %v: %v",
-				n, retry+1, maxRetries, waitTime, lastErr)
-			time.Sleep(waitTime)
+				n, retry+1, maxRetries, jitteredWait, lastErr)
+			timer := time.NewTimer(jitteredWait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
 			waitTime = time.Duration(float64(waitTime) * fc.retryBackoffFactor)
 		}
 	}

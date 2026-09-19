@@ -6,8 +6,8 @@ import (
 )
 
 // SchedulerLane identifies an independent scheduling track. Each lane runs
-// its own goroutine, maintains its own detection timing, and acquires its
-// own admin lock so that workloads in different lanes never block each other.
+// its own goroutine and maintains its own detection timing so that
+// workloads in different lanes never block each other.
 type SchedulerLane string
 
 const (
@@ -22,11 +22,15 @@ const (
 	// LaneLifecycle handles S3 object store lifecycle management
 	// (expiration, transition, abort incomplete multipart uploads).
 	LaneLifecycle SchedulerLane = "lifecycle"
+
+	// LaneLance handles table-bucket Lance maintenance: fragment compaction,
+	// index optimization and version cleanup.
+	LaneLance SchedulerLane = "lance"
 )
 
 // AllLanes returns every defined scheduler lane in a stable order.
 func AllLanes() []SchedulerLane {
-	return []SchedulerLane{LaneDefault, LaneIceberg, LaneLifecycle}
+	return []SchedulerLane{LaneDefault, LaneIceberg, LaneLifecycle, LaneLance}
 }
 
 // laneIdleSleep maps each lane to its default idle sleep duration.
@@ -36,20 +40,26 @@ var laneIdleSleep = map[SchedulerLane]time.Duration{
 	LaneDefault:   61 * time.Second,
 	LaneIceberg:   61 * time.Second,
 	LaneLifecycle: 5 * time.Minute,
+	LaneLance:     61 * time.Second,
 }
 
 // laneRequiresLock maps each lane to whether its job types must be
-// serialised under a single admin lock. The default lane needs this
-// because volume-management operations share global state. Other
-// lanes run each job type independently.
+// serialised and run under the shared cluster admin lock. The default
+// lane needs this because volume-management operations share global
+// state; the lock is taken around each detection and each job so manual
+// shell operations can interleave. Other lanes run each job type
+// independently without the lock.
 var laneRequiresLock = map[SchedulerLane]bool{
 	LaneDefault:   true,
 	LaneIceberg:   false,
 	LaneLifecycle: false,
+	// Lance maintenance rewrites files inside one table and shares no global
+	// state, so it has no more need of the cluster admin lock than Iceberg does.
+	LaneLance: false,
 }
 
-// LaneRequiresLock returns true if the given lane needs a single admin
-// lock to serialise its job types. Unknown lanes default to true.
+// LaneRequiresLock returns true if the given lane serialises its job types
+// and runs them under the cluster admin lock. Unknown lanes default to true.
 func LaneRequiresLock(lane SchedulerLane) bool {
 	if v, ok := laneRequiresLock[lane]; ok {
 		return v
@@ -81,6 +91,13 @@ var jobTypeLaneMap = map[string]SchedulerLane{
 
 	// S3 lifecycle management
 	"s3_lifecycle": LaneLifecycle,
+
+	// Lance table maintenance. Without these the job types fall back to the
+	// default lane, which serialises everything under the cluster admin lock
+	// and would queue a compaction behind volume balancing.
+	"lance_compact":          LaneLance,
+	"lance_optimize_indices": LaneLance,
+	"lance_cleanup_versions": LaneLance,
 }
 
 // JobTypeLane returns the scheduler lane for the given job type.

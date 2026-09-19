@@ -3,8 +3,13 @@
 //! Provides a trait-based abstraction over cloud storage providers (S3, GCS, Azure, etc.)
 //! and a registry to create clients from protobuf RemoteConf messages.
 
+pub mod endpoint_guard;
 pub mod s3;
 pub mod s3_tier;
+
+pub use endpoint_guard::{
+    guarded_tcp_connect, validate_remote_endpoint, validate_replica_target,
+};
 
 use crate::pb::remote_pb::{RemoteConf, RemoteStorageLocation};
 
@@ -86,6 +91,26 @@ pub fn make_remote_storage_client(
     }
 }
 
+/// Endpoint URL that the volume server would dial directly for `conf`, or
+/// `None` for non-S3-compatible backends. Every type handled here routes
+/// through [`s3::S3RemoteStorageClient`] with a caller-supplied endpoint, so
+/// the SSRF guard must validate each one. Keep this match in sync with
+/// [`make_remote_storage_client`].
+pub fn s3_compatible_endpoint(conf: &RemoteConf) -> Option<&str> {
+    match conf.r#type.as_str() {
+        "s3" => Some(&conf.s3_endpoint),
+        "wasabi" => Some(&conf.wasabi_endpoint),
+        "backblaze" => Some(&conf.backblaze_endpoint),
+        "aliyun" => Some(&conf.aliyun_endpoint),
+        "tencent" => Some(&conf.tencent_endpoint),
+        "baidu" => Some(&conf.baidu_endpoint),
+        "filebase" => Some(&conf.filebase_endpoint),
+        "storj" => Some(&conf.storj_endpoint),
+        "contabo" => Some(&conf.contabo_endpoint),
+        _ => None,
+    }
+}
+
 /// Extract S3-compatible credentials from a RemoteConf based on its type.
 fn extract_s3_credentials(conf: &RemoteConf) -> (String, String, String, String) {
     match conf.r#type.as_str() {
@@ -153,5 +178,71 @@ fn extract_s3_credentials(conf: &RemoteConf) -> (String, String, String, String)
             conf.s3_endpoint.clone(),
             conf.s3_region.clone(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn s3_compatible_endpoint_covers_all_s3_backends() {
+        let s3 = RemoteConf {
+            r#type: "s3".to_string(),
+            s3_endpoint: "http://s3.internal".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(s3_compatible_endpoint(&s3), Some("http://s3.internal"));
+
+        // A non-"s3" S3-compatible type still surfaces its own endpoint, so the
+        // SSRF guard cannot be bypassed by picking a different alias.
+        let wasabi = RemoteConf {
+            r#type: "wasabi".to_string(),
+            wasabi_endpoint: "http://wasabi.internal".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            s3_compatible_endpoint(&wasabi),
+            Some("http://wasabi.internal")
+        );
+
+        // Non-S3 backends do not dial a caller-supplied URL directly.
+        let gcs = RemoteConf {
+            r#type: "gcs".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(s3_compatible_endpoint(&gcs), None);
+    }
+
+    #[test]
+    fn azure_endpoint_has_no_ssrf_path() {
+        // The Go volume server guards the caller-supplied azure endpoint against
+        // SSRF. This server has no azure backend, so there is nothing to dial:
+        // azure is not S3-compatible (the endpoint guard does not apply) and
+        // make_remote_storage_client rejects the type before building a client.
+        let azure = RemoteConf {
+            r#type: "azure".to_string(),
+            azure_endpoint: "https://169.254.169.254/".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(s3_compatible_endpoint(&azure), None);
+        assert!(make_remote_storage_client(&azure).is_err());
+    }
+
+    #[test]
+    fn gcs_credentials_have_no_ssrf_path() {
+        // The Go volume server accepts only static-key gcs credentials and puts
+        // their token endpoint behind the SSRF guard, because the SDK dials
+        // whatever url, file or executable the credentials name. This server has
+        // no gcs backend, so make_remote_storage_client rejects the type before
+        // any credentials are parsed. Anyone adding one must carry both guards
+        // over with it.
+        let gcs = RemoteConf {
+            r#type: "gcs".to_string(),
+            gcs_google_application_credentials: r#"{"type":"external_account","credential_source":{"url":"http://169.254.169.254/"}}"#.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(s3_compatible_endpoint(&gcs), None);
+        assert!(make_remote_storage_client(&gcs).is_err());
     }
 }

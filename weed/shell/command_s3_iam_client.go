@@ -24,7 +24,7 @@ const iamRequestTimeout = 30 * time.Second
 // applied — callers can derive child contexts but should not need their own
 // timeout boilerplate.
 func (ce *CommandEnv) withIamClient(fn func(ctx context.Context, client iam_pb.SeaweedIdentityAccessManagementClient) error) error {
-	return pb.WithGrpcClient(false, 0, func(conn *grpc.ClientConn) error {
+	return pb.WithGrpcClient(context.Background(), false, 0, func(conn *grpc.ClientConn) error {
 		ctx, cancel := context.WithTimeout(iamAdminAuthContext(context.Background()), iamRequestTimeout)
 		defer cancel()
 		return fn(ctx, iam_pb.NewSeaweedIdentityAccessManagementClient(conn))
@@ -41,5 +41,5 @@ func iamAdminAuthContext(ctx context.Context) context.Context {
 	if token == "" {
 		return ctx
 	}
-	return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+string(token))
+	return metadata.AppendToOutgoingContext(ctx, "authorization", security.BearerPrefix+string(token))
 }

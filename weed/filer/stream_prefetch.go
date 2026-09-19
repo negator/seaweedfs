@@ -10,6 +10,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 )
@@ -46,6 +47,7 @@ func streamChunksPrefetched(
 	prefetchAhead int,
 ) error {
 	downloadThrottler := util.NewWriteThrottler(downloadMaxBytesPs)
+	invalidator, _ := masterClient.(CacheInvalidator)
 
 	// Create a local cancellable context so the consumer can stop the producer
 	// and all in-flight fetch goroutines on error (e.g., client disconnect).
@@ -98,14 +100,14 @@ func streamChunksPrefetched(
 			}
 
 			// Launch fetch goroutine
-			go func(cv *ChunkView, urls []string, jwt string, pw *io.PipeWriter, res *chunkPipeResult) {
+			go func(cv *ChunkView, urls []string, jwt string, pw *io.PipeWriter, res *chunkPipeResult, refresh util_http.RefreshUrlsFunc) {
 				defer func() { <-sem }() // release semaphore
 				defer close(res.done)
 
 				written, err := retriedStreamFetchChunkData(
 					localCtx, pw, urls, jwt,
 					cv.CipherKey, cv.IsGzipped, cv.IsFullChunk(),
-					cv.OffsetInChunk, int(cv.ViewSize),
+					cv.OffsetInChunk, int(cv.ViewSize), refresh,
 				)
 				res.written = written
 				res.fetchErr = err
@@ -115,7 +117,7 @@ func streamChunksPrefetched(
 				} else {
 					pw.Close()
 				}
-			}(chunkView, urlStrings, jwt, pw, result)
+			}(chunkView, urlStrings, jwt, pw, result, refreshUrls(localCtx, invalidator, masterClient.GetLookupFileIdFunction(), chunkView.FileId))
 
 			// Send result to consumer (blocks if channel full, back-pressuring producer)
 			select {
@@ -177,7 +179,7 @@ func streamChunksPrefetched(
 				consumeErr = err
 				break
 			}
-			retryErr := retryWithCacheInvalidation(localCtx, writer, chunkView, result.urlStrings, jwtFunc, masterClient)
+			retryErr := retryWithCacheInvalidation(localCtx, writer, chunkView, result.urlStrings, result.fetchErr, jwtFunc, masterClient)
 			if retryErr != nil {
 				stats.FilerHandlerCounter.WithLabelValues("chunkDownloadError").Inc()
 				consumeErr = fmt.Errorf("read chunk: %w", retryErr)
@@ -230,45 +232,25 @@ func streamChunksPrefetched(
 	return nil
 }
 
-// retryWithCacheInvalidation attempts to re-fetch a chunk after invalidating the URL cache.
-// This mirrors the retry logic in PrepareStreamContentWithThrottler's sequential path.
+// retryWithCacheInvalidation re-fetches a chunk via the shared location self-heal after the
+// initial fetch failed with originalErr.
 func retryWithCacheInvalidation(
 	ctx context.Context,
 	writer io.Writer,
 	chunkView *ChunkView,
 	oldUrlStrings []string,
+	originalErr error,
 	jwtFunc VolumeServerJwtFunction,
 	masterClient wdclient.HasLookupFileIdFunction,
 ) error {
-	invalidator, ok := masterClient.(CacheInvalidator)
-	if !ok {
-		return fmt.Errorf("read chunk %s failed and no cache invalidator available", chunkView.FileId)
-	}
-
-	glog.V(0).InfofCtx(ctx, "prefetch read chunk %s failed, invalidating cache and retrying", chunkView.FileId)
-	invalidator.InvalidateCache(chunkView.FileId)
-
-	newUrlStrings, lookupErr := masterClient.GetLookupFileIdFunction()(ctx, chunkView.FileId)
-	if lookupErr != nil {
-		glog.WarningfCtx(ctx, "failed to re-lookup chunk %s after cache invalidation: %v", chunkView.FileId, lookupErr)
-		return fmt.Errorf("re-lookup chunk %s: %w", chunkView.FileId, lookupErr)
-	}
-	if len(newUrlStrings) == 0 {
-		glog.WarningfCtx(ctx, "re-lookup for chunk %s returned no locations, skipping retry", chunkView.FileId)
-		return fmt.Errorf("re-lookup chunk %s: no locations", chunkView.FileId)
-	}
-
-	if urlSlicesEqual(oldUrlStrings, newUrlStrings) {
-		glog.V(0).InfofCtx(ctx, "re-lookup returned same locations for chunk %s, skipping retry", chunkView.FileId)
-		return fmt.Errorf("read chunk %s failed, same locations after cache invalidation", chunkView.FileId)
-	}
-
-	glog.V(0).InfofCtx(ctx, "retrying read chunk %s with new locations: %v", chunkView.FileId, newUrlStrings)
-	jwt := jwtFunc(chunkView.FileId)
-	_, err := retriedStreamFetchChunkData(
-		ctx, writer, newUrlStrings, jwt,
-		chunkView.CipherKey, chunkView.IsGzipped, chunkView.IsFullChunk(),
-		chunkView.OffsetInChunk, int(chunkView.ViewSize),
-	)
-	return err
+	invalidator, _ := masterClient.(CacheInvalidator)
+	return retryFetchWithFreshLocations(ctx, invalidator, masterClient.GetLookupFileIdFunction(), chunkView.FileId, oldUrlStrings, originalErr, func(newUrls []string) error {
+		jwt := jwtFunc(chunkView.FileId)
+		_, err := retriedStreamFetchChunkData(
+			ctx, writer, newUrls, jwt,
+			chunkView.CipherKey, chunkView.IsGzipped, chunkView.IsFullChunk(),
+			chunkView.OffsetInChunk, int(chunkView.ViewSize), nil,
+		)
+		return err
+	})
 }

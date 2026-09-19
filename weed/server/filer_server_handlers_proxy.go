@@ -5,6 +5,8 @@ import (
 	"sync"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 	"github.com/seaweedfs/seaweedfs/weed/util/request_id"
@@ -12,6 +14,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"strings"
 )
 
 // proxyReadConcurrencyPerVolumeServer limits how many concurrent proxy read
@@ -47,8 +50,59 @@ func releaseProxySemaphore(host string) {
 	}
 }
 
+// isProxyReadMethod reports whether a proxied request only reads. Everything
+// else is treated as a write for both credential and concurrency purposes.
+func isProxyReadMethod(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead
+}
+
+// baseFileId strips the trailing _N delta suffix that batch assigns append to a
+// fid, and only that: the suffix must be a non-empty run of digits, otherwise
+// the fid is returned whole for the caller to reject. The volume server compares
+// a JWT's fid claim against the stripped form (see
+// VolumeServer.maybeCheckJwtAuthorization), so anything minting or parsing a fid
+// on this side has to agree with it.
+//
+// That server strips at the last "_" unconditionally, which is safe there
+// because its fid already came out of a path the mux parsed and so cannot hold
+// a "/". Here the value is raw query input, and an unguarded strip would reduce
+// "3,01637037d6_1/../../status" to a valid fid and wave the traversal through.
+func baseFileId(fileId string) string {
+	sepIndex := strings.LastIndex(fileId, "_")
+	if sepIndex <= 0 {
+		return fileId
+	}
+	delta := fileId[sepIndex+1:]
+	if delta == "" {
+		return fileId
+	}
+	for _, c := range delta {
+		if c < '0' || c > '9' {
+			return fileId
+		}
+	}
+	return fileId[:sepIndex]
+}
+
+// validateProxyChunkId rejects a proxyChunkId that is not a well-formed fid.
+// LookupFileId only requires a single comma, and the value is pasted into the
+// volume server URL path, so "3,x/../../status" resolves to a volume the caller
+// never named -- the volume server's mux cleans the dot segments and redirects
+// to /status, which the filer follows and relays.
+func validateProxyChunkId(fileId string) error {
+	_, err := needle.ParseFileIdFromString(baseFileId(fileId))
+	return err
+}
+
 func (fs *FilerServer) proxyToVolumeServer(w http.ResponseWriter, r *http.Request, fileId string) {
 	ctx := r.Context()
+
+	if err := validateProxyChunkId(fileId); err != nil {
+		glog.V(1).InfofCtx(ctx, "reject proxyChunkId %q: %v", fileId, err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	urlStrings, err := fs.filer.MasterClient.GetLookupFileIdFunction()(ctx, fileId)
 	if err != nil {
 		glog.ErrorfCtx(ctx, "locate %s: %v", fileId, err)
@@ -61,21 +115,48 @@ func (fs *FilerServer) proxyToVolumeServer(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	proxyReq, err := http.NewRequest(r.Method, urlStrings[rand.IntN(len(urlStrings))], r.Body)
+	fs.proxyToVolumeServerURL(w, r, fileId, urlStrings[rand.IntN(len(urlStrings))])
+}
+
+// proxyToVolumeServerURL forwards the request to one already-resolved volume
+// server URL.
+func (fs *FilerServer) proxyToVolumeServerURL(w http.ResponseWriter, r *http.Request, fileId, targetURL string) {
+	ctx := r.Context()
+
+	// targetURL from LookupFileId already contains the fileId in the path
+	// (e.g. http://server:8080/6,08136bdce4). Forward the caller's query params
+	// (e.g. readDeleted=true from weed mount) but drop the internal proxyChunkId.
+	query := r.URL.Query()
+	query.Del(util_http.ProxyChunkIdParam)
+	// "jwt" here is the filer credential that got the caller past the gate, and
+	// a volume server has no business seeing one. security.GetJwt reads that
+	// parameter before the Authorization header, so relaying it would also
+	// hide the volume credential the filer attaches below.
+	query.Del("jwt")
+	if encoded := query.Encode(); encoded != "" {
+		targetURL += "?" + encoded
+	}
+
+	proxyReq, err := http.NewRequest(r.Method, targetURL, r.Body)
 	if err != nil {
-		glog.ErrorfCtx(ctx, "NewRequest %s: %v", urlStrings[0], err)
+		glog.ErrorfCtx(ctx, "NewRequest %s: %v", targetURL, err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	// Limit concurrent requests per volume server to prevent overload
-	volumeHost := proxyReq.URL.Host
-	if err := acquireProxySemaphore(ctx, volumeHost); err != nil {
-		glog.V(0).InfofCtx(ctx, "proxy to %s cancelled while waiting: %v", volumeHost, err)
-		w.WriteHeader(http.StatusServiceUnavailable)
-		return
+	// Limit concurrent reads per volume server to prevent overload. Writes are
+	// deliberately exempt: the bursts this exists to contain are replication
+	// reads, and an upload queued behind them stalls a caller that is holding a
+	// volume assignment open.
+	if isProxyReadMethod(r.Method) {
+		volumeHost := proxyReq.URL.Host
+		if err := acquireProxySemaphore(ctx, volumeHost); err != nil {
+			glog.V(0).InfofCtx(ctx, "proxy to %s cancelled while waiting: %v", volumeHost, err)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		defer releaseProxySemaphore(volumeHost)
 	}
-	defer releaseProxySemaphore(volumeHost)
 
 	proxyReq.Header.Set("Host", r.Host)
 	proxyReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
@@ -85,6 +166,18 @@ func (fs *FilerServer) proxyToVolumeServer(w http.ResponseWriter, r *http.Reques
 		for _, value := range values {
 			proxyReq.Header.Add(header, value)
 		}
+	}
+
+	// Decide the volume credential explicitly rather than letting the copied
+	// header stand. The caller's Authorization is the filer credential that got
+	// them past the gate: a volume server has no business seeing one, and it
+	// would not honour it anyway. Mint the credential the volume server does
+	// ask for, at the access level this request needs, and drop the caller's
+	// when there is nothing to mint.
+	if jwt := fs.maybeGetVolumeJwtAuthorizationToken(fileId, !isProxyReadMethod(r.Method)); jwt != "" {
+		proxyReq.Header.Set("Authorization", security.BearerPrefix+jwt)
+	} else {
+		proxyReq.Header.Del("Authorization")
 	}
 
 	proxyResponse, postErr := util_http.GetGlobalHttpClient().Do(proxyReq)

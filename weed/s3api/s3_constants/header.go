@@ -89,6 +89,13 @@ const (
 	AmzChecksumSHA256       = "X-Amz-Checksum-Sha256"
 	AmzTrailer              = "X-Amz-Trailer"
 	AmzSdkChecksumAlgorithm = "X-Amz-Sdk-Checksum-Algorithm"
+	AmzChecksumType         = "X-Amz-Checksum-Type"
+
+	// S3 checksum type values (x-amz-checksum-type). A COMPOSITE checksum is a
+	// checksum-of-per-part-checksums ("base64-N"); a FULL_OBJECT checksum is the
+	// checksum of the whole object as if uploaded in a single request ("base64").
+	ChecksumTypeComposite  = "COMPOSITE"
+	ChecksumTypeFullObject = "FULL_OBJECT"
 
 	// S3 conditional headers
 	IfMatch           = "If-Match"
@@ -101,6 +108,16 @@ const (
 	AmzCopySourceIfNoneMatch       = "X-Amz-Copy-Source-If-None-Match"
 	AmzCopySourceIfModifiedSince   = "X-Amz-Copy-Source-If-Modified-Since"
 	AmzCopySourceIfUnmodifiedSince = "X-Amz-Copy-Source-If-Unmodified-Since"
+
+	// RenameObject
+	// AmzClientToken makes a rename idempotent. The AWS SDKs fill it in on every
+	// call, so it arrives on requests that were never written with it in mind.
+	AmzClientToken                   = "X-Amz-Client-Token"
+	AmzRenameSource                  = "X-Amz-Rename-Source"
+	AmzRenameSourceIfMatch           = "X-Amz-Rename-Source-If-Match"
+	AmzRenameSourceIfNoneMatch       = "X-Amz-Rename-Source-If-None-Match"
+	AmzRenameSourceIfModifiedSince   = "X-Amz-Rename-Source-If-Modified-Since"
+	AmzRenameSourceIfUnmodifiedSince = "X-Amz-Rename-Source-If-Unmodified-Since"
 
 	// S3 Server-Side Encryption with Customer-provided Keys (SSE-C)
 	AmzServerSideEncryptionCustomerAlgorithm = "X-Amz-Server-Side-Encryption-Customer-Algorithm"
@@ -128,6 +145,12 @@ const (
 	// SeaweedFS internal metadata prefix (used to filter internal headers from client responses)
 	SeaweedFSInternalPrefix = "x-seaweedfs-"
 
+	// SeaweedFSPrefixObject marks a directory entry that also holds the object named by
+	// its path without a trailing slash. S3 keys are flat, so "a/b" and "a/b/c" are
+	// independent keys, and the filer stores the first one on the directory the second
+	// one lives under.
+	SeaweedFSPrefixObject = "x-seaweedfs-prefix-object"
+
 	// SeaweedFS internal metadata keys for encryption (prefixed to avoid automatic HTTP header conversion)
 	SeaweedFSSSEKMSKey = "x-seaweedfs-sse-kms-key" // Key for storing serialized SSE-KMS metadata
 	SeaweedFSSSES3Key  = "x-seaweedfs-sse-s3-key"  // Key for storing serialized SSE-S3 metadata
@@ -139,6 +162,12 @@ const (
 	SeaweedFSSSEKMSBucketKeyEnabled  = "x-seaweedfs-sse-kms-bucket-key-enabled" // Bucket key setting for multipart upload SSE-KMS inheritance
 	SeaweedFSSSEKMSEncryptionContext = "x-seaweedfs-sse-kms-encryption-context" // Encryption context for multipart upload SSE-KMS inheritance
 	SeaweedFSSSEKMSBaseIV            = "x-seaweedfs-sse-kms-base-iv"            // Base IV for multipart upload SSE-KMS (for IV offset calculation)
+
+	// SeaweedFSRenameToken records the x-amz-client-token of the rename that put an
+	// object at its key, together with the source that rename named. It rides on the
+	// object itself, so every gateway reads the same answer for a retry of that
+	// rename, and it is dropped whenever the key is written again.
+	SeaweedFSRenameToken = "x-seaweedfs-rename-token"
 
 	// Multipart upload metadata keys for SSE-S3
 	SeaweedFSSSES3Encryption = "x-seaweedfs-sse-s3-encryption" // Encryption type for multipart upload SSE-S3 inheritance
@@ -215,6 +244,16 @@ func IsValidBucketName(bucket string) bool {
 	return !strings.ContainsAny(bucket, "/\\\x00")
 }
 
+// IsValidPathSegment reports whether value is safe to use as one filer path
+// component. It intentionally does not enforce any application-specific
+// format; callers can layer stricter checks on top.
+func IsValidPathSegment(value string) bool {
+	if value == "" || value == "." || value == ".." {
+		return false
+	}
+	return !strings.ContainsAny(value, "/\\\x00")
+}
+
 // NormalizeObjectKey normalizes object keys by removing duplicate slashes and converting backslashes.
 // This normalizes keys from various sources (URL path, form values, etc.) to a consistent format.
 // It also converts Windows-style backslashes to forward slashes for cross-platform compatibility.
@@ -288,6 +327,8 @@ const (
 	contextKeyIdentityName   contextKey = "s3-identity-name"
 	contextKeyIdentityObject contextKey = "s3-identity-object"
 	contextKeyIdentityHolder contextKey = "s3-identity-holder"
+	contextKeyPrincipalArn   contextKey = "s3-principal-arn"
+	contextKeyIdentityClaim  contextKey = "s3-identity-claim"
 )
 
 // identityHolder is a mutable container for the authenticated identity name,
@@ -298,7 +339,9 @@ const (
 // holder installed before authentication is shared across all copies, so the
 // name written by the inner handler is readable by the outer middleware.
 type identityHolder struct {
-	name atomic.Pointer[string]
+	name          atomic.Pointer[string]
+	principalArn  atomic.Pointer[string]
+	identityClaim atomic.Pointer[string]
 }
 
 // EnsureIdentityHolder attaches a mutable identity holder to the request context
@@ -344,6 +387,65 @@ func GetIdentityNameFromContext(r *http.Request) string {
 	if h, ok := r.Context().Value(contextKeyIdentityHolder).(*identityHolder); ok && h != nil {
 		if name := h.name.Load(); name != nil {
 			return *name
+		}
+	}
+	return ""
+}
+
+// SetPrincipalArnInContext stores the authenticated principal ARN in the request
+// context. For an STS session the identity name is an opaque session subject, so
+// the ARN is the only place the assumed role and session name survive to the
+// audit log.
+func SetPrincipalArnInContext(ctx context.Context, principalArn string) context.Context {
+	if principalArn == "" {
+		return ctx
+	}
+	if h, ok := ctx.Value(contextKeyIdentityHolder).(*identityHolder); ok && h != nil {
+		h.principalArn.Store(&principalArn)
+	}
+	return context.WithValue(ctx, contextKeyPrincipalArn, principalArn)
+}
+
+// GetPrincipalArnFromContext retrieves the authenticated principal ARN from the
+// request context, or "" when the request is unauthenticated.
+func GetPrincipalArnFromContext(r *http.Request) string {
+	if arn, ok := r.Context().Value(contextKeyPrincipalArn).(string); ok && arn != "" {
+		return arn
+	}
+	if h, ok := r.Context().Value(contextKeyIdentityHolder).(*identityHolder); ok && h != nil {
+		if arn := h.principalArn.Load(); arn != nil {
+			return *arn
+		}
+	}
+	return ""
+}
+
+// SetIdentityClaimInContext stores the authoritative OIDC identity claim (e.g.
+// preferred_username, email, sub) for the audit log. For an STS-assumed OIDC
+// session the requester name is an opaque session subject, so the claim is the
+// only place a stable, human-readable federated identity survives to the audit
+// log. Empty for non-federated sessions, where the requester name already
+// carries the real username.
+func SetIdentityClaimInContext(ctx context.Context, identityClaim string) context.Context {
+	if identityClaim == "" {
+		return ctx
+	}
+	if h, ok := ctx.Value(contextKeyIdentityHolder).(*identityHolder); ok && h != nil {
+		h.identityClaim.Store(&identityClaim)
+	}
+	return context.WithValue(ctx, contextKeyIdentityClaim, identityClaim)
+}
+
+// GetIdentityClaimFromContext retrieves the authoritative OIDC identity claim
+// from the request context, or "" when the request is unauthenticated or not
+// federated.
+func GetIdentityClaimFromContext(r *http.Request) string {
+	if claim, ok := r.Context().Value(contextKeyIdentityClaim).(string); ok && claim != "" {
+		return claim
+	}
+	if h, ok := r.Context().Value(contextKeyIdentityHolder).(*identityHolder); ok && h != nil {
+		if claim := h.identityClaim.Load(); claim != nil {
+			return *claim
 		}
 	}
 	return ""

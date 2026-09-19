@@ -3,7 +3,7 @@ package sts
 import (
 	"crypto/sha256"
 	"encoding/base64"
-	"fmt"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -24,10 +24,34 @@ func ComputeParentUser(sub, iss string) string {
 	return base64.RawURLEncoding.EncodeToString(h[:])
 }
 
-// defaultCredentialGenerator is a reusable instance for generating temporary credentials
-// Reusing a single instance across all calls to ToSessionInfo() reduces allocation overhead
-// since this method may be called frequently during signature verification
-var defaultCredentialGenerator = NewCredentialGenerator()
+// identityClaimPriority is the order in which ResolveIdentityClaim looks for a
+// human-readable, authoritative identity attribute in an STS request context.
+// The context is populated at federation time from the validated OIDC token
+// (see AssumeRoleWithWebIdentity), so every entry here is server-asserted and
+// not client-supplied. preferred_username/email/name are conventional OIDC
+// user claims; sub is the always-present stable subject identifier and the
+// final fallback so a federated session never audits as fully anonymous.
+var identityClaimPriority = []string{"preferred_username", "email", "name", "sub"}
+
+// ResolveIdentityClaim returns the most human-readable authoritative identity
+// claim available in ctx, or "" when none is present. ctx is the STS request
+// context (sessionInfo.RequestContext) populated from the validated OIDC token
+// at federation time. Non-string values are skipped so a structured claim
+// never leaks into an audit-facing field. Whitespace-only values are treated
+// as absent so a blank preferred claim does not mask a usable email or sub.
+func ResolveIdentityClaim(ctx map[string]interface{}) string {
+	if len(ctx) == 0 {
+		return ""
+	}
+	for _, key := range identityClaimPriority {
+		if v, ok := ctx[key].(string); ok {
+			if trimmed := strings.TrimSpace(v); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
+}
 
 // STSSessionClaims represents comprehensive session information embedded in JWT tokens
 // This eliminates the need for separate session storage by embedding all session
@@ -92,21 +116,20 @@ func NewSTSSessionClaims(sessionId, issuer string, expiresAt time.Time) *STSSess
 
 // ToSessionInfo converts JWT claims back to SessionInfo structure
 // This enables seamless integration with existing code expecting SessionInfo
-func (c *STSSessionClaims) ToSessionInfo() *SessionInfo {
+func (c *STSSessionClaims) ToSessionInfo(credGen *CredentialGenerator) *SessionInfo {
 	var expiresAt time.Time
 	if c.ExpiresAt != nil {
 		expiresAt = c.ExpiresAt.Time
 	}
 
-	// Generate temporary credentials from the session ID
-	// This is deterministic based on the session ID, so the same credentials are regenerated
-	credentials, err := defaultCredentialGenerator.GenerateTemporaryCredentials(c.SessionId, expiresAt)
-	if err != nil {
-		// Log the error with context - credential generation failure is important for debugging
-		errMsg := fmt.Errorf("generate temporary credentials for session %s: %w", c.SessionId, err)
-		glog.Warningf("Failed to generate credentials for STS session: %v", errMsg)
-		// Return session info without credentials - validation will catch this as invalid
-		credentials = nil
+	var credentials *Credentials
+	if credGen != nil {
+		creds, err := credGen.GenerateTemporaryCredentials(c.SessionId, expiresAt)
+		if err != nil {
+			glog.Warningf("Failed to generate credentials for STS session %s: %v", c.SessionId, err)
+		} else {
+			credentials = creds
+		}
 	}
 
 	return &SessionInfo{

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -13,11 +14,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/apache/iceberg-go/table"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -124,7 +127,7 @@ func walkFilerEntries(ctx context.Context, client filer_pb.SeaweedFilerClient, d
 }
 
 // loadCurrentMetadata loads and parses the current Iceberg metadata from the table entry's xattr.
-func loadCurrentMetadata(ctx context.Context, client filer_pb.SeaweedFilerClient, bucketName, tablePath string) (table.Metadata, string, error) {
+func loadCurrentMetadata(ctx context.Context, client filer_pb.SeaweedFilerClient, bucketName, tablePath string) (*tableState, error) {
 	dir := path.Join(s3tables.TablesPath, bucketName, path.Dir(tablePath))
 	name := path.Base(tablePath)
 
@@ -133,63 +136,38 @@ func loadCurrentMetadata(ctx context.Context, client filer_pb.SeaweedFilerClient
 		Name:      name,
 	})
 	if err != nil {
-		return nil, "", fmt.Errorf("lookup table entry %s/%s: %w", dir, name, err)
+		return nil, fmt.Errorf("lookup table entry %s/%s: %w", dir, name, err)
 	}
 	if resp == nil || resp.Entry == nil {
-		return nil, "", fmt.Errorf("table entry not found: %s/%s", dir, name)
+		return nil, fmt.Errorf("table entry not found: %s/%s", dir, name)
 	}
 
 	metadataBytes, ok := resp.Entry.Extended[s3tables.ExtendedKeyMetadata]
 	if !ok || len(metadataBytes) == 0 {
-		return nil, "", fmt.Errorf("no metadata xattr on table entry %s/%s", dir, name)
+		return nil, fmt.Errorf("no metadata xattr on table entry %s/%s", dir, name)
 	}
 
-	// Parse internal metadata to extract FullMetadata
-	var internalMeta struct {
-		MetadataVersion  int    `json:"metadataVersion"`
-		MetadataLocation string `json:"metadataLocation,omitempty"`
-		Metadata         *struct {
-			FullMetadata json.RawMessage `json:"fullMetadata,omitempty"`
-		} `json:"metadata,omitempty"`
-	}
-	if err := json.Unmarshal(metadataBytes, &internalMeta); err != nil {
-		return nil, "", fmt.Errorf("unmarshal internal metadata: %w", err)
-	}
-	if internalMeta.Metadata == nil || len(internalMeta.Metadata.FullMetadata) == 0 {
-		return nil, "", fmt.Errorf("no fullMetadata in table xattr")
-	}
-
-	meta, err := table.ParseMetadataBytes(internalMeta.Metadata.FullMetadata)
+	state, err := parseTableMetadataEnvelope(metadataBytes, bucketName, tablePath)
 	if err != nil {
-		return nil, "", fmt.Errorf("parse iceberg metadata: %w", err)
+		return nil, err
 	}
-
-	// Use metadataLocation from xattr if available (includes nonce suffix),
-	// otherwise fall back to the canonical name derived from metadataVersion.
-	metadataFileName := path.Base(internalMeta.MetadataLocation)
-	if metadataFileName == "" || metadataFileName == "." {
-		metadataFileName = fmt.Sprintf("v%d.metadata.json", internalMeta.MetadataVersion)
+	// Refuse to rewrite an entry that only looks like an Iceberg table. Every
+	// operation here rewrites or deletes files under the table location, and a
+	// foreign format's files are unreferenced by Iceberg metadata by definition.
+	if !isIcebergTableEntry(resp.Entry.Extended, state.Metadata) {
+		return nil, fmt.Errorf("entry %s/%s is not an iceberg table", dir, name)
 	}
-	return meta, metadataFileName, nil
+	return state, nil
 }
 
 // loadFileByIcebergPath loads a file from the filer given an Iceberg-style path.
-// Paths may be absolute filer paths, relative (metadata/..., data/...), or
-// location-based (s3://bucket/ns/table/metadata/...).
-//
-// The function normalises the path to a relative form under the table root
-// (e.g. "metadata/snap-1.avro" or "data/region=us/file.parquet") and splits
-// it into the correct filer directory + entry name, so nested sub-directories
-// are resolved properly.
-func loadFileByIcebergPath(ctx context.Context, client filer_pb.SeaweedFilerClient, bucketName, tablePath, icebergPath string) ([]byte, error) {
-	relPath := path.Clean(normalizeIcebergPath(icebergPath, bucketName, tablePath))
-	relPath = strings.TrimPrefix(relPath, "/")
-	if relPath == "." || relPath == "" || strings.HasPrefix(relPath, "../") {
-		return nil, fmt.Errorf("invalid iceberg path %q", icebergPath)
+// dataPath is the bucket-relative directory the table's files live in.
+func loadFileByIcebergPath(ctx context.Context, client filer_pb.SeaweedFilerClient, bucketName, dataPath, icebergPath string) ([]byte, error) {
+	fullPath, err := icebergFilerPath(bucketName, dataPath, icebergPath)
+	if err != nil {
+		return nil, err
 	}
-
-	dir := path.Join(s3tables.TablesPath, bucketName, tablePath, path.Dir(relPath))
-	fileName := path.Base(relPath)
+	dir, fileName := path.Dir(fullPath), path.Base(fullPath)
 
 	resp, err := filer_pb.LookupEntry(ctx, client, &filer_pb.LookupDirectoryEntryRequest{
 		Directory: dir,
@@ -218,53 +196,112 @@ func loadFileByIcebergPath(ctx context.Context, client filer_pb.SeaweedFilerClie
 	return data, nil
 }
 
-// normalizeIcebergPath converts an Iceberg path (which may be an S3 URL, an
-// absolute filer path, or a plain relative path) into a relative path under the
-// table root, e.g. "metadata/snap-1.avro" or "data/region=us/file.parquet".
-func normalizeIcebergPath(icebergPath, bucketName, tablePath string) string {
+// normalizeIcebergPath converts an Iceberg path (an S3 URL, an absolute filer
+// path, or a path relative to the table root) into a path relative to the
+// bucket root, e.g. "ns/table/metadata/snap-1.avro". Absolute references are
+// resolved from the bucket root rather than from dataPath: an Iceberg table
+// records where its files actually are, and a client writing through the REST
+// catalog may place them outside the catalog path. The bucket-relative form is
+// the canonical key for comparing references that mix both spellings.
+func normalizeIcebergPath(icebergPath, bucketName, dataPath string) (string, error) {
 	p := icebergPath
-
-	// Strip scheme (e.g. "s3://bucket/ns/table/metadata/file" → "bucket/ns/table/metadata/file")
+	absolute := false
 	if idx := strings.Index(p, "://"); idx >= 0 {
 		p = p[idx+3:]
+		absolute = true
+	} else if strings.HasPrefix(p, "/") {
+		absolute = true
 	}
-
-	// Strip any leading slash
 	p = strings.TrimPrefix(p, "/")
 
-	// Strip bucket+tablePath prefix if present
-	// e.g. "mybucket/ns/table/metadata/file" → "metadata/file"
-	tablePrefix := path.Join(bucketName, tablePath) + "/"
-	if strings.HasPrefix(p, tablePrefix) {
-		return p[len(tablePrefix):]
+	if absolute {
+		rest, ok := cutPathPrefix(p, bucketName)
+		if !ok {
+			// Filer-style references carry the /buckets prefix ahead of the bucket.
+			if withoutTablesPath, hasTablesPath := cutPathPrefix(p, strings.TrimPrefix(s3tables.TablesPath, "/")); hasTablesPath {
+				rest, ok = cutPathPrefix(withoutTablesPath, bucketName)
+			}
+		}
+		if !ok {
+			return "", fmt.Errorf("iceberg path %q is outside bucket %q", icebergPath, bucketName)
+		}
+		p = rest
+	} else {
+		if clean := path.Clean(p); clean == ".." || strings.HasPrefix(clean, "../") {
+			return "", fmt.Errorf("invalid iceberg path %q", icebergPath)
+		}
+		p = path.Join(dataPath, p)
 	}
 
-	// Strip filer TablesPath prefix if present
-	// e.g. "buckets/mybucket/ns/table/metadata/file" → "metadata/file"
-	filerPrefix := strings.TrimPrefix(s3tables.TablesPath, "/")
-	fullPrefix := path.Join(filerPrefix, bucketName, tablePath) + "/"
-	if strings.HasPrefix(p, fullPrefix) {
-		return p[len(fullPrefix):]
+	p = path.Clean(p)
+	if p == "." || p == ".." || strings.HasPrefix(p, "../") {
+		return "", fmt.Errorf("invalid iceberg path %q", icebergPath)
 	}
-
-	// Already relative (e.g. "metadata/snap-1.avro")
-	return p
+	return p, nil
 }
 
-// saveFilerFile saves a file to the filer.
+// cutPathPrefix removes a leading path prefix at a path boundary.
+func cutPathPrefix(p, segment string) (string, bool) {
+	if segment == "" {
+		return p, false
+	}
+	rest, ok := strings.CutPrefix(p, segment+"/")
+	return rest, ok
+}
+
+// icebergFilerPath resolves an Iceberg path to the filer path holding the file.
+func icebergFilerPath(bucketName, dataPath, icebergPath string) (string, error) {
+	relPath, err := normalizeIcebergPath(icebergPath, bucketName, dataPath)
+	if err != nil {
+		return "", err
+	}
+	return path.Join(s3tables.TablesPath, bucketName, relPath), nil
+}
+
+// absoluteIcebergPath is the inverse of normalizeIcebergPath: it builds the
+// absolute s3:// URI for a bucket-relative path. The Iceberg spec requires
+// absolute locations in metadata — strict readers (Spark/Trino via S3FileIO)
+// reject paths with no scheme.
+func absoluteIcebergPath(bucketName string, elem ...string) string {
+	return "s3://" + path.Join(append([]string{bucketName}, elem...)...)
+}
+
+const (
+	// inlineContentLimit is the most saveFilerFile keeps in Entry.Content.
+	// Manifests and metadata JSON are small and stay inline; a compacted data
+	// file runs to hundreds of MB, and inlining that stores the parquet bytes
+	// verbatim in the filer store and ships them again through the metadata
+	// change log as one oversized event.
+	inlineContentLimit = 256 * 1024
+	// filerFileChunkSize is the upload chunk size for anything over the limit.
+	filerFileChunkSize = 8 * 1024 * 1024
+)
+
+// saveFilerFile saves a file to the filer, inline when it is small and as
+// volume chunks when it is not.
 func saveFilerFile(ctx context.Context, client filer_pb.SeaweedFilerClient, dir, fileName string, content []byte) error {
+	entry := &filer_pb.Entry{
+		Name: fileName,
+		Attributes: &filer_pb.FuseAttributes{
+			Mtime:    time.Now().Unix(),
+			Crtime:   time.Now().Unix(),
+			FileMode: uint32(0644),
+			FileSize: uint64(len(content)),
+		},
+	}
+	if len(content) <= inlineContentLimit {
+		entry.Content = content
+	} else {
+		chunks, err := uploadFilerChunks(ctx, client, path.Join(dir, fileName), content)
+		if err != nil {
+			return fmt.Errorf("upload %s/%s: %w", dir, fileName, err)
+		}
+		entry.Chunks = chunks
+	}
+
 	resp, err := client.CreateEntry(ctx, &filer_pb.CreateEntryRequest{
 		Directory: dir,
-		Entry: &filer_pb.Entry{
-			Name: fileName,
-			Attributes: &filer_pb.FuseAttributes{
-				Mtime:    time.Now().Unix(),
-				Crtime:   time.Now().Unix(),
-				FileMode: uint32(0644),
-				FileSize: uint64(len(content)),
-			},
-			Content: content,
-		},
+		Entry:     entry,
 	})
 	if err != nil {
 		return fmt.Errorf("create entry %s/%s: %w", dir, fileName, err)
@@ -273,6 +310,52 @@ func saveFilerFile(ctx context.Context, client filer_pb.SeaweedFilerClient, dir,
 		return fmt.Errorf("create entry %s/%s: %s", dir, fileName, resp.Error)
 	}
 	return nil
+}
+
+// uploadFilerChunks writes content to volume servers, assigning through the
+// filer so the entry's storage rules apply.
+func uploadFilerChunks(ctx context.Context, client filer_pb.SeaweedFilerClient, fullPath string, content []byte) ([]*filer_pb.FileChunk, error) {
+	assignFn := func(ctx context.Context, count int, expectedDataSize uint64) (*operation.VolumeAssignRequest, *operation.AssignResult, error) {
+		resp, err := client.AssignVolume(ctx, &filer_pb.AssignVolumeRequest{
+			Count:            int32(count),
+			Path:             fullPath,
+			ExpectedDataSize: expectedDataSize,
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		if resp.Error != "" {
+			return nil, nil, errors.New(resp.Error)
+		}
+		if resp.Location == nil || resp.FileId == "" {
+			return nil, nil, fmt.Errorf("assign volume returned no location")
+		}
+		return nil, &operation.AssignResult{
+			Fid:       resp.FileId,
+			Url:       resp.Location.Url,
+			PublicUrl: resp.Location.PublicUrl,
+			Count:     uint64(count),
+			Auth:      security.EncodedJwt(resp.Auth),
+			Fsync:     resp.Fsync,
+		}, nil
+	}
+
+	initGlobalHTTPClientOnce.Do(util_http.InitGlobalHttpClient)
+	result, err := operation.UploadReaderInChunks(ctx, util.NewBytesReader(content), &operation.ChunkedUploadOption{
+		ChunkSize:  filerFileChunkSize,
+		AssignFunc: assignFn,
+	})
+	if err != nil {
+		// Chunks uploaded before the failure are orphaned: nothing references
+		// them, so name them for fsck rather than losing them silently.
+		if result != nil {
+			for _, chunk := range result.FileChunks {
+				glog.Warningf("iceberg: orphan chunk %s from failed upload of %s", chunk.GetFileIdString(), fullPath)
+			}
+		}
+		return nil, err
+	}
+	return result.FileChunks, nil
 }
 
 // deleteFilerFile deletes a file from the filer.
@@ -285,8 +368,9 @@ func deleteFilerFile(ctx context.Context, client filer_pb.SeaweedFilerClient, di
 // writing and passes the previous metadata xattr back to the filer as a
 // server-side precondition so concurrent writers fail with a retryable
 // metadata version conflict.
-// newMetadataLocation is the table-relative path to the new metadata file
-// (e.g. "metadata/v3.metadata.json").
+// newMetadataLocation is the absolute location of the new metadata file
+// (e.g. "s3://bucket/ns/table/metadata/v3.metadata.json"), matching the form
+// the S3 Tables catalog stores.
 func updateTableMetadataXattr(ctx context.Context, client filer_pb.SeaweedFilerClient, tableDir string, expectedVersion int, newFullMetadata []byte, newMetadataLocation string) error {
 	tableName := path.Base(tableDir)
 	parentDir := path.Dir(tableDir)
@@ -365,15 +449,16 @@ func updateTableMetadataXattr(ctx context.Context, client filer_pb.SeaweedFilerC
 		return fmt.Errorf("marshal updated xattr: %w", err)
 	}
 
-	expectedVersionXattr := resp.Entry.Extended[s3tables.ExtendedKeyMetadataVersion]
+	// Assert the whole attribute set, not just the version: this rewrites the
+	// entry from the snapshot above, so a narrower precondition would delete an
+	// attribute a concurrent writer created, such as a maintenance configuration.
+	expectedExtended := s3tables.SnapshotExtended(resp.Entry.Extended)
 	resp.Entry.Extended[s3tables.ExtendedKeyMetadata] = updatedXattr
 	resp.Entry.Extended[s3tables.ExtendedKeyMetadataVersion] = metadataVersionXattr(newVersion)
 	_, err = client.UpdateEntry(ctx, &filer_pb.UpdateEntryRequest{
-		Directory: parentDir,
-		Entry:     resp.Entry,
-		ExpectedExtended: map[string][]byte{
-			s3tables.ExtendedKeyMetadataVersion: expectedVersionXattr,
-		},
+		Directory:        parentDir,
+		Entry:            resp.Entry,
+		ExpectedExtended: expectedExtended,
 	})
 	if err != nil {
 		if status.Code(err) == codes.FailedPrecondition {

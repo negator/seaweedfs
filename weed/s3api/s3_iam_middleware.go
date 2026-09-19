@@ -3,9 +3,9 @@ package s3api
 import (
 	"context"
 	"fmt"
-	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -13,28 +13,10 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/iam/integration"
 	"github.com/seaweedfs/seaweedfs/weed/iam/providers"
 	"github.com/seaweedfs/seaweedfs/weed/iam/sts"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/policy_engine"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"github.com/seaweedfs/seaweedfs/weed/security"
 )
-
-// privateNetworks contains pre-parsed private IP ranges for efficient lookups
-var privateNetworks []*net.IPNet
-
-func init() {
-	// Private IPv4 ranges (RFC1918) and IPv6 Unique Local Addresses (ULA)
-	privateRanges := []string{
-		"10.0.0.0/8",     // IPv4 private
-		"172.16.0.0/12",  // IPv4 private
-		"192.168.0.0/16", // IPv4 private
-		"fc00::/7",       // IPv6 Unique Local Addresses (ULA)
-	}
-
-	for _, cidr := range privateRanges {
-		_, network, err := net.ParseCIDR(cidr)
-		if err == nil {
-			privateNetworks = append(privateNetworks, network)
-		}
-	}
-}
 
 // IAMIntegration defines the interface for IAM integration
 type IAMIntegration interface {
@@ -52,10 +34,11 @@ type IAMManagerProvider interface {
 
 // S3IAMIntegration provides IAM integration for S3 API
 type S3IAMIntegration struct {
-	iamManager   *integration.IAMManager
-	stsService   *sts.STSService
-	filerAddress string
-	enabled      bool
+	iamManager     *integration.IAMManager
+	stsService     *sts.STSService
+	filerAddress   string
+	enabled        bool
+	trustedProxies atomic.Pointer[policy_engine.TrustedProxies]
 }
 
 // NewS3IAMIntegration creates a new S3 IAM integration
@@ -78,6 +61,12 @@ func (s3iam *S3IAMIntegration) GetIAMManager() *integration.IAMManager {
 	return s3iam.iamManager
 }
 
+// SetTrustedProxies configures the allowlist used to decide whether
+// forwarded headers are honored when extracting aws:SourceIp.
+func (s3iam *S3IAMIntegration) SetTrustedProxies(tp *policy_engine.TrustedProxies) {
+	s3iam.trustedProxies.Store(tp)
+}
+
 // AuthenticateJWT authenticates JWT tokens using our STS service
 func (s3iam *S3IAMIntegration) AuthenticateJWT(ctx context.Context, r *http.Request) (*IAMIdentity, s3err.ErrorCode) {
 
@@ -87,11 +76,11 @@ func (s3iam *S3IAMIntegration) AuthenticateJWT(ctx context.Context, r *http.Requ
 
 	// Extract bearer token from Authorization header
 	authHeader := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authHeader, "Bearer ") {
+	if !strings.HasPrefix(authHeader, security.BearerPrefix) {
 		return nil, s3err.ErrAccessDenied
 	}
 
-	sessionToken := strings.TrimPrefix(authHeader, "Bearer ")
+	sessionToken := strings.TrimPrefix(authHeader, security.BearerPrefix)
 	if sessionToken == "" {
 		return nil, s3err.ErrAccessDenied
 	}
@@ -142,6 +131,13 @@ func (s3iam *S3IAMIntegration) AuthenticateJWT(ctx context.Context, r *http.Requ
 			return nil, s3err.ErrAccessDenied
 		}
 
+		// Same trust-policy gate as AssumeRoleWithWebIdentity: the role mapping
+		// alone must not grant a role that STS would refuse for this token.
+		if err := s3iam.iamManager.ValidateTrustPolicyForWebIdentity(ctx, identity.RoleArn, sessionToken, nil); err != nil {
+			glog.V(3).Infof("OIDC bearer token rejected by trust policy of role %s: %v", identity.RoleArn, err)
+			return nil, s3err.ErrAccessDenied
+		}
+
 		// Create claims map and populate with standard claims and attributes
 		claims := make(map[string]interface{}, len(identity.Attributes)+5)
 
@@ -188,48 +184,17 @@ func (s3iam *S3IAMIntegration) AuthenticateJWT(ctx context.Context, r *http.Requ
 				EmailAddress: emailAddress,
 				Id:           identity.UserID,
 			},
-			Claims: claims,
+			Claims:        claims,
+			IdentityClaim: sts.ResolveIdentityClaim(claims),
 		}, s3err.ErrNone
 	}
 
-	// This is an STS-issued token - validate with STS service
-	// ValidateSessionToken performs cryptographic verification and extraction of trusted claims
-	sessionInfo, err := s3iam.stsService.ValidateSessionToken(ctx, sessionToken)
-	if err != nil {
-		glog.V(3).Infof("STS session validation failed: %v", err)
-		return nil, s3err.ErrAccessDenied
-	}
-
-	// Create claims map starting with request context (which holds custom claims)
-	claims := make(map[string]interface{})
-	if sessionInfo.RequestContext != nil {
-		for k, v := range sessionInfo.RequestContext {
-			claims[k] = v
-		}
-	}
-
-	// Add standard claims
-	claims["sub"] = sessionInfo.Subject
-	claims["role"] = sessionInfo.RoleArn
-	claims["principal"] = sessionInfo.Principal
-	claims["snam"] = sessionInfo.SessionName
-
-	// Create IAM identity from VALIDATED session info
-	// We use the trusted data returned by the STS service, not the unverified token claims
-	identity := &IAMIdentity{
-		Name:         sessionInfo.Subject,
-		Principal:    sessionInfo.Principal,
-		SessionToken: sessionToken,
-		Account: &Account{
-			DisplayName:  sessionInfo.SessionName,
-			EmailAddress: sessionInfo.Subject + "@seaweedfs.local",
-			Id:           sessionInfo.Subject,
-		},
-		Claims: claims,
-	}
-
-	glog.V(3).Infof("JWT authentication successful for principal: %s", identity.Principal)
-	return identity, s3err.ErrNone
+	// STS session tokens authenticate SigV4 requests via proof of possession
+	// (signature with the derived secret). As bearer tokens they would turn
+	// every presigned URL, which carries the token in X-Amz-Security-Token,
+	// into a standalone credential.
+	glog.V(3).Infof("Rejected STS session token presented as bearer token")
+	return nil, s3err.ErrAccessDenied
 }
 
 // ValidateSessionToken checks the validity of an STS session token
@@ -251,7 +216,7 @@ func (s3iam *S3IAMIntegration) AuthorizeAction(ctx context.Context, identity *IA
 	}
 
 	// Extract request context for policy conditions
-	requestContext := extractRequestContext(r)
+	requestContext := s3iam.extractRequestContext(r)
 
 	// For list operations, populate the s3:prefix condition key and ensure the
 	// resource ARN stays at bucket level (matching AWS ListBucket semantics).
@@ -340,12 +305,13 @@ func (s3iam *S3IAMIntegration) DefaultAllow() bool {
 
 // IAMIdentity represents an authenticated identity with session information
 type IAMIdentity struct {
-	Name         string
-	Principal    string
-	SessionToken string
-	Account      *Account
-	PolicyNames  []string
-	Claims       map[string]interface{}
+	Name          string
+	Principal     string
+	SessionToken  string
+	Account       *Account
+	PolicyNames   []string
+	Claims        map[string]interface{}
+	IdentityClaim string // Authoritative OIDC identity claim for audit logging; empty for non-federated sessions
 }
 
 // IsAdmin checks if the identity has admin privileges
@@ -389,25 +355,20 @@ func buildS3ResourceArn(bucket string, objectKey string) string {
 }
 
 // extractRequestContext extracts request context for policy conditions
-func extractRequestContext(r *http.Request) map[string]interface{} {
+func (s3iam *S3IAMIntegration) extractRequestContext(r *http.Request) map[string]interface{} {
 	context := make(map[string]interface{})
 
-	// Extract source IP for IP-based conditions
-	// Use AWS-compatible key name for policy variable substitution
-	sourceIP := extractSourceIP(r)
+	sourceIP := s3iam.extractSourceIP(r)
 	if sourceIP != "" {
 		context["aws:SourceIp"] = sourceIP
 	}
 
-	// Extract user agent
 	if userAgent := r.Header.Get("User-Agent"); userAgent != "" {
 		context["userAgent"] = userAgent
 	}
 
-	// Extract request time
 	context["requestTime"] = r.Context().Value("requestTime")
 
-	// Extract additional headers that might be useful for conditions
 	if referer := r.Header.Get("Referer"); referer != "" {
 		context["referer"] = referer
 	}
@@ -415,62 +376,11 @@ func extractRequestContext(r *http.Request) map[string]interface{} {
 	return context
 }
 
-// extractSourceIP extracts the real source IP from the request
-// SECURITY: Prioritizes RemoteAddr over client-controlled headers to prevent spoofing
-// Only trusts X-Forwarded-For/X-Real-IP if RemoteAddr appears to be from a trusted proxy
-func extractSourceIP(r *http.Request) string {
-	// Always start with RemoteAddr as the most trustworthy source
-	remoteIP := r.RemoteAddr
-	if ip, _, err := net.SplitHostPort(remoteIP); err == nil {
-		remoteIP = ip
-	}
-
-	// NOTE: The current heuristic of using isPrivateIP assumes reverse proxies are on a
-	// private/local network. This may be insufficient for some cloud, CDN, or multi-tier
-	// proxy deployments where proxies terminate connections from public IPs. In such
-	// environments, deployment-specific controls (e.g., network ACLs or proxy configs)
-	// should be used to ensure only trusted components can set forwarding headers.
-	// Future enhancements may introduce an explicit, configurable trusted proxy CIDR list.
-	isTrustedProxy := isPrivateIP(remoteIP)
-
-	if isTrustedProxy {
-		// Check X-Real-IP header first (single IP, more reliable than X-Forwarded-For)
-		if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
-			return strings.TrimSpace(realIP)
-		}
-
-		// Check X-Forwarded-For header (can contain multiple IPs, take the first one)
-		if forwardedFor := r.Header.Get("X-Forwarded-For"); forwardedFor != "" {
-			if ips := strings.Split(forwardedFor, ","); len(ips) > 0 {
-				return strings.TrimSpace(ips[0])
-			}
-		}
-	}
-
-	// Fall back to RemoteAddr (most secure)
-	return remoteIP
-}
-
-// isPrivateIP checks if an IP is in a private range (localhost or RFC1918)
-func isPrivateIP(ipStr string) bool {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return false
-	}
-
-	// Check for localhost and link-local addresses (IPv4/IPv6)
-	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-		return true
-	}
-
-	// Check against pre-parsed private CIDR ranges
-	for _, network := range privateNetworks {
-		if network.Contains(ip) {
-			return true
-		}
-	}
-
-	return false
+// extractSourceIP returns the client IP for aws:SourceIp condition
+// evaluation, honoring forwarded headers only when the direct TCP peer is in
+// the configured trusted-proxy allowlist (see SetTrustedProxies).
+func (s3iam *S3IAMIntegration) extractSourceIP(r *http.Request) string {
+	return s3iam.trustedProxies.Load().ExtractSourceIP(r)
 }
 
 // ParseUnverifiedJWTToken parses a JWT token and returns its claims WITHOUT cryptographic verification
@@ -506,12 +416,6 @@ func (s3a *S3ApiServer) SetIAMIntegration(iamManager *integration.IAMManager) {
 	} else {
 		glog.Errorf("Cannot set IAM integration: s3a.iam is nil")
 	}
-}
-
-// EnhancedS3ApiServer extends S3ApiServer with IAM integration
-type EnhancedS3ApiServer struct {
-	*S3ApiServer
-	iamIntegration IAMIntegration
 }
 
 // OIDCIdentity represents an identity validated through OIDC

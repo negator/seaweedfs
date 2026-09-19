@@ -1,18 +1,21 @@
 package s3api
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3lifecycle/scheduler"
 )
 
 const (
-	bucketLifecycleConfigurationXMLKey               = "s3-bucket-lifecycle-configuration-xml"
-	bucketLifecycleTransitionMinimumObjectSizeKey    = "s3-bucket-lifecycle-transition-default-minimum-object-size"
+	// The stored form is defined in the scheduler package, which callers
+	// outside the gateway also read; these are local shorthands for it.
+	bucketLifecycleConfigurationXMLKey            = scheduler.BucketLifecycleConfigurationXMLKey
+	bucketLifecycleTransitionMinimumObjectSizeKey = scheduler.BucketLifecycleTransitionMinimumObjectSizeKey
+	maxBucketLifecycleConfigurationSize           = scheduler.MaxBucketLifecycleConfigurationSize
+
 	bucketLifecycleTransitionMinimumObjectSizeHeader = "X-Amz-Transition-Default-Minimum-Object-Size"
 	defaultLifecycleTransitionMinimumObjectSize      = "all_storage_classes_128K"
-	maxBucketLifecycleConfigurationSize              = 1 << 20
 )
 
 func normalizeBucketLifecycleTransitionMinimumObjectSize(value string) string {
@@ -28,48 +31,27 @@ func (s3a *S3ApiServer) getStoredBucketLifecycleConfiguration(bucket string) ([]
 	if errCode != s3err.ErrNone {
 		return nil, "", false, errCode
 	}
-	if config.Entry == nil || config.Entry.Extended == nil {
+	if len(config.LifecycleXML) == 0 {
 		return nil, "", false, s3err.ErrNone
 	}
 
-	lifecycleXML, found := config.Entry.Extended[bucketLifecycleConfigurationXMLKey]
-	if !found || len(lifecycleXML) == 0 {
-		return nil, "", false, s3err.ErrNone
-	}
+	transitionMinimumObjectSize := normalizeBucketLifecycleTransitionMinimumObjectSize(config.LifecycleTransitionMinSize)
 
-	transitionMinimumObjectSize := normalizeBucketLifecycleTransitionMinimumObjectSize(
-		string(config.Entry.Extended[bucketLifecycleTransitionMinimumObjectSizeKey]),
-	)
-
-	return append([]byte(nil), lifecycleXML...), transitionMinimumObjectSize, true, s3err.ErrNone
+	return append([]byte(nil), config.LifecycleXML...), transitionMinimumObjectSize, true, s3err.ErrNone
 }
 
 func (s3a *S3ApiServer) storeBucketLifecycleConfiguration(bucket string, lifecycleXML []byte, transitionMinimumObjectSize string) s3err.ErrorCode {
 	return s3a.updateBucketConfig(bucket, func(config *BucketConfig) error {
-		if config.Entry == nil {
-			return fmt.Errorf("bucket %s is missing its filer entry", bucket)
-		}
-		if config.Entry.Extended == nil {
-			config.Entry.Extended = make(map[string][]byte)
-		}
-
-		config.Entry.Extended[bucketLifecycleConfigurationXMLKey] = append([]byte(nil), lifecycleXML...)
-		config.Entry.Extended[bucketLifecycleTransitionMinimumObjectSizeKey] = []byte(
-			normalizeBucketLifecycleTransitionMinimumObjectSize(transitionMinimumObjectSize),
-		)
-
+		config.LifecycleXML = append([]byte(nil), lifecycleXML...)
+		config.LifecycleTransitionMinSize = normalizeBucketLifecycleTransitionMinimumObjectSize(transitionMinimumObjectSize)
 		return nil
 	})
 }
 
 func (s3a *S3ApiServer) clearStoredBucketLifecycleConfiguration(bucket string) s3err.ErrorCode {
 	return s3a.updateBucketConfig(bucket, func(config *BucketConfig) error {
-		if config.Entry == nil {
-			return fmt.Errorf("bucket %s is missing its filer entry", bucket)
-		}
-
-		delete(config.Entry.Extended, bucketLifecycleConfigurationXMLKey)
-		delete(config.Entry.Extended, bucketLifecycleTransitionMinimumObjectSizeKey)
+		config.LifecycleXML = nil
+		config.LifecycleTransitionMinSize = ""
 		return nil
 	})
 }

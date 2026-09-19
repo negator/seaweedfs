@@ -26,13 +26,26 @@ func (h *S3TablesHandler) handleCreateTableBucket(w http.ResponseWriter, r *http
 		return err
 	}
 
+	// A bucket is a catalog, and a catalog serves one protocol. Saying which one
+	// at creation is what lets everything downstream - the endpoint the UI
+	// shows, the tables the bucket accepts - be answered without opening a table.
+	bucketFormat := FormatIceberg
+	if req.Format != "" {
+		normalized, ok := NormalizeFormat(req.Format)
+		if !ok {
+			h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, fmt.Sprintf("unsupported format %q", req.Format))
+			return fmt.Errorf("invalid format")
+		}
+		bucketFormat = normalized
+	}
+
 	principal := h.getAccountID(r)
 	identityActions := getIdentityActions(r)
 	identityPolicyNames := getIdentityPolicyNames(r)
 	useIAM := h.shouldUseIAM(r, identityActions, identityPolicyNames)
 	useLegacy := !useIAM
 	if useIAM {
-		allowed, err := h.authorizeIAMAction(r, identityPolicyNames, "CreateTableBucket", h.generateTableBucketARN(principal, req.Name), fmt.Sprintf("arn:aws:s3:::%s", req.Name))
+		allowed, err := h.authorizeIAMAction(r, identityPolicyNames, "CreateTableBucket", h.generateTableBucketARN(principal, req.Name), h.generateS3BucketARN(req.Name))
 		if err != nil {
 			h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to create table buckets")
 			return NewAuthError("CreateTableBucket", principal, "not authorized to create table buckets")
@@ -53,7 +66,7 @@ func (h *S3TablesHandler) handleCreateTableBucket(w http.ResponseWriter, r *http
 		}
 		if !CheckPermissionWithContext("CreateTableBucket", principal, owner, "", "", &PolicyContext{
 			IdentityActions: identityActions,
-			DefaultAllow:    h.defaultAllow,
+			DefaultAllow:    h.defaultAllowFor(r),
 		}) {
 			h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to create table buckets")
 			return NewAuthError("CreateTableBucket", principal, "not authorized to create table buckets")
@@ -115,6 +128,7 @@ func (h *S3TablesHandler) handleCreateTableBucket(w http.ResponseWriter, r *http
 		Name:           req.Name,
 		CreatedAt:      now,
 		OwnerAccountID: principal,
+		Format:         bucketFormat,
 	}
 
 	metadataBytes, err := json.Marshal(metadata)

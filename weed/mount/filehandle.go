@@ -3,6 +3,9 @@ package mount
 import (
 	"os"
 	"sync"
+	"sync/atomic"
+
+	"google.golang.org/protobuf/proto"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
@@ -37,17 +40,36 @@ type FileHandle struct {
 	savedName         string // last known file name if inode-to-path state is forgotten
 
 	isDeleted bool
-	isRenamed bool // set by Rename before waiting for async flush; skips old-path metadata flush
+	// deleteEpoch counts the times isDeleted was raised, all of them under the
+	// handle's flush lock. A caller that raised it and then found it had
+	// nothing to delete after all can tell its own mark from a later one.
+	deleteEpoch uint64
+	isRenamed   bool // set by Rename before waiting for async flush; skips old-path metadata flush
+
+	// entryVersionTsNs is the filer log position the handle's entry reflects.
+	// State at or below it must not replace the entry — that rolls it back.
+	entryVersionTsNs atomic.Int64
+
+	// entryVersionSignature identifies the filer whose clock stamped
+	// entryVersionTsNs, when it came from an RPC fence. Positions from a
+	// different filer are not comparable, so an event that filer did not log
+	// is applied rather than fenced out. Zero when the version came from an
+	// event, whose ordering the subscription already provides.
+	entryVersionSignature atomic.Int32
+
+	// baseEntry snapshots the filer state last installed or acknowledged.
+	// Local writes move the live entry away from it, so "is this event new"
+	// must be judged here, not against the live entry. Always store a clone.
+	baseEntry atomic.Pointer[filer_pb.Entry]
 
 	// dlmLock holds the distributed lock for cross-mount write coordination.
 	// Non-nil only when -dlm is enabled and the file was opened for writing.
 	// Acquired in AcquireHandle, released in ReleaseHandle.
 	dlmLock *cluster.LiveLock
 
-	// RDMA chunk offset cache for performance optimization
-	chunkOffsetCache []int64
-	chunkCacheValid  bool
-	chunkCacheLock   sync.RWMutex
+	// remoteInstallMu serializes downloadRemoteEntry's install, which holds
+	// only the handle's shared lock and so races a second concurrent read.
+	remoteInstallMu sync.Mutex
 
 	// for debugging
 	mirrorFile *os.File
@@ -67,6 +89,7 @@ func newFileHandle(wfs *WFS, handleId FileHandleId, inode uint64, entry *filer_p
 	}
 	if entry != nil {
 		fh.SetEntry(entry)
+		fh.baseEntry.Store(proto.Clone(entry).(*filer_pb.Entry))
 	}
 
 	if IsDebugFileReadWrite {
@@ -105,8 +128,11 @@ func (fh *FileHandle) SetEntry(entry *filer_pb.Entry) {
 	if entry != nil {
 		fileSize := filer.FileSize(entry)
 		entry.Attributes.FileSize = fileSize
+		if fh.entryChunkGroup != nil {
+			_ = fh.entryChunkGroup.Close()
+		}
 		var resolveManifestErr error
-		fh.entryChunkGroup, resolveManifestErr = filer.NewChunkGroup(fh.wfs.LookupFn(), fh.wfs.chunkCache, entry.Chunks, fh.wfs.option.ConcurrentReaders)
+		fh.entryChunkGroup, resolveManifestErr = filer.NewChunkGroup(fh.wfs.LookupFn(), fh.wfs.chunkCache, entry.Chunks, fh.wfs.option.ConcurrentReaders, fh.wfs.CacheInvalidator(), fh.wfs.manifestCache, fh.wfs.readerCacheBudget)
 		if resolveManifestErr != nil {
 			glog.Warningf("failed to resolve manifest chunks in %+v", entry)
 		}
@@ -114,9 +140,57 @@ func (fh *FileHandle) SetEntry(entry *filer_pb.Entry) {
 		glog.Fatalf("setting file handle entry to nil")
 	}
 	fh.entry.SetEntry(entry)
+}
 
-	// Invalidate chunk offset cache since chunks may have changed
-	fh.invalidateChunkCache()
+// installAckedEntry installs filer-acknowledged state under the handle lock
+// when it outranks the handle. A version never advances without its value:
+// stamping alone would fence out the events carrying what the handle lacks.
+// Dirty handles are skipped — local writes supersede the ack.
+func (fh *FileHandle) installAckedEntry(entry *filer_pb.Entry, versionTsNs int64, signature int32) {
+	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("installAckedEntry", fh.fh, util.ExclusiveLock)
+	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+	if versionTsNs == 0 || fh.dirtyMetadata || entry == fh.GetEntry().GetEntry() {
+		return
+	}
+	// Refuse only what is provably older. Two known, differing filer
+	// signatures mean the positions come from unrelated clocks and say
+	// nothing about each other; dropping the acknowledgment there would leave
+	// the handle holding the very state this mutation replaced. Unknown
+	// signatures still compare, as they did before.
+	handleSignature := fh.entryVersionSignature.Load()
+	provablyOtherClock := signature != 0 && handleSignature != 0 && signature != handleSignature
+	if !provablyOtherClock && versionTsNs <= fh.entryVersionTsNs.Load() {
+		return
+	}
+	fh.SetEntry(entry)
+	fh.setAuthoritativeBase(proto.Clone(entry).(*filer_pb.Entry))
+	fh.advanceEntryVersion(versionTsNs, signature)
+}
+
+// setAuthoritativeBase installs the base snapshot a local ack acknowledged.
+func (fh *FileHandle) setAuthoritativeBase(base *filer_pb.Entry) {
+	fh.baseEntry.Store(base)
+}
+
+// advanceEntryVersion raises the entry version, never regresses it, and
+// records the clock domain the new position belongs to: a filer signature for
+// an RPC fence, zero for an event. The signature travels with the timestamp so
+// the two never disagree. A zero position (an unversioned old filer) is a
+// no-op, leaving the handle open to refreshes.
+func (fh *FileHandle) advanceEntryVersion(tsNs int64, signature int32) {
+	if tsNs == 0 {
+		return
+	}
+	for {
+		current := fh.entryVersionTsNs.Load()
+		if tsNs <= current {
+			return
+		}
+		if fh.entryVersionTsNs.CompareAndSwap(current, tsNs) {
+			fh.entryVersionSignature.Store(signature)
+			return
+		}
+	}
 }
 
 func (fh *FileHandle) ResetDirtyPages() {
@@ -129,17 +203,11 @@ func (fh *FileHandle) ResetDirtyPages() {
 func (fh *FileHandle) UpdateEntry(fn func(entry *filer_pb.Entry)) *filer_pb.Entry {
 	result := fh.entry.UpdateEntry(fn)
 
-	// Invalidate chunk offset cache since entry may have been modified
-	fh.invalidateChunkCache()
-
 	return result
 }
 
 func (fh *FileHandle) AddChunks(chunks []*filer_pb.FileChunk) {
 	fh.entry.AppendChunks(chunks)
-
-	// Invalidate chunk offset cache since new chunks were added
-	fh.invalidateChunkCache()
 }
 
 func (fh *FileHandle) ReleaseHandle() {
@@ -154,53 +222,11 @@ func (fh *FileHandle) ReleaseHandle() {
 	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("ReleaseHandle", fh.fh, util.ExclusiveLock)
 	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 
+	if fh.entryChunkGroup != nil {
+		_ = fh.entryChunkGroup.Close()
+	}
 	fh.dirtyPages.Destroy()
 	if IsDebugFileReadWrite {
 		fh.mirrorFile.Close()
 	}
-}
-
-// getCumulativeOffsets returns cached cumulative offsets for chunks, computing them if necessary
-func (fh *FileHandle) getCumulativeOffsets(chunks []*filer_pb.FileChunk) []int64 {
-	fh.chunkCacheLock.RLock()
-	if fh.chunkCacheValid && len(fh.chunkOffsetCache) == len(chunks)+1 {
-		// Cache is valid and matches current chunk count
-		result := make([]int64, len(fh.chunkOffsetCache))
-		copy(result, fh.chunkOffsetCache)
-		fh.chunkCacheLock.RUnlock()
-		return result
-	}
-	fh.chunkCacheLock.RUnlock()
-
-	// Need to compute/recompute cache
-	fh.chunkCacheLock.Lock()
-	defer fh.chunkCacheLock.Unlock()
-
-	// Double-check in case another goroutine computed it while we waited for the lock
-	if fh.chunkCacheValid && len(fh.chunkOffsetCache) == len(chunks)+1 {
-		result := make([]int64, len(fh.chunkOffsetCache))
-		copy(result, fh.chunkOffsetCache)
-		return result
-	}
-
-	// Compute cumulative offsets
-	cumulativeOffsets := make([]int64, len(chunks)+1)
-	for i, chunk := range chunks {
-		cumulativeOffsets[i+1] = cumulativeOffsets[i] + int64(chunk.Size)
-	}
-
-	// Cache the result
-	fh.chunkOffsetCache = make([]int64, len(cumulativeOffsets))
-	copy(fh.chunkOffsetCache, cumulativeOffsets)
-	fh.chunkCacheValid = true
-
-	return cumulativeOffsets
-}
-
-// invalidateChunkCache invalidates the chunk offset cache when chunks are modified
-func (fh *FileHandle) invalidateChunkCache() {
-	fh.chunkCacheLock.Lock()
-	fh.chunkCacheValid = false
-	fh.chunkOffsetCache = nil
-	fh.chunkCacheLock.Unlock()
 }

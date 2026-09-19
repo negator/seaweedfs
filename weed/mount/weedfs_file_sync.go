@@ -16,6 +16,12 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// metadataFlushTimeout bounds a close()/fsync metadata flush so an overwhelmed
+// filer cannot wedge the calling process forever. It is deliberately generous:
+// a healthy CreateEntry completes in well under a second, so this only fires on
+// a genuinely stuck filer, never on a normal flush.
+const metadataFlushTimeout = 30 * time.Second
+
 /**
  * Flush method
  *
@@ -71,7 +77,18 @@ func (wfs *WFS) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
 	// would silently degrade to a blocking flush for ordinary close().
 	hasPosixLocks := wfs.hasPosixOwner(in.NodeId, in.LockOwner)
 	allowAsync := !hasPosixLocks
-	status := wfs.doFlush(fh, in.Uid, in.Gid, allowAsync)
+
+	// Bound the flush with a deadline instead of tying it to the FUSE cancel
+	// channel. A FUSE interrupt is not a process kill: Go's async preemption
+	// (SIGURG) makes a close() under load emit an interrupt on nearly every
+	// flush (see go-fuse RawFileSystem docs), so cancelling the in-flight
+	// metadata CreateEntry on that interrupt turned healthy concurrent close()s
+	// into EIO. The deadline still keeps close() from hanging forever against an
+	// overwhelmed filer without failing benign flushes.
+	ctx, cancelFunc := context.WithTimeout(context.Background(), metadataFlushTimeout)
+	defer cancelFunc()
+
+	status := wfs.doFlush(ctx, fh, in.Uid, in.Gid, allowAsync)
 	if in.LockOwner != 0 {
 		wfs.releasePosixOwner(in.NodeId, in.LockOwner)
 	}
@@ -104,12 +121,15 @@ func (wfs *WFS) Fsync(cancel <-chan struct{}, in *fuse.FsyncIn) (code fuse.Statu
 		return fuse.ENOENT
 	}
 
+	ctx, cancelFunc := context.WithTimeout(context.Background(), metadataFlushTimeout)
+	defer cancelFunc()
+
 	// Fsync is an explicit sync request — always flush synchronously
-	return wfs.doFlush(fh, in.Uid, in.Gid, false)
+	return wfs.doFlush(ctx, fh, in.Uid, in.Gid, false)
 
 }
 
-func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.Status {
+func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.Status {
 
 	// flush works at fh level
 	fileFullPath := fh.FullPath()
@@ -141,7 +161,7 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.S
 	if !isOverQuota {
 		if err := fh.dirtyPages.FlushData(); err != nil {
 			glog.Errorf("%v doFlush: %v", fileFullPath, err)
-			return fuse.EIO
+			return writeErrorToFuseStatus(err)
 		}
 	}
 
@@ -160,8 +180,8 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.S
 		return fuse.Status(syscall.ENOSPC)
 	}
 
-	if err := retryMetadataFlush(func() error {
-		return wfs.flushMetadataToFiler(fh, dir, name, uid, gid)
+	if err := retryMetadataFlush(ctx, func() error {
+		return wfs.flushMetadataToFiler(ctx, fh, dir, name, uid, gid)
 	}, func(nextAttempt, totalAttempts int, backoff time.Duration, err error) {
 		glog.Warningf("%v fh %d flush: retrying metadata flush (attempt %d/%d) after %v: %v",
 			fileFullPath, fh.fh, nextAttempt, totalAttempts, backoff, err)
@@ -183,12 +203,20 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.S
 // When -dlm is enabled, the distributed lock is already held by the FileHandle
 // from open-for-write through close, so no additional distributed lock is
 // needed here. The local fhLockTable lock below serializes within this mount.
-func (wfs *WFS) flushMetadataToFiler(fh *FileHandle, dir, name string, uid, gid uint32) error {
+func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, name string, uid, gid uint32) error {
 	fileFullPath := fh.FullPath()
 	glog.V(4).Infof("flushMetadataToFiler %s/%s inode %d fh %d", dir, name, fh.inode, fh.fh)
 
 	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
 	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+
+	// Re-check under the lock: Unlink sets the flag under it, so a flush that
+	// was already past the earlier check cannot write the entry back after
+	// the delete removed it.
+	if fh.isDeleted {
+		glog.V(3).Infof("flushMetadataToFiler %s fh %d: file was unlinked, skipping", fileFullPath, fh.fh)
+		return nil
+	}
 
 	entry := fh.GetEntry()
 	entry.Name = name // this flush may be just after a rename operation
@@ -219,7 +247,8 @@ func (wfs *WFS) flushMetadataToFiler(fh *FileHandle, dir, name string, uid, gid 
 		manifestChunks = nil
 	}
 
-	chunks, manifestErr := filer.MaybeManifestize(wfs.saveDataAsChunk(fileFullPath), chunks)
+	// no chunk deleter here: a failed fold reports the blobs it saved
+	chunks, manifestErr := filer.MaybeManifestize(wfs.saveDataAsChunk(fileFullPath), nil, chunks)
 	if manifestErr != nil {
 		// not good, but should be ok
 		glog.V(0).Infof("MaybeManifestize: %v", manifestErr)
@@ -238,9 +267,12 @@ func (wfs *WFS) flushMetadataToFiler(fh *FileHandle, dir, name string, uid, gid 
 		SkipCheckParentDirectory: true,
 	}
 
+	// Snapshot with local ids before the request mapping mutates the clone:
+	// on ack this becomes the handle's base, judged against future events.
+	baseSnapshot := proto.Clone(requestEntry).(*filer_pb.Entry)
 	wfs.mapPbIdFromLocalToFiler(request.Entry)
 
-	resp, err := wfs.streamCreateEntry(context.Background(), request)
+	resp, err := wfs.streamCreateEntry(ctx, request)
 	if err != nil {
 		glog.Errorf("fh flush create %s: %v", fileFullPath, err)
 		return fmt.Errorf("fh flush create %s: %v", fileFullPath, err)
@@ -249,7 +281,15 @@ func (wfs *WFS) flushMetadataToFiler(fh *FileHandle, dir, name string, uid, gid 
 	event := resp.GetMetadataEvent()
 	if event == nil {
 		event = metadataUpdateEvent(string(dir), request.Entry)
+		if event != nil {
+			event.TsNs = ackVersionTsNs(resp)
+		}
 	}
+	// The filer acknowledged this state at the event's log position (or, for
+	// a no-op create, at the response's log position); older queued
+	// subscription events must not roll the handle back.
+	fh.setAuthoritativeBase(baseSnapshot)
+	fh.advanceEntryVersion(ackVersionTsNs(resp), resp.GetLogSignature())
 	if applyErr := wfs.applyLocalMetadataEvent(context.Background(), event); applyErr != nil {
 		glog.Warningf("flush %s: best-effort metadata apply failed: %v", fileFullPath, applyErr)
 		wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(dir))

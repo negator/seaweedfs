@@ -74,6 +74,7 @@ type syncState struct {
 	grpcDialOption       grpc.DialOption
 	targetFiler          pb.ServerAddress
 	sourcePath           string
+	targetPath           string
 	sourceFilerSignature int32
 }
 
@@ -217,7 +218,7 @@ func runFilerSynchronize(cmd *Command, args []string) bool {
 			if offsetTsNs == 0 {
 				return
 			}
-			if err := setOffset(state.grpcDialOption, state.targetFiler, getSignaturePrefixByPath(state.sourcePath), state.sourceFilerSignature, offsetTsNs); err != nil {
+			if err := setOffset(state.grpcDialOption, state.targetFiler, getSignaturePrefixByPath(state.sourcePath, state.targetPath), state.sourceFilerSignature, offsetTsNs); err != nil {
 				glog.Errorf("failed to save checkpoint for %s on shutdown: %v", name, err)
 			} else {
 				glog.V(0).Infof("saved checkpoint for %s on shutdown: %v", name, time.Unix(0, offsetTsNs))
@@ -231,7 +232,7 @@ func runFilerSynchronize(cmd *Command, args []string) bool {
 	go func() {
 		// a->b
 		// set synchronization start timestamp to offset
-		initOffsetError := initOffsetFromTsMs(grpcDialOptionB, filerB, aFilerSignature, *syncOptions.aFromTsMs, getSignaturePrefixByPath(*syncOptions.aPath))
+		initOffsetError := initOffsetFromTsMs(grpcDialOptionB, filerB, aFilerSignature, *syncOptions.aFromTsMs, getSignaturePrefixByPath(*syncOptions.aPath, *syncOptions.bPath))
 		if initOffsetError != nil {
 			glog.Errorf("init offset from timestamp %d error from %s to %s: %v", *syncOptions.aFromTsMs, *syncOptions.filerA, *syncOptions.filerB, initOffsetError)
 			os.Exit(2)
@@ -273,7 +274,7 @@ func runFilerSynchronize(cmd *Command, args []string) bool {
 	if !*syncOptions.isActivePassive {
 		// b->a
 		// set synchronization start timestamp to offset
-		initOffsetError := initOffsetFromTsMs(grpcDialOptionA, filerA, bFilerSignature, *syncOptions.bFromTsMs, getSignaturePrefixByPath(*syncOptions.bPath))
+		initOffsetError := initOffsetFromTsMs(grpcDialOptionA, filerA, bFilerSignature, *syncOptions.bFromTsMs, getSignaturePrefixByPath(*syncOptions.bPath, *syncOptions.aPath))
 		if initOffsetError != nil {
 			glog.Errorf("init offset from timestamp %d error from %s to %s: %v", *syncOptions.bFromTsMs, *syncOptions.filerB, *syncOptions.filerA, initOffsetError)
 			os.Exit(2)
@@ -339,7 +340,10 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDi
 
 	// if first time, start from now
 	// if has previously synced, resume from that point of time
-	sourceFilerOffsetTsNs, err := getOffset(targetGrpcDialOption, targetFiler, getSignaturePrefixByPath(sourcePath), sourceFilerSignature)
+	// the historical key ignored the target path; falling back to it lets a
+	// sync that predates target-scoped keys survive the upgrade
+	signaturePrefix := getSignaturePrefixByPath(sourcePath, targetPath)
+	sourceFilerOffsetTsNs, err := getOffsetWithFallback(targetGrpcDialOption, targetFiler, signaturePrefix, sourceFilerSignature, getSignaturePrefixByPath(sourcePath, "/"), sourceFilerSignature)
 	if err != nil {
 		return err
 	}
@@ -378,7 +382,9 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDi
 		glog.Warningf("invalid concurrency value, using default: %d", DefaultConcurrencyLimit)
 		concurrency = DefaultConcurrencyLimit
 	}
+	clientName := fmt.Sprintf("syncFrom_%s_To_%s", string(sourceFiler), string(targetFiler))
 	processor := NewMetadataProcessor(processEventFn, concurrency, sourceFilerOffsetTsNs)
+	processor.SetMetrics(sourceFiler.String(), targetFiler.String(), clientName, sourcePath)
 
 	// update sync state for graceful shutdown checkpoint saving
 	if statePtr != nil {
@@ -387,13 +393,43 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDi
 			grpcDialOption:       targetGrpcDialOption,
 			targetFiler:          targetFiler,
 			sourcePath:           sourcePath,
+			targetPath:           targetPath,
 			sourceFilerSignature: sourceFilerSignature,
 		})
 	}
 
+	// The offset callback below only fires while events flow, so it freezes
+	// exactly when the workers are saturated; a ticker keeps lag honest. The
+	// idle heartbeat is folded in because the watermark stops at the last real
+	// event, so a quiet caught-up stream would otherwise show phantom lag.
+	lagGauge := statsCollect.FilerSyncLagSecondsGauge.WithLabelValues(sourceFiler.String(), targetFiler.String(), clientName, sourcePath)
+	var idleHeartbeatTsNs atomic.Int64
+	stopLagTicker := make(chan struct{})
+	defer close(stopLagTicker)
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopLagTicker:
+				return
+			case <-ticker.C:
+				freshnessTsNs := processor.processedTsWatermark.Load()
+				// a heartbeat means consumed, not replicated: while a failure
+				// pins the watermark it must not mask the growing lag
+				if processor.OldestFailedTsNs() == 0 {
+					freshnessTsNs = max(freshnessTsNs, idleHeartbeatTsNs.Load())
+				}
+				if freshnessTsNs == 0 {
+					continue
+				}
+				lagGauge.Set(max(0, time.Since(time.Unix(0, freshnessTsNs)).Seconds()))
+			}
+		}
+	}()
+
 	var lastLogTsNs = time.Now().UnixNano()
 	var lastProgressedTsNs int64
-	var clientName = fmt.Sprintf("syncFrom_%s_To_%s", string(sourceFiler), string(targetFiler))
 	processEventFnWithOffset := pb.AddOffsetFunc(func(resp *filer_pb.SubscribeMetadataResponse) error {
 		processor.AddSyncJob(resp)
 		return nil
@@ -420,7 +456,7 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDi
 		lastProgressedTsNs = offsetTsNs
 		// collect synchronous offset
 		statsCollect.FilerSyncOffsetGauge.WithLabelValues(sourceFiler.String(), targetFiler.String(), clientName, sourcePath).Set(float64(offsetTsNs))
-		return setOffset(targetGrpcDialOption, targetFiler, getSignaturePrefixByPath(sourcePath), sourceFilerSignature, offsetTsNs)
+		return setOffset(targetGrpcDialOption, targetFiler, signaturePrefix, sourceFilerSignature, offsetTsNs)
 	})
 
 	prefix := sourcePath
@@ -444,7 +480,13 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDi
 		// The idle heartbeat moves the gauge to the source's current time once we
 		// are caught up, so now-sync_offset reflects real lag and stays alertable.
 		OnIdleHeartbeat: func(tsNs int64) {
+			// same masking concern as the lag ticker: a pinned failure must
+			// keep now-sync_offset growing too
+			if processor.OldestFailedTsNs() != 0 {
+				return
+			}
 			statsCollect.FilerSyncOffsetGauge.WithLabelValues(sourceFiler.String(), targetFiler.String(), clientName, sourcePath).Set(float64(tsNs))
+			idleHeartbeatTsNs.Store(tsNs)
 		},
 	}
 
@@ -452,14 +494,22 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDi
 
 }
 
-// When each business is distinguished according to path, and offsets need to be maintained separately.
-func getSignaturePrefixByPath(path string) string {
-	// compatible historical version
-	if path == "/" {
-		return SyncKeyPrefix
-	} else {
-		return SyncKeyPrefix + path
+// Offsets are kept per (source path, target path): two syncs from the same
+// source to different directories on the same target filer see the same events
+// but progress independently, so a shared key would let one push the other
+// past events it never processed. "/" contributes nothing on either side,
+// keeping the historical key form so existing deployments resume unchanged.
+func getSignaturePrefixByPath(sourcePath, targetPath string) string {
+	prefix := SyncKeyPrefix
+	if sourcePath != "/" {
+		prefix += sourcePath
 	}
+	if targetPath != "/" {
+		// NUL cannot occur in a path, so the combined key can alias neither a
+		// source-only key nor another (source, target) pair
+		prefix += "\x00" + targetPath
+	}
+	return prefix
 }
 
 func getOffset(grpcDialOption grpc.DialOption, filer pb.ServerAddress, signaturePrefix string, signature int32) (lastOffsetTsNs int64, readErr error) {
@@ -487,6 +537,20 @@ func getOffset(grpcDialOption grpc.DialOption, filer pb.ServerAddress, signature
 
 	return
 
+}
+
+// getOffsetWithFallback reads the offset under the current key, falling back
+// to the historical key when the current one has no value yet, so streams
+// created before a checkpoint key-scheme change resume where they left off
+// instead of replaying from zero. Writes must go only to the current key:
+// keeping the historical key warm would re-create the very sharing between
+// streams that a key-scheme change separates.
+func getOffsetWithFallback(grpcDialOption grpc.DialOption, filer pb.ServerAddress, signaturePrefix string, signature int32, legacySignaturePrefix string, legacySignature int32) (int64, error) {
+	lastOffsetTsNs, err := getOffset(grpcDialOption, filer, signaturePrefix, signature)
+	if err == nil && lastOffsetTsNs == 0 {
+		lastOffsetTsNs, err = getOffset(grpcDialOption, filer, legacySignaturePrefix, legacySignature)
+	}
+	return lastOffsetTsNs, err
 }
 
 func setOffset(grpcDialOption grpc.DialOption, filer pb.ServerAddress, signaturePrefix string, signature int32, offsetTsNs int64) error {
@@ -611,6 +675,37 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 			// old key is in the watched directory
 			if util.IsEqualOrUnder(string(sourceNewKey), sourcePath) {
 				// new key is also in the watched directory
+				if filer_pb.IsRename(resp) {
+					newKey := buildKey(dataSink, message, targetPath, sourceNewKey, sourcePath)
+					// With deletes enabled a rename relocates the entry. Guard the
+					// watched root itself, whose old key would resolve to the target
+					// root and recursively delete the whole sink tree.
+					if doDeleteFiles && string(sourceOldKey) != sourcePath {
+						oldKey := buildKey(dataSink, message, targetPath, sourceOldKey, sourcePath)
+						if mover, ok := dataSink.(sink.EntryMover); ok {
+							// native atomic move: no re-copy, no descendant gap, no chunk leak.
+							return mover.MoveEntry(oldKey, newKey, message.NewEntry, message.Signatures)
+						}
+						// no native move: create the new entry first, then delete the
+						// old, so a crash between the two leaves the entry visible.
+						if err := dataSink.CreateEntry(newKey, message.NewEntry, message.Signatures); err != nil {
+							return fmt.Errorf("create entry2 : %w", err)
+						}
+						if err := dataSink.DeleteEntry(oldKey, message.OldEntry.IsDirectory, false, message.Signatures); err != nil {
+							return fmt.Errorf("delete old entry %v: %w", oldKey, err)
+						}
+						return nil
+					}
+					// deletes disabled (backup/incremental) or the watched root moved:
+					// create the new entry and keep the old.
+					if err := dataSink.CreateEntry(newKey, message.NewEntry, message.Signatures); err != nil {
+						return fmt.Errorf("create entry2 : %w", err)
+					}
+					return nil
+				}
+
+				// in-place update (same path): mutate via UpdateEntry; never
+				// delete-then-recreate the same key.
 				if doDeleteFiles {
 					oldKey := util.Join(targetPath, string(sourceOldKey)[len(sourcePath):])
 					var sinkNewParentPath string
@@ -623,19 +718,16 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 					if foundExisting {
 						return err
 					}
-
-					// not able to find old entry
+					// old entry missing on the destination; fall through to create it
 					if err = dataSink.DeleteEntry(string(oldKey), message.OldEntry.IsDirectory, false, message.Signatures); err != nil {
 						return fmt.Errorf("delete old entry %v: %w", oldKey, err)
 					}
 				}
-				// create the new entry
 				newKey := buildKey(dataSink, message, targetPath, sourceNewKey, sourcePath)
 				if err := dataSink.CreateEntry(newKey, message.NewEntry, message.Signatures); err != nil {
 					return fmt.Errorf("create entry2 : %w", err)
-				} else {
-					return nil
 				}
+				return nil
 
 			} else {
 				// new key is outside the watched directory
@@ -694,10 +786,10 @@ func destKey(dataSink sink.ReplicationSink, targetPath, sourcePath string, sourc
 		relative = strings.TrimPrefix(sk, "/")
 	}
 	if !dataSink.IsIncremental() {
-		return escapeKey(util.Join(targetPath, relative))
+		return util.Join(targetPath, relative)
 	}
 	dateKey := time.Unix(mTime, 0).Format("2006-01-02")
-	return escapeKey(util.Join(targetPath, dateKey, relative))
+	return util.Join(targetPath, dateKey, relative)
 }
 
 // isEntryExcluded checks whether a single side (old or new) of an event is excluded

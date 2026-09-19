@@ -54,7 +54,10 @@ func (c *Collection) GetVolumeLayout(rp *super_block.ReplicaPlacement, ttl *need
 		keyString += string(diskType)
 	}
 	vl, ok := c.storageType2VolumeLayout.Find(keyString)
-	return vl.(*VolumeLayout), ok
+	if !ok {
+		return nil, false
+	}
+	return vl.(*VolumeLayout), true
 }
 
 func (c *Collection) GetAllVolumeLayouts() []*VolumeLayout {
@@ -75,7 +78,10 @@ func (c *Collection) DeleteVolumeLayout(rp *super_block.ReplicaPlacement, ttl *n
 	if diskType != types.HardDriveType {
 		keyString += string(diskType)
 	}
-	c.storageType2VolumeLayout.Delete(keyString)
+	// Unpublish first so a racing registration re-resolves into a fresh layout.
+	if vl, found := c.storageType2VolumeLayout.Delete(keyString); found {
+		vl.(*VolumeLayout).releaseLookupOwnership()
+	}
 }
 
 func (c *Collection) Lookup(vid needle.VolumeId) []*DataNode {

@@ -555,6 +555,32 @@ func TestPostPolicyBucketHandlerKeyExtraction(t *testing.T) {
 	}
 }
 
+func TestPostPolicyBucketHandlerRejectsTraversalKey(t *testing.T) {
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	assert.NoError(t, writer.WriteField("key", "uploads/../../victim-bucket/secret"))
+	assert.NoError(t, writer.WriteField("Policy", ""))
+	part, err := writer.CreateFormFile("file", "payload.txt")
+	assert.NoError(t, err)
+	_, err = part.Write([]byte("secret"))
+	assert.NoError(t, err)
+	assert.NoError(t, writer.Close())
+
+	req := httptest.NewRequest(http.MethodPost, "/source-bucket", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req = mux.SetURLVars(req, map[string]string{"bucket": "source-bucket"})
+	rec := httptest.NewRecorder()
+
+	s3a := &S3ApiServer{
+		option: &S3ApiServerOption{BucketsPath: "/buckets"},
+		iam:    &IdentityAccessManagement{},
+	}
+	s3a.PostPolicyBucketHandler(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "InvalidRequest")
+}
+
 // TestPostPolicyBucketHandler_PolicyViolationReturns403 drives the handler
 // end-to-end with a signed multipart POST whose policy conditions cannot be
 // satisfied by the form fields. It verifies the handler responds 403
@@ -588,13 +614,8 @@ func TestPostPolicyBucketHandler_PolicyViolationReturns403(t *testing.T) {
 	}
 	// Pre-populate the bucket registry so validateTableBucketObjectPath sees
 	// a non-table bucket without needing a live filer connection.
-	s3a.bucketRegistry = &BucketRegistry{
-		metadataCache: map[string]*BucketMetaData{
-			testBucket: {Name: testBucket, IsTableBucket: false},
-		},
-		notFound: make(map[string]struct{}),
-		s3a:      s3a,
-	}
+	s3a.bucketRegistry = NewBucketRegistry(s3a)
+	s3a.bucketRegistry.setMetadataCache(&BucketMetaData{Name: testBucket, IsTableBucket: false})
 
 	now := time.Now().UTC()
 	amzDate := now.Format(iso8601Format)

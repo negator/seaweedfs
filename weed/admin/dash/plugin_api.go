@@ -595,19 +595,14 @@ func (s *AdminServer) TriggerPluginDetectionAPI(w http.ResponseWriter, r *http.R
 }
 
 // RunPluginJobTypeAPI runs full workflow for one job type: detect then dispatch detected jobs.
+// RunPluginDetection and the dispatch path take the cluster admin lock
+// themselves (around detection and around each job), so no lock is held
+// across the whole workflow here.
 func (s *AdminServer) RunPluginJobTypeAPI(w http.ResponseWriter, r *http.Request) {
 	jobType := strings.TrimSpace(mux.Vars(r)["jobType"])
 	if jobType == "" {
 		writeJSONError(w, http.StatusBadRequest, "jobType is required")
 		return
-	}
-	releaseLock, err := s.acquirePluginLock(fmt.Sprintf("plugin detect+execute %s", jobType))
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if releaseLock != nil {
-		defer releaseLock()
 	}
 
 	var req struct {
@@ -805,9 +800,7 @@ func (s *AdminServer) buildDefaultPluginClusterContext() *plugin_pb.ClusterConte
 
 	s3Seen := map[string]struct{}{}
 	if err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
-		resp, err := client.ListClusterNodes(context.Background(), &master_pb.ListClusterNodesRequest{
-			ClientType: cluster.S3Type,
-		})
+		resp, err := client.ListClusterNodes(context.Background(), s.listClusterNodesRequest(cluster.S3Type))
 		if err != nil {
 			return err
 		}
@@ -989,3 +982,27 @@ func parsePositiveInt(raw string, defaultValue int) int {
 }
 
 // cloneConfigValueMap is now exported by the plugin package as CloneConfigValueMap
+
+// GetPluginObservationsAPI returns what workers last reported about the objects
+// they inspected. Accepts an optional ?format= filter.
+//
+// These are cached, not live: a worker reports what it saw when it last looked,
+// and the timestamp is served with each one so a reader can judge the age.
+func (s *AdminServer) GetPluginObservationsAPI(w http.ResponseWriter, r *http.Request) {
+	plugin := s.GetPlugin()
+	if plugin == nil {
+		writeJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+
+	formatFilter := strings.TrimSpace(r.URL.Query().Get("format"))
+	observed := plugin.Observations().List()
+	payload := make([]interface{}, 0, len(observed))
+	for _, o := range observed {
+		if formatFilter != "" && !strings.EqualFold(o.Format, formatFilter) {
+			continue
+		}
+		payload = append(payload, o)
+	}
+	writeJSON(w, http.StatusOK, payload)
+}

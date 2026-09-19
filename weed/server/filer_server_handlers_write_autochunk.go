@@ -177,7 +177,7 @@ func (fs *FilerServer) checkPermissions(ctx context.Context, r *http.Request, fi
 
 func (fs *FilerServer) wormEnforcedForEntry(ctx context.Context, fullPath string) (bool, error) {
 	rule := fs.filer.FilerConf.MatchStorageRule(fullPath)
-	if !rule.Worm {
+	if !rule.GetWorm() {
 		return false, nil
 	}
 
@@ -306,7 +306,7 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 	}
 
 	// maybe compact entry chunks
-	mergedChunks, replyerr = filer.MaybeManifestize(fs.saveAsChunk(ctx, so), mergedChunks)
+	mergedChunks, replyerr = filer.MaybeManifestize(fs.saveAsChunk(ctx, so), fs.filer.DeleteChunksNotRecursive, mergedChunks)
 	if replyerr != nil {
 		glog.V(0).InfofCtx(ctx, "manifestize %s: %v", r.RequestURI, replyerr)
 		return

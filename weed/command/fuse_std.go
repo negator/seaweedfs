@@ -124,6 +124,8 @@ func runFuse(cmd *Command, args []string) bool {
 			mountOptions.filer = &parameter.value
 		case "filer.path":
 			mountOptions.filerMountRootPath = &parameter.value
+		case "volumeName":
+			mountOptions.volumeName = &parameter.value
 		case "dirAutoCreate":
 			if parsed, err := strconv.ParseBool(parameter.value); err == nil {
 				mountOptions.dirAutoCreate = &parsed
@@ -165,7 +167,6 @@ func runFuse(cmd *Command, args []string) bool {
 				panic(fmt.Errorf("dirIdleEvictSec: %s", err))
 			}
 		case "concurrentWriters":
-			i++
 			if parsed, err := strconv.ParseInt(parameter.value, 0, 32); err == nil {
 				intValue := int(parsed)
 				mountOptions.concurrentWriters = &intValue

@@ -19,9 +19,9 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/iam_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/policy_engine"
-	. "github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"github.com/seaweedfs/seaweedfs/weed/util/request_id"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 	"google.golang.org/grpc"
@@ -117,16 +117,28 @@ func NewIamApiServerWithStore(router *mux.Router, option *IamServerOption, expli
 }
 
 func (iama *IamApiServer) registerRouter(router *mux.Router) {
+	// SigV4 recomputes the canonical query from the parsed query, so raw ';'
+	// pairs that Go would drop must be recovered before verification.
+	router.Use(util_http.EscapeSemicolonsInQuery)
 	// API Router
 	apiRouter := router.PathPrefix("/").Subrouter()
 	apiRouter.Use(request_id.Middleware)
-	// ListBuckets
+	apiRouter.Methods(http.MethodPost).Path("/").HandlerFunc(iama.iam.AuthIamManagement(iama.DoActions))
 
-	// apiRouter.Methods("GET").Path("/").HandlerFunc(track(s3a.iam.Auth(s3a.ListBucketsHandler, ACTION_ADMIN), "LIST"))
-	apiRouter.Methods(http.MethodPost).Path("/").HandlerFunc(iama.iam.Auth(iama.DoActions, ACTION_ADMIN))
-	//
+	// Health probes
+	apiRouter.Methods(http.MethodGet, http.MethodHead).Path("/healthz").HandlerFunc(iama.healthzHandler)
+	apiRouter.Methods(http.MethodGet, http.MethodHead).Path("/readyz").HandlerFunc(iama.readyzHandler)
+
 	// NotFound
 	apiRouter.NotFoundHandler = http.HandlerFunc(s3err.NotFoundHandler)
+}
+
+func (iama *IamApiServer) healthzHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+}
+
+func (iama *IamApiServer) readyzHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
 }
 
 // Shutdown gracefully stops the IAM API server and releases resources.

@@ -21,13 +21,15 @@ func TestMarkVolumeWritable_ReopensPersistedReadOnly(t *testing.T) {
 		t.Fatalf("create volume: %v", err)
 	}
 
-	if _, _, _, err := v.writeNeedle2(newRandomNeedle(1), true, false); err != nil {
+	if _, _, _, err := v.writeNeedle2(newRandomNeedle(1), true, false, false); err != nil {
 		t.Fatalf("initial write: %v", err)
 	}
 
 	// Persist read-only state into .vif, then simulate a server restart by
 	// closing and re-opening the volume from the same directory.
-	v.PersistReadOnly(true)
+	if err := v.PersistReadOnly(true, false); err != nil {
+		t.Fatalf("persist read-only: %v", err)
+	}
 	v.Close()
 
 	v2, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
@@ -47,7 +49,7 @@ func TestMarkVolumeWritable_ReopensPersistedReadOnly(t *testing.T) {
 	// once noWriteOrDelete is cleared. Confirm the failure mode the issue
 	// describes — flipping only the flag is not enough.
 	v2.noWriteOrDelete = false
-	_, _, _, writeErr := v2.writeNeedle2(newRandomNeedle(2), true, false)
+	_, _, _, writeErr := v2.writeNeedle2(newRandomNeedle(2), true, false, false)
 	if !errors.Is(writeErr, os.ErrInvalid) {
 		t.Fatalf("expected write through SortedFileNeedleMap to fail with os.ErrInvalid, got %v", writeErr)
 	}
@@ -61,7 +63,7 @@ func TestMarkVolumeWritable_ReopensPersistedReadOnly(t *testing.T) {
 	}
 
 	v2.noWriteOrDelete = false
-	if _, _, _, err := v2.writeNeedle2(newRandomNeedle(3), true, false); err != nil {
+	if _, _, _, err := v2.writeNeedle2(newRandomNeedle(3), true, false, false); err != nil {
 		t.Fatalf("write after reopen: %v", err)
 	}
 }

@@ -38,7 +38,7 @@ func init() {
 	cmdUpload.IsDebug = cmdUpload.Flag.Bool("debug", false, "verbose debug information")
 	upload.master = cmdUpload.Flag.String("master", "localhost:9333", "SeaweedFS master location")
 	upload.dir = cmdUpload.Flag.String("dir", "", "Upload the whole folder recursively if specified.")
-	upload.include = cmdUpload.Flag.String("include", "", "pattens of files to upload, e.g., *.pdf, *.html, ab?d.txt, works together with -dir")
+	upload.include = cmdUpload.Flag.String("include", "", "patterns of files to upload, e.g., *.pdf, *.html, ab?d.txt, works together with -dir")
 	upload.replication = cmdUpload.Flag.String("replication", "", "replication type")
 	upload.collection = cmdUpload.Flag.String("collection", "", "optional collection name")
 	upload.dataCenter = cmdUpload.Flag.String("dataCenter", "", "optional data center name")
@@ -145,7 +145,7 @@ func runUpload(cmd *Command, args []string) bool {
 }
 
 func readMasterConfiguration(grpcDialOption grpc.DialOption, masterAddress pb.ServerAddress) (replication string, err error) {
-	err = pb.WithMasterClient(false, masterAddress, grpcDialOption, false, func(client master_pb.SeaweedClient) error {
+	err = pb.WithMasterClient(context.Background(), false, masterAddress, grpcDialOption, false, func(client master_pb.SeaweedClient) error {
 		resp, err := client.GetMasterConfiguration(context.Background(), &master_pb.GetMasterConfigurationRequest{})
 		if err != nil {
 			return fmt.Errorf("get master %s configuration: %v", masterAddress, err)

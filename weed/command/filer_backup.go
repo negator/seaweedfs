@@ -17,6 +17,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/replication/repl_util"
 	"github.com/seaweedfs/seaweedfs/weed/replication/sink"
+	"github.com/seaweedfs/seaweedfs/weed/replication/sink/filersink"
 	"github.com/seaweedfs/seaweedfs/weed/replication/source"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -63,7 +64,7 @@ func init() {
 	filerBackupOptions.retentionDays = cmdFilerBackup.Flag.Int("retentionDays", 0, "incremental backup retention days")
 	filerBackupOptions.disableErrorRetry = cmdFilerBackup.Flag.Bool("disableErrorRetry", false, "disables errors retry, only logs will print")
 	filerBackupOptions.ignore404Error = cmdFilerBackup.Flag.Bool("ignore404Error", true, "ignore 404 errors from filer")
-	filerBackupOptions.initialSnapshot = cmdFilerBackup.Flag.Bool("initialSnapshot", false, "before subscribing to metadata updates, walk the live filer tree under -filerPath and seed the destination. Only runs on a fresh sync (no prior checkpoint and -timeAgo is 0). After the walk, subscription starts from the walk-start timestamp so concurrent changes are still captured.")
+	filerBackupOptions.initialSnapshot = cmdFilerBackup.Flag.Bool("initialSnapshot", false, "before subscribing to metadata updates, walk the live filer tree under -filerPath and seed the destination, then subscribe from the walk-start timestamp so concurrent changes are still captured. Runs on every start when -timeAgo is 0 and overwrites the saved checkpoint, so it also re-seeds a reinitialized destination. Remove it once the backup is caught up, otherwise it re-walks the whole tree on each restart.")
 }
 
 var cmdFilerBackup = &Command{
@@ -75,12 +76,13 @@ var cmdFilerBackup = &Command{
 	and write to the destination. This is to replace filer.replicate command since additional message queue is not needed.
 
 	If restarted and "-timeAgo" is not set, the synchronization will resume from the previous checkpoints, persisted every minute.
-	A fresh sync will start from the earliest metadata logs. To reset the checkpoints, just set "-timeAgo" to a high value.
+	A fresh sync will start from the earliest metadata logs.
 
 	On a fresh sync the metadata event log only re-materializes files that still exist on the source; entries that were
 	created and later deleted are replayed as a create-then-delete pair and therefore never appear on the destination.
 	Pass "-initialSnapshot" to walk the live filer tree first and seed the destination with the current tree, then
-	subscribe from the walk-start timestamp. The walk only runs when there is no prior checkpoint.
+	subscribe from the walk-start timestamp. This also re-seeds a reinitialized destination: it overwrites the saved
+	checkpoint and re-walks on every start, so remove it once the backup is caught up.
 
 `,
 }
@@ -135,27 +137,25 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 
 	// get start time for the data sink
 	startFrom := time.Unix(0, 0)
-	isFreshSync := true
-	sinkId := util.HashStringToLong(dataSink.GetName() + dataSink.GetSinkToDirectory())
-	if timeAgo.Milliseconds() == 0 {
-		lastOffsetTsNs, err := getOffset(grpcDialOption, sourceFiler, BackupKeyPrefix, int32(sinkId))
-		if err != nil {
-			// A KV read failure is ambiguous — a checkpoint may well exist but the
-			// source filer is temporarily unreachable. Don't treat that as a fresh
-			// sync; otherwise runFilerBackup's retry loop would redo the full
-			// -initialSnapshot walk on every transient error.
-			isFreshSync = false
-			glog.V(0).Infof("starting from %v (offset read failed: %v)", startFrom, err)
-		} else if lastOffsetTsNs > 0 {
-			startFrom = time.Unix(0, lastOffsetTsNs)
-			isFreshSync = false
-			glog.V(0).Infof("resuming from %v", startFrom)
+	sinkId, legacySinkId := backupCheckpointIds(sourcePath, dataSink)
+	runSnapshot := *backupOption.initialSnapshot && timeAgo == 0
+	if timeAgo == 0 {
+		if runSnapshot {
+			// snapshot below sets the start point; no checkpoint read needed
+			glog.V(0).Infof("initialSnapshot requested — walking live tree before subscribing")
 		} else {
-			glog.V(0).Infof("starting from %v (no prior checkpoint)", startFrom)
+			lastOffsetTsNs, err := getOffsetWithFallback(grpcDialOption, sourceFiler, BackupKeyPrefix, sinkId, BackupKeyPrefix, legacySinkId)
+			if err != nil {
+				glog.V(0).Infof("starting from %v (offset read failed: %v)", startFrom, err)
+			} else if lastOffsetTsNs > 0 {
+				startFrom = time.Unix(0, lastOffsetTsNs)
+				glog.V(0).Infof("resuming from %v", startFrom)
+			} else {
+				glog.V(0).Infof("starting from %v (no prior checkpoint)", startFrom)
+			}
 		}
 	} else {
 		startFrom = time.Now().Add(-timeAgo)
-		isFreshSync = false
 		glog.V(0).Infof("start time is set to %v", startFrom)
 	}
 
@@ -174,13 +174,11 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 	}
 	dataSink.SetSourceFiler(filerSource)
 
-	// When the destination has no prior checkpoint and the user opted in to an
-	// initial snapshot, walk the live filer tree first and seed the destination
-	// with the current entries. This avoids the "only new files appear" pitfall
-	// of replaying the metadata event log: entries created-then-deleted before
-	// the walk leave no trace, so a re-backup after wiping the destination
-	// reflects what is actually live on the source instead of an empty tree.
-	if *backupOption.initialSnapshot && isFreshSync {
+	// Walk and seed the live tree, then subscribe from the walk-start watermark:
+	// replaying the event log alone misses entries created-then-deleted before
+	// the walk. The watermark overwrites any stale checkpoint, re-seeding a wiped
+	// destination.
+	if runSnapshot {
 		snapshotTsNs, err := runInitialSnapshot(sourceFiler.ToGrpcAddress(), filerSource, sourcePath, targetPath, excludePaths, reExcludeFileName, excludeFileNames, excludePathPatterns, dataSink, *backupOption.ignore404Error)
 		if err != nil {
 			return fmt.Errorf("initial snapshot: %w", err)
@@ -188,11 +186,13 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 		// The walk can take hours on large trees; retry the tiny KV write a
 		// handful of times before giving up so a flaky filer KV doesn't force
 		// the whole walk to repeat on the next retry loop iteration.
-		if err := persistSnapshotOffset(grpcDialOption, sourceFiler, int32(sinkId), snapshotTsNs); err != nil {
+		if err := persistSnapshotOffset(grpcDialOption, sourceFiler, sinkId, snapshotTsNs); err != nil {
 			glog.Errorf("initialSnapshot: FAILED to persist offset %d for sinkId %d after retries: %v — the next retry will redo the full walk", snapshotTsNs, sinkId, err)
 			return fmt.Errorf("persist initial snapshot offset: %w", err)
 		}
 		startFrom = time.Unix(0, snapshotTsNs)
+		// walk once per process; retries resume from the persisted checkpoint
+		*backupOption.initialSnapshot = false
 		glog.V(0).Infof("initialSnapshot done; subscribing from %v", startFrom)
 	}
 
@@ -208,6 +208,10 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 				glog.V(0).Infof("got 404 error for %s, ignore it: %s", getSourceKey(resp), err.Error())
 				return nil
 			}
+			if isSourceLookupError(err) && eventSourceSuperseded(filerSource, resp) {
+				glog.V(0).Infof("source superseded %s during lookup failure, skip it: %s", getSourceKey(resp), err.Error())
+				return nil
+			}
 			return err
 		}
 	} else {
@@ -216,7 +220,7 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 
 	processEventFnWithOffset := pb.AddOffsetFunc(processEventFn, 3*time.Second, func(counter int64, lastTsNs int64) error {
 		glog.V(0).Infof("backup %s progressed to %v %0.2f/sec", sourceFiler, time.Unix(0, lastTsNs), float64(counter)/float64(3))
-		return setOffset(grpcDialOption, sourceFiler, BackupKeyPrefix, int32(sinkId), lastTsNs)
+		return setOffset(grpcDialOption, sourceFiler, BackupKeyPrefix, sinkId, lastTsNs)
 	})
 
 	if dataSink.IsIncremental() && *filerBackupOptions.retentionDays > 0 {
@@ -258,6 +262,24 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 
 }
 
+// backupCheckpointIds derives the checkpoint key for this backup and the
+// historical key kept for fallback reads. The checkpoint covers everything
+// that defines one backup stream: what is backed up (the source path) and
+// exactly where it lands (the sink's destination identity). The historical
+// key hashed only sink name + directory, so two backups to different buckets
+// or endpoints sharing a directory layout advanced one checkpoint and could
+// silently skip each other's changes. Writes go only to the new key; the
+// historical key is read once when the new key has no value yet, so an
+// existing backup resumes where it left off after an upgrade.
+//
+// NUL joins the fields because it cannot occur in a path or a configuration
+// value, so distinct field tuples cannot concatenate to the same hash input.
+func backupCheckpointIds(sourcePath string, dataSink sink.ReplicationSink) (sinkId, legacySinkId int32) {
+	sinkId = int32(util.HashStringToLong(sourcePath + "\x00" + dataSink.GetName() + "\x00" + dataSink.GetDestinationIdentity()))
+	legacySinkId = int32(util.HashStringToLong(dataSink.GetName() + dataSink.GetSinkToDirectory()))
+	return
+}
+
 func getSourceKey(resp *filer_pb.SubscribeMetadataResponse) string {
 	if resp == nil || resp.EventNotification == nil {
 		return ""
@@ -272,20 +294,55 @@ func getSourceKey(resp *filer_pb.SubscribeMetadataResponse) string {
 	return ""
 }
 
-// isIgnorable404 returns true if the error represents a 404/not-found condition
-// that should be silently ignored during backup. This covers:
-//   - errors wrapping http.ErrNotFound (direct volume server 404 via non-S3 sinks)
-//   - errors containing the "404 Not Found: not found" status string (S3 sink path
-//     where AWS SDK breaks the errors.Is unwrap chain)
-//   - LookupFileId or volume-id-not-found errors from the volume id map
+// isIgnorable404 returns true only for a genuine source-side 404, where skipping
+// the event is lossless: errors wrapping http.ErrNotFound, or carrying the S3
+// "404 Not Found: not found" status string (the AWS SDK breaks the unwrap chain).
+// It deliberately does not match "LookupFileId" / "volume id ... not found" —
+// usually transient lookup races whose skip drops live files; those are resolved
+// against the live source instead (isSourceLookupError + eventSourceSuperseded).
 func isIgnorable404(err error) bool {
+	if err == nil {
+		return false
+	}
 	if errors.Is(err, http.ErrNotFound) {
 		return true
 	}
+	return strings.Contains(err.Error(), ignorable404ErrString)
+}
+
+// isSourceLookupError reports whether err is a source volume-lookup failure.
+// The same strings cover a transient race and a permanently gone volume, so
+// the caller must consult the live source to pick skip or retry.
+func isSourceLookupError(err error) bool {
+	if err == nil {
+		return false
+	}
 	errStr := err.Error()
-	return strings.Contains(errStr, ignorable404ErrString) ||
-		strings.Contains(errStr, "LookupFileId") ||
+	return strings.Contains(errStr, "LookupFileId") ||
 		(strings.Contains(errStr, "volume id") && strings.Contains(errStr, "not found"))
+}
+
+// eventSourceSuperseded reports whether the live source has moved past the
+// version carried by this event (entry gone or strictly newer), making a skip
+// lossless. Without a NewEntry it reports false so the error propagates.
+func eventSourceSuperseded(filerSource *source.FilerSource, resp *filer_pb.SubscribeMetadataResponse) bool {
+	sourcePath, mtimeNs, ok := eventSupersessionProbe(resp)
+	if !ok {
+		return false
+	}
+	return filersink.SourceSupersedes(context.Background(), filerSource, sourcePath, mtimeNs)
+}
+
+// eventSupersessionProbe derives the source path and replayed mtime of the
+// event's landing entry. Legacy events can carry an empty NewParentPath, so the
+// path comes from MetadataEventTargetFullPath (falls back to resp.Directory) —
+// a wrong path here would read as "gone" and skip a live file.
+func eventSupersessionProbe(resp *filer_pb.SubscribeMetadataResponse) (util.FullPath, int64, bool) {
+	if resp == nil || resp.EventNotification == nil || resp.EventNotification.NewEntry == nil {
+		return "", 0, false
+	}
+	return util.FullPath(filer_pb.MetadataEventTargetFullPath(resp)),
+		filersink.EntryMtimeNs(resp.EventNotification.NewEntry), true
 }
 
 // persistSnapshotOffset writes the snapshot high-water mark to the source
@@ -387,9 +444,17 @@ func runInitialSnapshot(
 			// -ignore404Error is set; apply the same policy here so the walk
 			// doesn't abort (and trigger a full re-walk on retry) just because
 			// a single entry disappeared mid-snapshot.
-			if ignore404Error && isIgnorable404(err) {
-				glog.V(0).Infof("initialSnapshot: source entry %s disappeared, ignore it: %s", sourceKey, err.Error())
-				return nil
+			if ignore404Error {
+				if isIgnorable404(err) {
+					glog.V(0).Infof("initialSnapshot: source entry %s disappeared, ignore it: %s", sourceKey, err.Error())
+					return nil
+				}
+				// Same decision as the follow phase; lossless because the
+				// post-walk subscription replays the newer change.
+				if isSourceLookupError(err) && filersink.SourceSupersedes(ctx, filerSource, sourceKey, filersink.EntryMtimeNs(entry)) {
+					glog.V(0).Infof("initialSnapshot: source superseded %s mid-walk, skip it: %s", sourceKey, err.Error())
+					return nil
+				}
 			}
 			return fmt.Errorf("seed %s: %w", targetKey, err)
 		}

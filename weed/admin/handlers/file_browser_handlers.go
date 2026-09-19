@@ -1,13 +1,16 @@
 package handlers
 
 import (
+	"bufio"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -15,10 +18,12 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/admin/dash"
 	"github.com/seaweedfs/seaweedfs/weed/admin/view/app"
 	"github.com/seaweedfs/seaweedfs/weed/admin/view/layout"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/http/client"
+	"google.golang.org/protobuf/proto"
 )
 
 type FileBrowserHandlers struct {
@@ -61,7 +66,7 @@ func (h *FileBrowserHandlers) ShowFileBrowser(w http.ResponseWriter, r *http.Req
 	}
 
 	// Get file browser data with cursor-based pagination
-	browserData, err := h.adminServer.GetFileBrowser(path, lastFileName, pageSize)
+	browserData, err := h.adminServer.GetFileBrowser(path, "", lastFileName, pageSize)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "Failed to get file browser data: "+err.Error())
 		return
@@ -104,14 +109,7 @@ func (h *FileBrowserHandlers) DeleteFile(w http.ResponseWriter, r *http.Request)
 
 	// Delete file via filer
 	err := h.adminServer.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
-		_, err := client.DeleteEntry(context.Background(), &filer_pb.DeleteEntryRequest{
-			Directory:            filepath.Dir(request.Path),
-			Name:                 filepath.Base(request.Path),
-			IsDeleteData:         true,
-			IsRecursive:          true,
-			IgnoreRecursiveError: false,
-		})
-		return err
+		return filer_pb.DoRemove(context.Background(), client, path.Dir(request.Path), path.Base(request.Path), true, true, false, false, nil)
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "Failed to delete file: "+err.Error())
@@ -137,8 +135,8 @@ func (h *FileBrowserHandlers) DeleteMultipleFiles(w http.ResponseWriter, r *http
 		return
 	}
 
-	for _, path := range request.Paths {
-		if strings.TrimSpace(path) == "" {
+	for _, p := range request.Paths {
+		if strings.TrimSpace(p) == "" {
 			writeJSONError(w, http.StatusBadRequest, "path is required")
 			return
 		}
@@ -149,21 +147,14 @@ func (h *FileBrowserHandlers) DeleteMultipleFiles(w http.ResponseWriter, r *http
 	var errors []string
 
 	// Delete each file/folder
-	for _, path := range request.Paths {
+	for _, p := range request.Paths {
 		err := h.adminServer.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
-			_, err := client.DeleteEntry(context.Background(), &filer_pb.DeleteEntryRequest{
-				Directory:            filepath.Dir(path),
-				Name:                 filepath.Base(path),
-				IsDeleteData:         true,
-				IsRecursive:          true,
-				IgnoreRecursiveError: false,
-			})
-			return err
+			return filer_pb.DoRemove(context.Background(), client, path.Dir(p), path.Base(p), true, true, false, false, nil)
 		})
 
 		if err != nil {
 			failedCount++
-			errors = append(errors, fmt.Sprintf("%s: %v", path, err))
+			errors = append(errors, fmt.Sprintf("%s: %v", p, err))
 		} else {
 			deletedCount++
 		}
@@ -224,9 +215,9 @@ func (h *FileBrowserHandlers) CreateFolder(w http.ResponseWriter, r *http.Reques
 	// Create folder via filer
 	err := h.adminServer.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
 		_, err := client.CreateEntry(context.Background(), &filer_pb.CreateEntryRequest{
-			Directory: filepath.Dir(fullPath),
+			Directory: path.Dir(fullPath),
 			Entry: &filer_pb.Entry{
-				Name:        filepath.Base(fullPath),
+				Name:        path.Base(fullPath),
 				IsDirectory: true,
 				Attributes: &filer_pb.FuseAttributes{
 					FileMode: uint32(0o755 | os.ModeDir), // Directory mode
@@ -391,8 +382,9 @@ func (h *FileBrowserHandlers) DownloadFile(w http.ResponseWriter, r *http.Reques
 		writeJSONError(w, http.StatusBadRequest, "File path is required")
 		return
 	}
+	inline := r.URL.Query().Get("inline") == "true"
 	tracker := &responseWriteTracker{ResponseWriter: w}
-	if err := h.downloadFileGrpc(r.Context(), filePath, tracker); err != nil {
+	if err := h.downloadFileGrpc(r.Context(), filePath, tracker, inline); err != nil {
 		// Once bytes have been written we can't switch to a JSON error body
 		// without corrupting the partial response — log and stop. Before any
 		// write the response is still uncommitted, so a 502 with details is
@@ -437,8 +429,8 @@ func (h *FileBrowserHandlers) ViewFile(w http.ResponseWriter, r *http.Request) {
 	var fileEntry dash.FileEntry
 	err := h.adminServer.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
 		resp, err := client.LookupDirectoryEntry(context.Background(), &filer_pb.LookupDirectoryEntryRequest{
-			Directory: filepath.Dir(filePath),
-			Name:      filepath.Base(filePath),
+			Directory: path.Dir(filePath),
+			Name:      path.Base(filePath),
 		})
 		if err != nil {
 			return err
@@ -542,8 +534,8 @@ func (h *FileBrowserHandlers) GetFileProperties(w http.ResponseWriter, r *http.R
 	var properties map[string]interface{}
 	err := h.adminServer.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
 		resp, err := client.LookupDirectoryEntry(context.Background(), &filer_pb.LookupDirectoryEntryRequest{
-			Directory: filepath.Dir(filePath),
-			Name:      filepath.Base(filePath),
+			Directory: path.Dir(filePath),
+			Name:      path.Base(filePath),
 		})
 		if err != nil {
 			return err
@@ -625,7 +617,100 @@ func (h *FileBrowserHandlers) GetFileProperties(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	if isDir, _ := properties["is_directory"].(bool); !isDir {
+		if objectURL := h.adminServer.GetS3ObjectURL(filePath); objectURL != "" {
+			properties["object_url"] = objectURL
+		}
+	}
+
 	writeJSON(w, http.StatusOK, properties)
+}
+
+// ExportMetadata streams a file or folder's metadata as a gzipped, length-prefixed
+// FullEntry stream — the format weed shell fs.meta.load reads. Directories are
+// walked recursively via the filer BFS metadata stream.
+func (h *FileBrowserHandlers) ExportMetadata(w http.ResponseWriter, r *http.Request) {
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
+		writeJSONError(w, http.StatusBadRequest, "File path is required")
+		return
+	}
+	cleanPath, err := h.validateAndCleanFilePath(filePath)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	tracker := &responseWriteTracker{ResponseWriter: w}
+
+	err = h.adminServer.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+		stream, err := client.TraverseBfsMetadata(r.Context(), &filer_pb.TraverseBfsMetadataRequest{
+			Directory:        cleanPath,
+			ExcludedPrefixes: []string{filer.SystemLogDir},
+		})
+		if err != nil {
+			return err
+		}
+
+		// Read the first entry before sending headers so a bad path returns a clean error.
+		first, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+
+		downloadName := path.Base(cleanPath)
+		if downloadName == "/" || downloadName == "." || downloadName == "" {
+			downloadName = "root"
+		}
+		tracker.Header().Set("Content-Type", "application/gzip")
+		tracker.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": downloadName + ".meta.gz"}))
+		tracker.WriteHeader(http.StatusOK)
+
+		bw := bufio.NewWriter(tracker)
+		gw := gzip.NewWriter(bw)
+
+		sizeBuf := make([]byte, 4)
+		writeEntry := func(resp *filer_pb.TraverseBfsMetadataResponse) error {
+			b, err := proto.Marshal(&filer_pb.FullEntry{Dir: resp.Directory, Entry: resp.Entry})
+			if err != nil {
+				return err
+			}
+			util.Uint32toBytes(sizeBuf, uint32(len(b)))
+			if _, err := gw.Write(sizeBuf); err != nil {
+				return err
+			}
+			_, err = gw.Write(b)
+			return err
+		}
+
+		if err := writeEntry(first); err != nil {
+			return err
+		}
+		for {
+			resp, recvErr := stream.Recv()
+			if recvErr == io.EOF {
+				break
+			}
+			if recvErr != nil {
+				return recvErr
+			}
+			if err := writeEntry(resp); err != nil {
+				return err
+			}
+		}
+
+		if err := gw.Close(); err != nil {
+			return err
+		}
+		return bw.Flush()
+	})
+	if err != nil {
+		if tracker.committed {
+			glog.Errorf("Error exporting metadata for %s: %v", cleanPath, err)
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "Failed to export metadata: "+err.Error())
+	}
 }
 
 // Helper function to format bytes
@@ -686,3 +771,62 @@ func min(a, b int64) int64 {
 	return b
 }
 
+// maxListFoldersEntries caps how many subfolder names ListFolders will
+// collect for a single request, so a directory with an unusually large
+// number of children can't turn one autocomplete keystroke into an
+// unbounded, slow full-directory walk.
+const maxListFoldersEntries = 2000
+
+// maxListFoldersScanned caps how many entries ListFolders will page through
+// looking for those subfolders. The folder cap alone doesn't bound the work:
+// a bucket holding nothing but flat object keys has no subfolders to count,
+// so the walk runs to the end of the directory - a million keys is a million
+// entries read, 200 per round trip, behind a single keystroke.
+const maxListFoldersScanned = 10000
+
+// ListFolders returns, as JSON, the names of the subdirectories directly
+// under the given path. It exists to back progressive autocomplete (e.g. the
+// policy editor's Resource ARN field building up "bucket/folder/subfolder"
+// one path segment at a time) rather than to be a general directory listing
+// API, so it's restricted to paths under /buckets. The optional prefix is the
+// segment the caller is still typing, and narrows the listing to it.
+func (h *FileBrowserHandlers) ListFolders(w http.ResponseWriter, r *http.Request) {
+	dirPath := defaultQuery(r.URL.Query().Get("path"), "/buckets")
+	// Clean before the scope check: CleanWindowsPath only rewrites backslashes,
+	// so "/buckets/../etc" would otherwise satisfy the prefix test below.
+	dirPath = path.Clean(util.CleanWindowsPath(dirPath))
+
+	if dirPath != "/buckets" && !strings.HasPrefix(dirPath, "/buckets/") {
+		writeJSONError(w, http.StatusBadRequest, "path must be under /buckets")
+		return
+	}
+
+	prefix := r.URL.Query().Get("prefix")
+
+	folders := []string{}
+	lastFileName := ""
+	scanned := 0
+	for {
+		browserData, err := h.adminServer.GetFileBrowser(dirPath, prefix, lastFileName, 200)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "Failed to list directory: "+err.Error())
+			return
+		}
+		scanned += len(browserData.Entries)
+		for _, entry := range browserData.Entries {
+			if entry.IsDirectory {
+				folders = append(folders, entry.Name)
+				if len(folders) >= maxListFoldersEntries {
+					break
+				}
+			}
+		}
+		if len(browserData.Entries) == 0 || !browserData.HasNextPage ||
+			len(folders) >= maxListFoldersEntries || scanned >= maxListFoldersScanned {
+			break
+		}
+		lastFileName = browserData.Entries[len(browserData.Entries)-1].Name
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{"folders": folders})
+}

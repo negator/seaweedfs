@@ -33,6 +33,7 @@ const (
 	defaultMinPartitionsCount     = 5
 	defaultMaxPartitionsCount     = 1000
 	defaultMaxListChunk           = 2000
+	defaultTablePathPrefix        = "seaweedfs"
 )
 
 var (
@@ -64,6 +65,7 @@ func (store *YdbStore) GetName() string {
 }
 
 func (store *YdbStore) Initialize(configuration util.Configuration, prefix string) (err error) {
+	configuration.SetDefault(prefix+"prefix", defaultTablePathPrefix)
 	configuration.SetDefault(prefix+"partitionBySizeEnabled", defaultPartitionBySizeEnabled)
 	configuration.SetDefault(prefix+"partitionSizeMb", defaultPartitionSizeMb)
 	configuration.SetDefault(prefix+"partitionByLoadEnabled", defaultPartitionByLoadEnabled)
@@ -463,6 +465,12 @@ func (store *YdbStore) getPrefix(ctx context.Context, dir *string) (tablePathPre
 			bucket = bucketAndDir
 		}
 		if bucket == "" {
+			return
+		}
+
+		// Dot-prefixed entries directly under /buckets (e.g. .system) are internal
+		// folders, not S3 buckets; keep them under the default prefix.
+		if strings.HasPrefix(bucket, ".") {
 			return
 		}
 

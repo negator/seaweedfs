@@ -9,6 +9,7 @@ package postgres2
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strconv"
 
@@ -33,8 +34,12 @@ func (store *PostgresStore2) GetName() string {
 }
 
 func (store *PostgresStore2) Initialize(configuration util.Configuration, prefix string) (err error) {
-	// Absent key keeps a pooled default; an explicit 0 disables the idle pool.
-	configuration.SetDefault(prefix+"connection_max_idle", 2)
+	// Fewer idle slots than concurrent operations means a fresh connection per
+	// operation, until the filer runs out of ephemeral ports. connection_max_open
+	// stays unset: a listing runs a second query from its own callback, so a
+	// bounded pool deadlocks once the concurrency reaches it.
+	configuration.SetDefault(prefix+"connection_max_idle", 50)
+	configuration.SetDefault(prefix+"connection_max_lifetime_seconds", 300)
 	// Default on so minimal configs are not exposed to duplicate-key tx
 	// poisoning on Postgres; an explicit false still disables it.
 	configuration.SetDefault(prefix+"enableUpsert", true)
@@ -63,16 +68,22 @@ func (store *PostgresStore2) Initialize(configuration util.Configuration, prefix
 func (store *PostgresStore2) initialize(createTable, upsertQuery string, enableUpsert bool, user, password, hostname string, port int, database, schema, sslmode, sslcert, sslkey, sslrootcert, sslcrl string, pgbouncerCompatible bool, maxIdle, maxOpen, maxLifetimeSeconds int) (err error) {
 
 	store.SupportBucketTable = true
+	store.SkipDDL = createTable == "false"
+	createTable = postgres.ResolveCreateTableQuery(createTable)
+	if createTable == "" && !store.SkipDDL {
+		createTable = postgres.DefaultCreateTableQuery
+	}
 	if !enableUpsert {
 		upsertQuery = ""
 	} else if upsertQuery == "" {
 		upsertQuery = postgres.DefaultUpsertQuery
 	}
-	store.SqlGenerator = &postgres.SqlGenPostgres{
+	gen := &postgres.SqlGenPostgres{
 		CreateTableSqlTemplate: createTable,
-		DropTableSqlTemplate:   `drop table "%s"`,
+		DropTableSqlTemplate:   `drop table if exists "%s"`,
 		UpsertQueryTemplate:    upsertQuery,
 	}
+	store.SqlGenerator = gen
 
 	// pgx-optimized connection string with better timeouts and connection handling
 	sqlUrl := "connect_timeout=30"
@@ -120,11 +131,19 @@ func (store *PostgresStore2) initialize(createTable, upsertQuery string, enableU
 	if openErr != nil {
 		return openErr
 	}
-	store.DB = db
-
-	if err = store.CreateTable(context.Background(), abstract_sql.DEFAULT_TABLE); err != nil {
-		return fmt.Errorf("init table %s: %v", abstract_sql.DEFAULT_TABLE, err)
+	if err = store.UseConnectionPools(db, func() (*sql.DB, error) {
+		return postgres.OpenPGXDB(sqlUrl, adaptedSqlUrl, pgbouncerCompatible, maxIdle, maxOpen, maxLifetimeSeconds)
+	}, maxIdle, maxOpen, maxLifetimeSeconds); err != nil {
+		return err
 	}
+
+	if !store.SkipDDL {
+		if err = store.CreateTable(context.Background(), abstract_sql.DEFAULT_TABLE); err != nil {
+			return fmt.Errorf("init table %s: %v", abstract_sql.DEFAULT_TABLE, err)
+		}
+	}
+
+	postgres.ConfigureListOrdering(store.DB, gen)
 
 	return nil
 }

@@ -600,9 +600,9 @@ func testExpireSnapshots(t *testing.T) {
 
 	handler := icebergHandler.NewHandler(nil)
 	config := icebergHandler.Config{
-		SnapshotRetentionHours: 0, // instant expiry — everything eligible
-		MaxSnapshotsToKeep:     1, // keep only the current snapshot
-		MaxCommitRetries:       3,
+		SnapshotRetentionMs: 0, // instant expiry — everything eligible
+		MaxSnapshotsToKeep:  1, // keep only the current snapshot
+		MaxCommitRetries:    3,
 	}
 
 	result, _, err := handler.ExpireSnapshots(context.Background(), client, bucket, path.Join(ns, tbl), config)
@@ -796,7 +796,7 @@ func testCompactDataFiles(t *testing.T) {
 	}
 
 	require.Len(t, addedPaths, 1, "compaction should add exactly one merged parquet file")
-	assert.Contains(t, addedPaths, path.Join("data", compacted.Name))
+	assert.Contains(t, addedPaths, fmt.Sprintf("s3://%s/%s/data/%s", bucket, tablePath, compacted.Name))
 	require.Len(t, deletedPaths, len(files), "compaction should delete every original small input file")
 	for _, file := range files {
 		assert.Contains(t, deletedPaths, path.Join("data", file.name))
@@ -932,9 +932,9 @@ func testFullMaintenanceCycle(t *testing.T) {
 
 	// Step 1: Expire snapshots
 	expireConfig := icebergHandler.Config{
-		SnapshotRetentionHours: 0, // instant expiry
-		MaxSnapshotsToKeep:     1,
-		MaxCommitRetries:       3,
+		SnapshotRetentionMs: 0, // instant expiry
+		MaxSnapshotsToKeep:  1,
+		MaxCommitRetries:    3,
 	}
 	result, _, err := handler.ExpireSnapshots(ctx, client, bucket, tablePath, expireConfig)
 	require.NoError(t, err)

@@ -64,6 +64,8 @@ pub struct Cli {
     pub rack: String,
 
     /// Choose [memory|redb|redbMedium|redbLarge] mode for memory~performance balance.
+    /// The redb tiers give each volume's on-disk index a 4, 8, or 16 MiB page
+    /// cache respectively; total index memory is roughly (volumes x cache).
     /// `leveldb`/`leveldbMedium`/`leveldbLarge` are accepted as aliases for the
     /// corresponding redb backends (Rust volume server uses redb under the hood).
     #[arg(long = "index", default_value = "memory")]
@@ -188,6 +190,12 @@ pub struct Cli {
     #[arg(long = "securityFile", default_value = "")]
     pub security_file: String,
 
+    /// If true, FetchAndWriteNeedle accepts arbitrary remote S3 endpoints
+    /// including loopback / link-local hosts. Default rejects internal /
+    /// metadata endpoints.
+    #[arg(long = "volume.allowUntrustedRemoteEndpoints", default_value_t = false)]
+    pub allow_untrusted_remote_endpoints: bool,
+
     /// A file of command line options, each line in optionName=optionValue format.
     #[arg(long = "options", default_value = "")]
     pub options: String,
@@ -250,6 +258,8 @@ pub struct VolumeServerConfig {
     pub https_client_ca_file: String,
     pub grpc_cert_file: String,
     pub grpc_key_file: String,
+    pub grpc_client_cert_file: String,
+    pub grpc_client_key_file: String,
     pub grpc_ca_file: String,
     pub grpc_allowed_wildcard_domain: String,
     pub grpc_volume_allowed_common_names: Vec<String>,
@@ -258,6 +268,9 @@ pub struct VolumeServerConfig {
     pub enable_write_queue: bool,
     /// Path to security.toml — stored for SIGHUP reload.
     pub security_file: String,
+    /// If true, FetchAndWriteNeedle skips remote S3 endpoint validation
+    /// (allows loopback / link-local / metadata hosts).
+    pub allow_untrusted_remote_endpoints: bool,
 }
 
 pub use crate::storage::needle_map::NeedleMapKind;
@@ -358,17 +371,18 @@ fn merge_options_file(args: Vec<String>) -> Vec<String> {
         if arg == "--" {
             break;
         }
-        if arg.starts_with("--") {
-            let key = if let Some(eq) = arg.find('=') {
-                arg[2..eq].to_string()
+        if let Some(long) = arg.strip_prefix("--") {
+            let key = if let Some(eq) = long.find('=') {
+                long[..eq].to_string()
             } else {
-                arg[2..].to_string()
+                long.to_string()
             };
             cli_flags.insert(key);
-        } else if arg.starts_with('-') && arg.len() > 2 {
+        } else if arg.len() > 2
+            && let Some(without_dash) = arg.strip_prefix('-')
+        {
             // Single-dash long option (already normalized to -- at this point,
             // but handle both for safety)
-            let without_dash = &arg[1..];
             let key = if let Some(eq) = without_dash.find('=') {
                 without_dash[..eq].to_string()
             } else {
@@ -388,15 +402,14 @@ fn merge_options_file(args: Vec<String>) -> Vec<String> {
         }
 
         // Split on first `=`, ` `, or `:`
-        let (name, value) =
-            if let Some(pos) = trimmed.find(|c: char| c == '=' || c == ' ' || c == ':') {
-                (
-                    trimmed[..pos].trim().to_string(),
-                    trimmed[pos + 1..].trim().to_string(),
-                )
-            } else {
-                (trimmed.to_string(), String::new())
-            };
+        let (name, value) = if let Some(pos) = trimmed.find(['=', ' ', ':']) {
+            (
+                trimmed[..pos].trim().to_string(),
+                trimmed[pos + 1..].trim().to_string(),
+            )
+        } else {
+            (trimmed.to_string(), String::new())
+        };
 
         // Strip leading dashes from name
         let name = name.trim_start_matches('-').to_string();
@@ -423,10 +436,8 @@ fn merge_options_file(args: Vec<String>) -> Vec<String> {
 /// Extract the options file path from args (looks for --options or -options).
 fn find_options_arg(args: &[String]) -> String {
     for i in 1..args.len() {
-        if args[i] == "--options" || args[i] == "-options" {
-            if i + 1 < args.len() {
-                return args[i + 1].clone();
-            }
+        if (args[i] == "--options" || args[i] == "-options") && i + 1 < args.len() {
+            return args[i + 1].clone();
         }
         if let Some(rest) = args[i].strip_prefix("--options=") {
             return rest.to_string();
@@ -444,20 +455,22 @@ fn parse_duration(s: &str) -> std::time::Duration {
     if s.is_empty() {
         return std::time::Duration::from_secs(60);
     }
-    if let Some(secs) = s.strip_suffix('s') {
-        if let Ok(v) = secs.parse::<u64>() {
-            return std::time::Duration::from_secs(v);
-        }
+    if let Some(secs) = s.strip_suffix('s')
+        && let Ok(v) = secs.parse::<u64>()
+    {
+        return std::time::Duration::from_secs(v);
     }
-    if let Some(mins) = s.strip_suffix('m') {
-        if let Ok(v) = mins.parse::<u64>() {
-            return std::time::Duration::from_secs(v * 60);
-        }
+    if let Some(mins) = s.strip_suffix('m')
+        && let Ok(v) = mins.parse::<u64>()
+        && let Some(seconds) = v.checked_mul(60)
+    {
+        return std::time::Duration::from_secs(seconds);
     }
-    if let Some(hours) = s.strip_suffix('h') {
-        if let Ok(v) = hours.parse::<u64>() {
-            return std::time::Duration::from_secs(v * 3600);
-        }
+    if let Some(hours) = s.strip_suffix('h')
+        && let Ok(v) = hours.parse::<u64>()
+        && let Some(seconds) = v.checked_mul(3600)
+    {
+        return std::time::Duration::from_secs(seconds);
     }
     // Fallback: try parsing as raw seconds
     if let Ok(v) = s.parse::<u64>() {
@@ -490,40 +503,40 @@ fn parse_min_free_spaces(min_free_space: &str, min_free_space_percent: &str) -> 
             }
             // Try parsing human-readable bytes: e.g. "10GiB", "500MiB", "1TiB"
             let s_upper = s.to_uppercase();
-            if let Some(rest) = s_upper.strip_suffix("TIB") {
-                if let Ok(v) = rest.trim().parse::<f64>() {
-                    return MinFreeSpace::Bytes((v * 1024.0 * 1024.0 * 1024.0 * 1024.0) as u64);
-                }
+            if let Some(rest) = s_upper.strip_suffix("TIB")
+                && let Ok(v) = rest.trim().parse::<f64>()
+            {
+                return MinFreeSpace::Bytes((v * 1024.0 * 1024.0 * 1024.0 * 1024.0) as u64);
             }
-            if let Some(rest) = s_upper.strip_suffix("GIB") {
-                if let Ok(v) = rest.trim().parse::<f64>() {
-                    return MinFreeSpace::Bytes((v * 1024.0 * 1024.0 * 1024.0) as u64);
-                }
+            if let Some(rest) = s_upper.strip_suffix("GIB")
+                && let Ok(v) = rest.trim().parse::<f64>()
+            {
+                return MinFreeSpace::Bytes((v * 1024.0 * 1024.0 * 1024.0) as u64);
             }
-            if let Some(rest) = s_upper.strip_suffix("MIB") {
-                if let Ok(v) = rest.trim().parse::<f64>() {
-                    return MinFreeSpace::Bytes((v * 1024.0 * 1024.0) as u64);
-                }
+            if let Some(rest) = s_upper.strip_suffix("MIB")
+                && let Ok(v) = rest.trim().parse::<f64>()
+            {
+                return MinFreeSpace::Bytes((v * 1024.0 * 1024.0) as u64);
             }
-            if let Some(rest) = s_upper.strip_suffix("KIB") {
-                if let Ok(v) = rest.trim().parse::<f64>() {
-                    return MinFreeSpace::Bytes((v * 1024.0) as u64);
-                }
+            if let Some(rest) = s_upper.strip_suffix("KIB")
+                && let Ok(v) = rest.trim().parse::<f64>()
+            {
+                return MinFreeSpace::Bytes((v * 1024.0) as u64);
             }
-            if let Some(rest) = s_upper.strip_suffix("TB") {
-                if let Ok(v) = rest.trim().parse::<f64>() {
-                    return MinFreeSpace::Bytes((v * 1_000_000_000_000.0) as u64);
-                }
+            if let Some(rest) = s_upper.strip_suffix("TB")
+                && let Ok(v) = rest.trim().parse::<f64>()
+            {
+                return MinFreeSpace::Bytes((v * 1_000_000_000_000.0) as u64);
             }
-            if let Some(rest) = s_upper.strip_suffix("GB") {
-                if let Ok(v) = rest.trim().parse::<f64>() {
-                    return MinFreeSpace::Bytes((v * 1_000_000_000.0) as u64);
-                }
+            if let Some(rest) = s_upper.strip_suffix("GB")
+                && let Ok(v) = rest.trim().parse::<f64>()
+            {
+                return MinFreeSpace::Bytes((v * 1_000_000_000.0) as u64);
             }
-            if let Some(rest) = s_upper.strip_suffix("MB") {
-                if let Ok(v) = rest.trim().parse::<f64>() {
-                    return MinFreeSpace::Bytes((v * 1_000_000.0) as u64);
-                }
+            if let Some(rest) = s_upper.strip_suffix("MB")
+                && let Ok(v) = rest.trim().parse::<f64>()
+            {
+                return MinFreeSpace::Bytes((v * 1_000_000.0) as u64);
             }
             // Default: 1%
             MinFreeSpace::Percent(1.0)
@@ -796,6 +809,8 @@ fn resolve_config(cli: Cli) -> VolumeServerConfig {
         https_client_ca_file: sec.https_client_ca_file,
         grpc_cert_file: sec.grpc_cert_file,
         grpc_key_file: sec.grpc_key_file,
+        grpc_client_cert_file: sec.grpc_client_cert_file,
+        grpc_client_key_file: sec.grpc_client_key_file,
         grpc_ca_file: sec.grpc_ca_file,
         grpc_allowed_wildcard_domain: sec.grpc_allowed_wildcard_domain,
         grpc_volume_allowed_common_names: sec.grpc_volume_allowed_common_names,
@@ -804,6 +819,7 @@ fn resolve_config(cli: Cli) -> VolumeServerConfig {
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false),
         security_file: cli.security_file,
+        allow_untrusted_remote_endpoints: cli.allow_untrusted_remote_endpoints,
     }
 }
 
@@ -827,6 +843,8 @@ pub struct SecurityConfig {
     pub https_client_ca_file: String,
     pub grpc_cert_file: String,
     pub grpc_key_file: String,
+    pub grpc_client_cert_file: String,
+    pub grpc_client_key_file: String,
     pub grpc_ca_file: String,
     pub grpc_allowed_wildcard_domain: String,
     pub grpc_volume_allowed_common_names: Vec<String>,
@@ -872,6 +890,8 @@ const SECURITY_CONFIG_FILE_NAME: &str = "security.toml";
 /// [grpc.volume]
 /// cert = "/path/to/cert.pem"
 /// key = "/path/to/key.pem"
+/// client_cert = "/path/to/client-cert.pem"
+/// client_key = "/path/to/client-key.pem"
 /// allowed_commonNames = "volume-a.internal,volume-b.internal"
 /// ```
 pub fn parse_security_config(path: &str) -> SecurityConfig {
@@ -967,7 +987,9 @@ pub fn parse_security_config(path: &str) -> SecurityConfig {
                 },
                 Section::JwtSigning => match key {
                     "key" => cfg.jwt_signing_key = value.as_bytes().to_vec(),
-                    "expires_after_seconds" => cfg.jwt_signing_expires = value.parse().unwrap_or(10),
+                    "expires_after_seconds" => {
+                        cfg.jwt_signing_expires = value.parse().unwrap_or(10)
+                    }
                     _ => {}
                 },
                 Section::HttpsClient => match key {
@@ -993,6 +1015,8 @@ pub fn parse_security_config(path: &str) -> SecurityConfig {
                 Section::GrpcVolume => match key {
                     "cert" => cfg.grpc_cert_file = value.to_string(),
                     "key" => cfg.grpc_key_file = value.to_string(),
+                    "client_cert" => cfg.grpc_client_cert_file = value.to_string(),
+                    "client_key" => cfg.grpc_client_key_file = value.to_string(),
                     // Go only reads CA from [grpc], not [grpc.volume]
                     "allowed_commonNames" => {
                         cfg.grpc_volume_allowed_common_names =
@@ -1006,20 +1030,20 @@ pub fn parse_security_config(path: &str) -> SecurityConfig {
                     "cipher_suites" => cfg.tls_policy.cipher_suites = value.to_string(),
                     _ => {}
                 },
-                Section::Guard => match key {
-                    "white_list" => {
+                Section::Guard => {
+                    if key == "white_list" {
                         cfg.guard_white_list = value
                             .split(',')
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty())
                             .collect();
                     }
-                    _ => {}
-                },
-                Section::Access => match key {
-                    "ui" => cfg.access_ui = value.parse().unwrap_or(false),
-                    _ => {}
-                },
+                }
+                Section::Access => {
+                    if key == "ui" {
+                        cfg.access_ui = value.parse().unwrap_or(false)
+                    }
+                }
                 Section::None => {}
             }
         }
@@ -1124,6 +1148,12 @@ fn apply_env_overrides(cfg: &mut SecurityConfig) {
     if let Ok(v) = std::env::var("WEED_GRPC_VOLUME_KEY") {
         cfg.grpc_key_file = v;
     }
+    if let Ok(v) = std::env::var("WEED_GRPC_VOLUME_CLIENT_CERT") {
+        cfg.grpc_client_cert_file = v;
+    }
+    if let Ok(v) = std::env::var("WEED_GRPC_VOLUME_CLIENT_KEY") {
+        cfg.grpc_client_key_file = v;
+    }
     if let Ok(v) = std::env::var("WEED_GRPC_CA") {
         cfg.grpc_ca_file = v;
     } else if let Ok(v) = std::env::var("WEED_GRPC_VOLUME_CA") {
@@ -1160,12 +1190,11 @@ fn apply_env_overrides(cfg: &mut SecurityConfig) {
 /// Mirrors Go's `util.DetectedHostAddress()`.
 fn detect_host_address() -> String {
     // Connect to a remote address to determine the local outbound IP
-    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
-        if socket.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                return addr.ip().to_string();
-            }
-        }
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0")
+        && socket.connect("8.8.8.8:80").is_ok()
+        && let Ok(addr) = socket.local_addr()
+    {
+        return addr.ip().to_string();
     }
     "localhost".to_string()
 }
@@ -1181,21 +1210,30 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
+    // SAFETY (all env mutation in this module): `set_var`/`remove_var` are
+    // unsafe as of Rust 2024 because they race with concurrent readers in
+    // other threads. Every test that reaches these helpers holds
+    // `process_state_lock()` for the duration, so only one test at a time
+    // touches the environment and none observes another's edit.
     fn with_temp_env_var<F: FnOnce()>(key: &str, value: Option<&str>, f: F) {
         let previous = std::env::var_os(key);
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
         }
         f();
         restore_env_var(key, previous);
     }
 
     fn restore_env_var(key: &str, value: Option<OsString>) {
-        if let Some(value) = value {
-            std::env::set_var(key, value);
-        } else {
-            std::env::remove_var(key);
+        unsafe {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
         }
     }
 
@@ -1221,6 +1259,8 @@ mod tests {
             "WEED_HTTPS_CLIENT_CA",
             "WEED_GRPC_VOLUME_CERT",
             "WEED_GRPC_VOLUME_KEY",
+            "WEED_GRPC_VOLUME_CLIENT_CERT",
+            "WEED_GRPC_VOLUME_CLIENT_KEY",
             "WEED_GRPC_CA",
             "WEED_GRPC_VOLUME_CA",
             "WEED_GRPC_ALLOWED_WILDCARD_DOMAIN",
@@ -1238,7 +1278,10 @@ mod tests {
             .collect();
 
         for key in KEYS {
-            std::env::remove_var(key);
+            // SAFETY: as above — the caller holds `process_state_lock()`.
+            unsafe {
+                std::env::remove_var(key);
+            }
         }
 
         f();
@@ -1255,6 +1298,14 @@ mod tests {
         assert_eq!(parse_duration("1h"), std::time::Duration::from_secs(3600));
         assert_eq!(parse_duration("30"), std::time::Duration::from_secs(30));
         assert_eq!(parse_duration(""), std::time::Duration::from_secs(60));
+        assert_eq!(
+            parse_duration("307445734561825861m"),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            parse_duration("5124095576030432h"),
+            std::time::Duration::from_secs(60)
+        );
     }
 
     #[test]
@@ -1374,12 +1425,18 @@ mod tests {
 
     #[test]
     fn test_resolve_config_defaults_dir_to_platform_temp_dir() {
+        // resolve_config reads HOME/USERPROFILE and the WEED_* set, so it has to
+        // hold the same lock the mutation helpers take — a concurrent set_var
+        // during this read is exactly what makes those calls unsafe.
+        let _guard = process_state_lock();
         let cfg = resolve_config(Cli::parse_from(["bin"]));
         assert_eq!(cfg.folders, vec![default_volume_dir()]);
     }
 
     #[test]
     fn test_resolve_config_index_accepts_redb_and_leveldb_aliases() {
+        // As above: resolve_config reads the environment.
+        let _guard = process_state_lock();
         let pairs = [
             ("memory", NeedleMapKind::InMemory),
             ("redb", NeedleMapKind::Redb),
@@ -1487,6 +1544,35 @@ key = "/etc/seaweedfs/volume-key.pem"
             assert_eq!(cfg.grpc_ca_file, "/etc/seaweedfs/grpc-ca.pem");
             assert_eq!(cfg.grpc_cert_file, "/etc/seaweedfs/volume-cert.pem");
             assert_eq!(cfg.grpc_key_file, "/etc/seaweedfs/volume-key.pem");
+        });
+    }
+
+    #[test]
+    fn test_parse_security_config_uses_grpc_volume_client_cert() {
+        let _guard = process_state_lock();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"
+[grpc.volume]
+cert = "/etc/seaweedfs/volume-cert.pem"
+key = "/etc/seaweedfs/volume-key.pem"
+client_cert = "/etc/seaweedfs/volume-client-cert.pem"
+client_key = "/etc/seaweedfs/volume-client-key.pem"
+"#,
+        )
+        .unwrap();
+
+        with_cleared_security_env(|| {
+            let cfg = parse_security_config(tmp.path().to_str().unwrap());
+            assert_eq!(
+                cfg.grpc_client_cert_file,
+                "/etc/seaweedfs/volume-client-cert.pem"
+            );
+            assert_eq!(
+                cfg.grpc_client_key_file,
+                "/etc/seaweedfs/volume-client-key.pem"
+            );
         });
     }
 

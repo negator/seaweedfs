@@ -3,11 +3,13 @@ package plugin
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/plugin_pb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func TestLoadSchedulerPolicyUsesAdminConfig(t *testing.T) {
@@ -633,16 +635,19 @@ func TestRunLaneSchedulerIterationLockBehavior(t *testing.T) {
 			t.Parallel()
 
 			lm := &trackingLockManager{}
-			pluginSvc, err := New(Options{
-				LockManager: lm,
-				ClusterContextProvider: func(context.Context) (*plugin_pb.ClusterContext, error) {
-					return &plugin_pb.ClusterContext{}, nil
-				},
-			})
+			// Construct without a cluster-context provider so the background
+			// lane loops do not start: they call runLaneSchedulerIteration on
+			// the same lane and would race this test's own manual call,
+			// consuming the due job before it observes the lock. The provider
+			// is set afterward so the manual iteration can still detect.
+			pluginSvc, err := New(Options{LockManager: lm})
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
 			defer pluginSvc.Shutdown()
+			pluginSvc.clusterContextProvider = func(context.Context) (*plugin_pb.ClusterContext, error) {
+				return &plugin_pb.ClusterContext{}, nil
+			}
 
 			// Register a detectable worker for the job type.
 			pluginSvc.registry.UpsertFromHello(&plugin_pb.WorkerHello{
@@ -664,6 +669,12 @@ func TestRunLaneSchedulerIterationLockBehavior(t *testing.T) {
 				t.Fatalf("SaveJobTypeConfig: %v", err)
 			}
 
+			// Make the job type due immediately so the iteration reaches
+			// detection; the lock is only taken around due work now.
+			pluginSvc.schedulerMu.Lock()
+			pluginSvc.nextDetectionAt[tt.jobType] = time.Now().UTC().Add(-time.Second)
+			pluginSvc.schedulerMu.Unlock()
+
 			ls := pluginSvc.lanes[tt.lane]
 			pluginSvc.runLaneSchedulerIteration(ls)
 
@@ -671,5 +682,313 @@ func TestRunLaneSchedulerIterationLockBehavior(t *testing.T) {
 				t.Errorf("lock acquired %d times, wantLock=%v", got, tt.wantLock)
 			}
 		})
+	}
+}
+
+func TestDispatchScheduledProposalsLocksPerJob(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		jobType   string
+		wantLocks int
+	}{
+		{"DefaultLaneLocksEachJob", "volume_balance", 3},
+		{"LifecycleLaneNeedsNoLock", "s3_lifecycle", 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			lm := &trackingLockManager{}
+			pluginSvc, err := New(Options{LockManager: lm})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			defer pluginSvc.Shutdown()
+
+			// The worker has capabilities but no connected session, so each
+			// job reserves capacity, fails to send, and moves on.
+			pluginSvc.registry.UpsertFromHello(&plugin_pb.WorkerHello{
+				WorkerId: "worker-a",
+				Capabilities: []*plugin_pb.JobTypeCapability{
+					{JobType: tt.jobType, CanExecute: true, MaxExecutionConcurrency: 4},
+				},
+			})
+
+			policy := schedulerPolicy{
+				ExecutionConcurrency:   1,
+				PerWorkerConcurrency:   1,
+				ExecutionTimeout:       time.Second,
+				ExecutorReserveBackoff: time.Millisecond,
+			}
+			proposals := []*plugin_pb.JobProposal{
+				{ProposalId: "p1", JobType: tt.jobType, DedupeKey: "k1"},
+				{ProposalId: "p2", JobType: tt.jobType, DedupeKey: "k2"},
+				{ProposalId: "p3", JobType: tt.jobType, DedupeKey: "k3"},
+			}
+
+			success, errors, canceled := pluginSvc.dispatchScheduledProposals(
+				context.Background(), tt.jobType, proposals, &plugin_pb.ClusterContext{}, policy)
+			if success != 0 || canceled != 0 || errors != 3 {
+				t.Fatalf("unexpected dispatch counts: success=%d errors=%d canceled=%d", success, errors, canceled)
+			}
+			if got := lm.count(); got != tt.wantLocks {
+				t.Fatalf("lock acquired %d times, want %d", got, tt.wantLocks)
+			}
+		})
+	}
+}
+
+func TestScheduledAttemptContextDrainGrace(t *testing.T) {
+	t.Parallel()
+
+	assertDeadline := func(t *testing.T, ctx context.Context, want time.Time) {
+		t.Helper()
+		got, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("expected attempt context to carry a deadline")
+		}
+		if diff := got.Sub(want); diff < -5*time.Second || diff > 5*time.Second {
+			t.Fatalf("unexpected attempt deadline: got=%v want~%v", got, want)
+		}
+	}
+
+	windowEnd := time.Now().Add(time.Minute)
+	window, cancelWindow := context.WithDeadline(context.Background(), windowEnd)
+	defer cancelWindow()
+
+	// Fits inside the window: keeps its own deadline.
+	ctx, cancel := scheduledAttemptContext(window, 30*time.Second, 0)
+	assertDeadline(t, ctx, time.Now().Add(30*time.Second))
+	cancel()
+
+	// Longer: capped at window close plus the grace.
+	ctx, cancel = scheduledAttemptContext(window, 3*time.Hour, 0)
+	assertDeadline(t, ctx, windowEnd.Add(scheduledExecutionDrainGrace))
+	cancel()
+
+	// Estimated runtime: keeps its full deadline.
+	ctx, cancel = scheduledAttemptContext(window, 3*time.Hour, 3*time.Hour)
+	assertDeadline(t, ctx, time.Now().Add(3*time.Hour))
+	cancel()
+
+	// An estimate below the timeout floors the drain cap.
+	ctx, cancel = scheduledAttemptContext(window, 3*time.Hour, 45*time.Minute)
+	assertDeadline(t, ctx, time.Now().Add(45*time.Minute))
+	cancel()
+
+	// No window deadline: the timeout stands alone.
+	ctx, cancel = scheduledAttemptContext(context.Background(), 2*time.Hour, 0)
+	assertDeadline(t, ctx, time.Now().Add(2*time.Hour))
+	cancel()
+}
+
+func TestScheduledEstimatedRuntime(t *testing.T) {
+	t.Parallel()
+
+	estimate := func(v int64) map[string]*plugin_pb.ConfigValue {
+		return map[string]*plugin_pb.ConfigValue{
+			"estimated_runtime_seconds": {Kind: &plugin_pb.ConfigValue_Int64Value{Int64Value: v}},
+		}
+	}
+
+	if got := scheduledEstimatedRuntime(nil); got != 0 {
+		t.Fatalf("nil parameters: got=%v want=0", got)
+	}
+	if got := scheduledEstimatedRuntime(estimate(-5)); got != 0 {
+		t.Fatalf("negative estimate: got=%v want=0", got)
+	}
+	if got := scheduledEstimatedRuntime(estimate(600)); got != 10*time.Minute {
+		t.Fatalf("normal estimate: got=%v want=10m", got)
+	}
+	// Oversized seconds cap before the Duration conversion can overflow.
+	if got := scheduledEstimatedRuntime(estimate(math.MaxInt64)); got != maxEstimatedRuntimeCap {
+		t.Fatalf("oversized estimate: got=%v want=%v", got, maxEstimatedRuntimeCap)
+	}
+}
+
+func TestDispatchScheduledProposalsDrainsStartedJobOnWindowClose(t *testing.T) {
+	t.Parallel()
+
+	pluginSvc, err := New(Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer pluginSvc.Shutdown()
+
+	const workerID = "worker-drain"
+	const jobType = "s3_lifecycle" // lifecycle lane: no admin lock needed
+	pluginSvc.registry.UpsertFromHello(&plugin_pb.WorkerHello{
+		WorkerId: workerID,
+		Capabilities: []*plugin_pb.JobTypeCapability{
+			{JobType: jobType, CanExecute: true, MaxExecutionConcurrency: 1},
+		},
+	})
+	session := &streamSession{workerID: workerID, outgoing: make(chan *plugin_pb.AdminToWorkerMessage, 8), done: make(chan struct{})}
+	pluginSvc.putSession(session)
+
+	windowCtx, closeWindow := context.WithCancel(context.Background())
+	defer closeWindow()
+
+	policy := schedulerPolicy{
+		ExecutionConcurrency:   1,
+		PerWorkerConcurrency:   1,
+		ExecutionTimeout:       time.Hour,
+		ExecutorReserveBackoff: time.Millisecond,
+	}
+	proposals := []*plugin_pb.JobProposal{
+		{ProposalId: "p1", JobType: jobType, DedupeKey: "k1"},
+		{ProposalId: "p2", JobType: jobType, DedupeKey: "k2"},
+	}
+
+	resultCh := make(chan [3]int, 1)
+	go func() {
+		success, errCount, canceled := pluginSvc.dispatchScheduledProposals(
+			windowCtx, jobType, proposals, &plugin_pb.ClusterContext{}, policy)
+		resultCh <- [3]int{success, errCount, canceled}
+	}()
+
+	first := <-session.outgoing
+	execReq := first.GetExecuteJobRequest()
+	if execReq == nil {
+		t.Fatalf("expected execute_job_request, got %+v", first)
+	}
+
+	// Close the window mid-job: the job must drain to completion while the
+	// still-queued second proposal is canceled.
+	closeWindow()
+	pluginSvc.handleJobCompleted(&plugin_pb.JobCompleted{
+		RequestId:   first.RequestId,
+		JobId:       execReq.Job.JobId,
+		JobType:     jobType,
+		Success:     true,
+		CompletedAt: timestamppb.Now(),
+	})
+
+	result := <-resultCh
+	if result[0] != 1 || result[1] != 0 || result[2] != 1 {
+		t.Fatalf("unexpected dispatch counts: success=%d errors=%d canceled=%d", result[0], result[1], result[2])
+	}
+
+	select {
+	case unexpected := <-session.outgoing:
+		t.Fatalf("expected no further worker messages (no cancel for the draining job), got %+v", unexpected)
+	default:
+	}
+}
+
+// ---------- lane-scoped prune ----------
+
+func TestPruneSchedulerState_DefaultLaneKeepsForeignLanesAndPrunesOwnStale(t *testing.T) {
+	p, err := New(Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer p.Shutdown()
+
+	now := time.Now().UTC()
+	p.schedulerMu.Lock()
+	p.nextDetectionAt["s3_lifecycle"] = now.Add(24 * time.Hour) // lifecycle lane
+	p.nextDetectionAt["vacuum"] = now.Add(time.Minute)          // default lane, active
+	p.nextDetectionAt["ec_balance"] = now.Add(time.Minute)      // default lane, stale
+	p.detectionInFlight["ec_balance"] = true
+	p.schedulerMu.Unlock()
+
+	// Default-lane iteration prunes with only its own active job types.
+	p.pruneSchedulerState(LaneDefault, map[string]struct{}{"vacuum": {}})
+
+	p.schedulerMu.Lock()
+	defer p.schedulerMu.Unlock()
+	if _, ok := p.nextDetectionAt["s3_lifecycle"]; !ok {
+		t.Fatal("default-lane prune must not delete lifecycle-lane nextDetectionAt[s3_lifecycle]")
+	}
+	if _, ok := p.nextDetectionAt["vacuum"]; !ok {
+		t.Fatal("active default-lane job (vacuum) must be kept")
+	}
+	if _, ok := p.nextDetectionAt["ec_balance"]; ok {
+		t.Fatal("stale default-lane job (ec_balance) must still be pruned within its own lane")
+	}
+	if _, ok := p.detectionInFlight["ec_balance"]; ok {
+		t.Fatal("pruned job must also drop its detectionInFlight entry")
+	}
+}
+
+func TestPruneSchedulerState_LifecycleLaneLeavesDefaultLane(t *testing.T) {
+	p, err := New(Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer p.Shutdown()
+
+	now := time.Now().UTC()
+	p.schedulerMu.Lock()
+	p.nextDetectionAt["vacuum"] = now.Add(time.Minute)          // default lane
+	p.nextDetectionAt["s3_lifecycle"] = now.Add(24 * time.Hour) // lifecycle lane, active
+	p.schedulerMu.Unlock()
+
+	p.pruneSchedulerState(LaneLifecycle, map[string]struct{}{"s3_lifecycle": {}})
+
+	p.schedulerMu.Lock()
+	defer p.schedulerMu.Unlock()
+	if _, ok := p.nextDetectionAt["vacuum"]; !ok {
+		t.Fatal("lifecycle-lane prune must not delete default-lane nextDetectionAt[vacuum]")
+	}
+	if _, ok := p.nextDetectionAt["s3_lifecycle"]; !ok {
+		t.Fatal("active lifecycle job (s3_lifecycle) must be kept")
+	}
+}
+
+func TestPruneDetectorLeases_IsLaneScoped(t *testing.T) {
+	p, err := New(Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer p.Shutdown()
+
+	p.detectorLeaseMu.Lock()
+	p.detectorLeases["s3_lifecycle"] = "worker-a" // lifecycle lane
+	p.detectorLeases["vacuum"] = "worker-b"       // default lane, active
+	p.detectorLeases["ec_balance"] = "worker-c"   // default lane, stale
+	p.detectorLeaseMu.Unlock()
+
+	p.pruneDetectorLeases(LaneDefault, map[string]struct{}{"vacuum": {}})
+
+	p.detectorLeaseMu.Lock()
+	defer p.detectorLeaseMu.Unlock()
+	if _, ok := p.detectorLeases["s3_lifecycle"]; !ok {
+		t.Fatal("default-lane prune must not delete lifecycle-lane detector lease")
+	}
+	if _, ok := p.detectorLeases["vacuum"]; !ok {
+		t.Fatal("active default-lane detector lease (vacuum) must be kept")
+	}
+	if _, ok := p.detectorLeases["ec_balance"]; ok {
+		t.Fatal("stale default-lane detector lease (ec_balance) must still be pruned within its own lane")
+	}
+}
+
+func TestLaneStatus_LifecycleNextDetectionSurvivesDefaultLanePrune(t *testing.T) {
+	p, err := New(Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer p.Shutdown()
+
+	now := time.Now().UTC()
+	expected := now.Add(24 * time.Hour)
+	p.schedulerMu.Lock()
+	p.nextDetectionAt["s3_lifecycle"] = expected
+	p.nextDetectionAt["vacuum"] = now.Add(time.Minute)
+	p.schedulerMu.Unlock()
+
+	p.pruneSchedulerState(LaneDefault, map[string]struct{}{"vacuum": {}})
+
+	status := p.GetLaneSchedulerStatus(LaneLifecycle)
+	if status.NextDetectionAt == nil {
+		t.Fatal("lifecycle lane status lost next_detection_at after a default-lane prune")
+	}
+	if !status.NextDetectionAt.Equal(expected) {
+		t.Fatalf("next_detection_at = %v, want %v (must be the 24h schedule, not the idle-sleep fallback)",
+			status.NextDetectionAt, expected)
 	}
 }

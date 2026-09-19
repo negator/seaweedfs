@@ -12,6 +12,26 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
+// acquireRenamePathLocks holds both paths across commit and notification so a
+// fenced lookup cannot read renamed state under a fence preceding its events.
+// Path order avoids deadlock with a reverse rename; descendants are not
+// locked. The returned func releases both.
+func (fs *FilerServer) acquireRenamePathLocks(intention string, oldPath, newPath util.FullPath) func() {
+	firstPath, secondPath := oldPath, newPath
+	if secondPath < firstPath {
+		firstPath, secondPath = secondPath, firstPath
+	}
+	firstLock := fs.entryLockTable.AcquireLock(intention, firstPath, util.ExclusiveLock)
+	if secondPath == firstPath {
+		return func() { fs.entryLockTable.ReleaseLock(firstPath, firstLock) }
+	}
+	secondLock := fs.entryLockTable.AcquireLock(intention, secondPath, util.ExclusiveLock)
+	return func() {
+		fs.entryLockTable.ReleaseLock(secondPath, secondLock)
+		fs.entryLockTable.ReleaseLock(firstPath, firstLock)
+	}
+}
+
 func (fs *FilerServer) AtomicRenameEntry(ctx context.Context, req *filer_pb.AtomicRenameEntryRequest) (*filer_pb.AtomicRenameEntryResponse, error) {
 
 	glog.V(1).Infof("AtomicRenameEntry %v", req)
@@ -22,6 +42,8 @@ func (fs *FilerServer) AtomicRenameEntry(ctx context.Context, req *filer_pb.Atom
 	if err := fs.filer.CanRename(ctx, oldParent, newParent, req.OldName); err != nil {
 		return nil, err
 	}
+
+	defer fs.acquireRenamePathLocks("AtomicRenameEntry", oldParent.Child(req.OldName), newParent.Child(req.NewName))()
 
 	ctx, err := fs.filer.BeginTransaction(ctx)
 	if err != nil {
@@ -70,6 +92,8 @@ func (fs *FilerServer) StreamRenameEntry(req *filer_pb.StreamRenameEntryRequest,
 	if err := fs.filer.CanRename(stream.Context(), oldParent, newParent, req.OldName); err != nil {
 		return err
 	}
+
+	defer fs.acquireRenamePathLocks("StreamRenameEntry", oldParent.Child(req.OldName), newParent.Child(req.NewName))()
 
 	ctx := context.Background()
 
@@ -250,7 +274,7 @@ func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.Seawee
 		}
 	}
 	if existingTarget != nil {
-		toDelete, err := filer.MinusChunks(ctx, fs.filer.MasterClient.GetLookupFileIdFunction(), existingTarget.GetChunks(), newEntry.GetChunks())
+		toDelete, err := filer.MinusChunks(ctx, fs.filer.MasterClient.GetLookupFileIdFunction(), existingTarget.GetChunks(), newEntry.GetChunks(), fs.filer.MasterClient)
 		if err != nil {
 			glog.ErrorfCtx(ctx, "Failed to resolve overwrite target chunks during rename. new: %v, old: %v", newEntry.GetChunks(), existingTarget.GetChunks())
 		} else if len(toDelete) > 0 {

@@ -103,7 +103,7 @@ func (s *RcloneBackendStorage) NewStorageFile(key string, tierInfo *volume_serve
 	return f
 }
 
-func (s *RcloneBackendStorage) CopyFile(f *os.File, fn func(progressed int64, percentage float32) error) (key string, size int64, err error) {
+func (s *RcloneBackendStorage) CopyFile(f *os.File, fn func(progressed int64, percentage float32) error, concurrency int) (key string, size int64, err error) {
 	randomUuid, err := uuid.NewRandom()
 	if err != nil {
 		return key, 0, err
@@ -154,7 +154,7 @@ func uploadViaRclone(rfs fs.Fs, filename string, key string, fn func(progressed 
 	return obj.Size(), err
 }
 
-func (s *RcloneBackendStorage) DownloadFile(filename string, key string, fn func(progressed int64, percentage float32) error) (size int64, err error) {
+func (s *RcloneBackendStorage) DownloadFile(filename string, key string, fn func(progressed int64, percentage float32) error, concurrency int) (size int64, err error) {
 	glog.V(1).Infof("download dat file of %s from remote rclone.%s as %s", filename, s.id, key)
 
 	util.Retry("download via Rclone", func() error {
@@ -190,6 +190,13 @@ func downloadViaRclone(fs fs.Fs, filename string, key string, fn func(progressed
 
 	tr := accounting.NewStats(ctx).NewTransfer(obj, fs)
 	defer func() {
+		// fsync the .dat before closing so its content is durable before the caller
+		// trims the remote reference and deletes the shared remote object.
+		if syncer, ok := file.(interface{ Sync() error }); ok {
+			if syncErr := syncer.Sync(); err == nil && syncErr != nil {
+				err = syncErr
+			}
+		}
 		if closeErr := file.Close(); err == nil && closeErr != nil {
 			err = closeErr
 		}

@@ -6,8 +6,8 @@ use seaweed_volume::config::{self, VolumeServerConfig};
 use seaweed_volume::metrics;
 use seaweed_volume::pb::volume_server_pb::volume_server_server::VolumeServerServer;
 use seaweed_volume::security::tls::{
-    build_rustls_server_config, build_rustls_server_config_with_grpc_client_auth,
-    GrpcClientAuthPolicy, TlsPolicy,
+    GrpcClientAuthPolicy, TlsPolicy, build_rustls_server_config,
+    build_rustls_server_config_with_grpc_client_auth, install_default_crypto_provider,
 };
 use seaweed_volume::security::{Guard, SigningKey};
 #[cfg(unix)]
@@ -18,7 +18,7 @@ use seaweed_volume::server::grpc_server::VolumeGrpcService;
 use seaweed_volume::server::profiling::CpuProfileSession;
 use seaweed_volume::server::request_id::GrpcRequestIdLayer;
 use seaweed_volume::server::volume_server::{
-    build_metrics_router, RuntimeMetricsConfig, VolumeServerState,
+    RuntimeMetricsConfig, VolumeServerState, build_metrics_router,
 };
 use seaweed_volume::server::write_queue::WriteQueue;
 use seaweed_volume::storage::store::Store;
@@ -39,6 +39,13 @@ const GRPC_MAX_HEADER_LIST_SIZE: u32 = 8 * 1024 * 1024;
 const GRPC_MAX_CONCURRENT_STREAMS: u32 = 1000;
 
 fn main() {
+    // Before anything allocates: stop glibc from training its mmap threshold
+    // upward on our large EC buffers and turning them into heap it never
+    // returns. See seaweed_volume::malloc_tuning for the measurements.
+    let malloc_tuning = seaweed_volume::malloc_tuning::pin_mmap_threshold();
+
+    install_default_crypto_provider();
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -63,6 +70,19 @@ fn main() {
         "SeaweedFS Volume Server (Rust) v{}",
         seaweed_volume::version::full_version()
     );
+    match malloc_tuning {
+        seaweed_volume::malloc_tuning::MallocTuning::Pinned(bytes) => {
+            info!("pinned glibc M_MMAP_THRESHOLD to {} bytes", bytes)
+        }
+        seaweed_volume::malloc_tuning::MallocTuning::DeferredToEnv => info!(
+            "an allocator mmap-threshold override ({}) is set; leaving glibc's mmap threshold to the environment",
+            seaweed_volume::malloc_tuning::MMAP_THRESHOLD_ENV
+        ),
+        seaweed_volume::malloc_tuning::MallocTuning::Failed => {
+            warn!("mallopt(M_MMAP_THRESHOLD) failed; large freed buffers may stay resident")
+        }
+        seaweed_volume::malloc_tuning::MallocTuning::NotApplicable => {}
+    }
 
     // Register Prometheus metrics
     metrics::register_metrics();
@@ -327,6 +347,7 @@ async fn run(
             seaweed_volume::remote_storage::s3_tier::S3TierRegistry::new(),
         ),
         read_mode: config.read_mode,
+        allow_untrusted_remote_endpoints: config.allow_untrusted_remote_endpoints,
         master_url,
         master_urls,
         seed_master_set,
@@ -545,6 +566,12 @@ async fn run(
                     whitelist.extend(sec.guard_white_list.iter().cloned());
                     let mut guard = state_reload.guard.write().unwrap();
                     guard.update_whitelist(&whitelist);
+                    guard.update_signing_keys(
+                        SigningKey(sec.jwt_signing_key),
+                        sec.jwt_signing_expires,
+                        SigningKey(sec.jwt_read_signing_key),
+                        sec.jwt_read_signing_expires,
+                    );
                 }
 
                 // Trigger heartbeat to report new volumes
@@ -644,8 +671,7 @@ async fn run(
                     })
                     .await
             } else {
-                let incoming =
-                    tokio_stream::wrappers::TcpListenerStream::new(grpc_listener);
+                let incoming = tokio_stream::wrappers::TcpListenerStream::new(grpc_listener);
                 info!("gRPC server listening on {}", grpc_local_addr);
                 build_grpc_server_builder()
                     .layer(GrpcRequestIdLayer)
@@ -1031,15 +1057,17 @@ mod tests {
 
     #[test]
     fn test_grpc_server_tls_returns_none_when_files_are_missing() {
-        assert!(build_grpc_server_tls_acceptor(
-            "/missing/server.crt",
-            "/missing/server.key",
-            "/missing/ca.crt",
-            &TlsPolicy::default(),
-            "",
-            &[],
-        )
-        .is_none());
+        assert!(
+            build_grpc_server_tls_acceptor(
+                "/missing/server.crt",
+                "/missing/server.key",
+                "/missing/ca.crt",
+                &TlsPolicy::default(),
+                "",
+                &[],
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1061,19 +1089,21 @@ mod tests {
             "-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n",
         );
 
-        assert!(build_grpc_server_tls_acceptor(
-            &cert,
-            &key,
-            &ca,
-            &TlsPolicy {
-                min_version: "TLS 1.0".to_string(),
-                max_version: "TLS 1.1".to_string(),
-                cipher_suites: String::new(),
-            },
-            "",
-            &[],
-        )
-        .is_none());
+        assert!(
+            build_grpc_server_tls_acceptor(
+                &cert,
+                &key,
+                &ca,
+                &TlsPolicy {
+                    min_version: "TLS 1.0".to_string(),
+                    max_version: "TLS 1.1".to_string(),
+                    cipher_suites: String::new(),
+                },
+                "",
+                &[],
+            )
+            .is_none()
+        );
     }
 
     #[test]

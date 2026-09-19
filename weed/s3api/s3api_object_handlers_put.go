@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"path"
@@ -21,6 +22,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
@@ -29,6 +31,8 @@ import (
 	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
 	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util/constants"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Object lock validation errors
@@ -131,6 +135,28 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 
 	objectContentType := r.Header.Get("Content-Type")
 	if strings.HasSuffix(object, "/") && r.ContentLength <= 1024 {
+		// The filer mkdir below would implicitly create a missing bucket, so gate it
+		// on the same auto-create policy as regular uploads.
+		if err := s3a.checkBucket(r, bucket); err == s3err.ErrNoSuchBucket {
+			if !s3a.handleAutoCreateBucket(w, r, bucket, "PutObjectHandler") {
+				return
+			}
+		} else if err != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, err)
+			return
+		}
+
+		objectLockEnabled, lockErr := s3a.isObjectLockEnabled(bucket)
+		if lockErr != nil && !errors.Is(lockErr, filer_pb.ErrNotFound) {
+			glog.Errorf("PutObjectHandler: failed to check object lock for bucket %s: %v", bucket, lockErr)
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+			return
+		}
+		if validationErr := s3a.validateObjectLockHeaders(r, objectLockEnabled); validationErr != nil {
+			glog.V(2).Infof("PutObjectHandler: object lock header validation failed for %s/%s: %v", bucket, object, validationErr)
+			s3err.WriteErrorResponse(w, r, mapValidationErrorToS3Error(validationErr))
+			return
+		}
 		// Split the object into directory path and name
 		objectWithoutSlash := strings.TrimSuffix(object, "/")
 		dirName := path.Dir(objectWithoutSlash)
@@ -165,28 +191,55 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 
 		glog.Infof("PutObjectHandler: explicit directory marker %s/%s (contentType=%q, len=%d)",
 			bucket, object, objectContentType, r.ContentLength)
-		if err := s3a.mkdir(
-			fullDirPath, entryName,
-			func(entry *filer_pb.Entry) {
-				if objectContentType == "" {
-					objectContentType = s3_constants.FolderMimeType
-				}
-				if len(dirContent) > 0 {
-					entry.Content = dirContent
-				}
-				entry.Attributes.Mime = objectContentType
-				entry.Attributes.Md5 = dirMd5[:]
+		// mkdir replaces this entry outright, so a lock recorded on the entry itself
+		// is what stands in the way -- not the latest version, which a versioned
+		// write of the same key is free to add to. Check it under the same lock the
+		// marker delete takes, so the entry cannot change in between.
+		markerCode := s3a.withObjectWriteLock(bucket, object, func() s3err.ErrorCode {
+			if !objectLockEnabled {
+				return s3err.ErrNone
+			}
+			existing, existErr := s3a.getEntry(fullDirPath, entryName)
+			if existErr != nil {
+				return s3err.ErrNone
+			}
+			if lockErr := s3a.enforceObjectLockOnEntry(existing, bucket, object, "", s3a.evaluateGovernanceBypassRequest(r, bucket, object)); lockErr != nil {
+				glog.V(2).Infof("PutObjectHandler: object lock permissions check failed for %s/%s: %v", bucket, object, lockErr)
+				return s3err.ErrAccessDenied
+			}
+			return s3err.ErrNone
+		}, func() s3err.ErrorCode {
+			if err := s3a.mkdir(
+				fullDirPath, entryName,
+				func(entry *filer_pb.Entry) {
+					if objectContentType == "" {
+						objectContentType = s3_constants.FolderMimeType
+					}
+					if len(dirContent) > 0 {
+						entry.Content = dirContent
+					}
+					entry.Attributes.Mime = objectContentType
+					entry.Attributes.Md5 = dirMd5[:]
 
-				// Store ETag in extended attributes for consistency with regular objects
-				if entry.Extended == nil {
-					entry.Extended = make(map[string][]byte)
-				}
-				entry.Extended[s3_constants.ExtETagKey] = []byte(dirEtag)
+					// Store ETag in extended attributes for consistency with regular objects
+					if entry.Extended == nil {
+						entry.Extended = make(map[string][]byte)
+					}
+					entry.Extended[s3_constants.ExtETagKey] = []byte(dirEtag)
 
-				// Set object owner for directory objects (same as regular objects)
-				s3a.setObjectOwnerFromRequest(r, bucket, entry)
-			}); err != nil {
-			s3err.WriteErrorResponse(w, r, filerErrorToS3Error(err))
+					// Set object owner for directory objects (same as regular objects)
+					s3a.setObjectOwnerFromRequest(r, bucket, entry)
+
+					if lockErr := s3a.extractObjectLockMetadataFromRequest(r, entry); lockErr != nil {
+						glog.Errorf("PutObjectHandler: failed to extract object lock metadata for %s/%s: %v", bucket, object, lockErr)
+					}
+				}); err != nil {
+				return filerErrorToS3Error(err)
+			}
+			return s3err.ErrNone
+		})
+		if markerCode != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, markerCode)
 			return
 		}
 		setEtag(w, dirEtag)
@@ -297,7 +350,7 @@ func (s3a *S3ApiServer) PutObjectHandler(w http.ResponseWriter, r *http.Request)
 			}
 
 			ttlSec := s3a.lifecycleTTLForObjectWrite(bucket, object, r.ContentLength)
-			etag, errCode, sseMetadata := s3a.putToFiler(r, filePath, dataReader, bucket, object, 1, ttlSec, nil, false)
+			etag, errCode, sseMetadata := s3a.putToFiler(r, filePath, dataReader, bucket, object, 1, ttlSec, nil, false, "")
 
 			if errCode != s3err.ErrNone {
 				s3err.WriteErrorResponse(w, r, errCode)
@@ -352,6 +405,38 @@ func (s3a *S3ApiServer) withObjectWriteLock(bucket, object string, preconditionF
 	return fn()
 }
 
+// putFinalize folds an object write's finalize into its create. On the routed
+// path its mutations ride in the entry's PUT transaction under lockKey, committing
+// atomically (e.g. the .versions pointer flip); off the ring afterCreate does the
+// equivalent under the object write lock. A finalize with no routed form (suspended
+// IsLatest fixups) carries no mutations and runs only via afterCreate.
+type putFinalize struct {
+	lockKey     string
+	mutations   []*filer_pb.ObjectMutation
+	afterCreate func(entry *filer_pb.Entry) s3err.ErrorCode
+}
+
+const (
+	// defaultUploadChunkSizeMB applies when the filer reports no -maxMB.
+	defaultUploadChunkSizeMB = 8
+	// maxUploadChunkSizeMB keeps the byte count inside int32.
+	maxUploadChunkSizeMB = 2047
+)
+
+// uploadChunkSize is how large a chunk the S3 write path cuts. It follows the
+// filer's -maxMB so an object written through S3 chunks the same way the same
+// bytes written through the filer, WebDAV or a mount would.
+func (s3a *S3ApiServer) uploadChunkSize() int32 {
+	sizeMB := s3a.option.MaxMB
+	if sizeMB <= 0 {
+		sizeMB = defaultUploadChunkSizeMB
+	}
+	if sizeMB > maxUploadChunkSizeMB {
+		sizeMB = maxUploadChunkSizeMB
+	}
+	return sizeMB * 1024 * 1024
+}
+
 // putToFiler writes one chunk of object bytes (a full PutObject body, a
 // single MPU part, a copy-part destination). lifecycleTTLSec is non-zero
 // only for top-level PutObject paths where the lifecycle XML's
@@ -359,7 +444,15 @@ func (s3a *S3ApiServer) withObjectWriteLock(bucket, object string, preconditionF
 // pass 0 because their own keys aren't the user-visible object the rule
 // targets and a part write would otherwise bind a TTL clock starting
 // before CompleteMultipartUpload.
-func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader io.Reader, bucket string, object string, partNumber int, lifecycleTTLSec int32, afterCreate func(entry *filer_pb.Entry) s3err.ErrorCode, uniqueWritePath bool) (etag string, code s3err.ErrorCode, sseMetadata SSEResponseMetadata) {
+//
+// storageDestination overrides the path the filer resolves filer.conf storage
+// rules against, empty meaning filePath. MPU parts stage under the bucket's
+// .uploads folder but their bytes become the object, so they pass the object's
+// path the way the x-seaweedfs-destination header used to carry it.
+func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader io.Reader, bucket string, object string, partNumber int, lifecycleTTLSec int32, finalize *putFinalize, uniqueWritePath bool, storageDestination string) (etag string, code s3err.ErrorCode, sseMetadata SSEResponseMetadata) {
+	if !s3_constants.IsValidBucketName(bucket) || (object != "" && !s3_constants.IsValidObjectKey(object)) {
+		return "", s3err.ErrInvalidRequest, SSEResponseMetadata{}
+	}
 	// NEW OPTIMIZATION: Write directly to volume servers, bypassing filer proxy
 	// This eliminates the filer proxy overhead for PUT operations
 	// Note: filePath is now passed directly instead of URL (no parsing needed)
@@ -452,13 +545,17 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 
 	// filePath is already provided directly - no URL parsing needed
 	// Step 1 & 2: Use auto-chunking to handle large files without OOM
-	// This splits large uploads into 8MB chunks, preventing memory issues on both S3 API and volume servers
-	const chunkSize = 8 * 1024 * 1024 // 8MB chunks (S3 standard)
+	chunkSize := s3a.uploadChunkSize()
 	const smallFileLimit = 256 * 1024 // 256KB - store inline in filer
 
 	collection := ""
 	if s3a.option.FilerGroup != "" {
 		collection = s3a.getCollectionName(bucket)
+	}
+
+	assignPath := filePath
+	if storageDestination != "" {
+		assignPath = storageDestination
 	}
 
 	// Create assign function for chunked upload
@@ -471,7 +568,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 				Collection:       collection,
 				DiskType:         "",
 				DataCenter:       s3a.option.DataCenter,
-				Path:             filePath,
+				Path:             assignPath,
 				ExpectedDataSize: expectedDataSize,
 				TtlSec:           lifecycleTTLSec,
 			})
@@ -489,13 +586,22 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 		}
 
 		// Convert filer_pb.AssignVolumeResponse to operation.AssignResult
-		return nil, &operation.AssignResult{
+		result := &operation.AssignResult{
 			Fid:       assignResult.FileId,
 			Url:       assignResult.Location.Url,
 			PublicUrl: assignResult.Location.PublicUrl,
 			Count:     uint64(count),
 			Auth:      security.EncodedJwt(assignResult.Auth),
-		}, nil
+			Fsync:     assignResult.Fsync,
+		}
+		for _, replica := range assignResult.Replicas {
+			result.Replicas = append(result.Replicas, operation.Location{
+				Url:        replica.Url,
+				PublicUrl:  replica.PublicUrl,
+				DataCenter: replica.DataCenter,
+			})
+		}
+		return nil, result, nil
 	}
 
 	// Upload with auto-chunking
@@ -523,10 +629,7 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 			s3a.deleteOrphanedChunks(chunkResult.FileChunks)
 		}
 
-		if strings.Contains(err.Error(), s3err.ErrMsgPayloadChecksumMismatch) {
-			return "", s3err.ErrInvalidDigest, SSEResponseMetadata{}
-		}
-		return "", s3err.ErrInternalError, SSEResponseMetadata{}
+		return "", mapChunkedUploadErrorToS3Error(r.Context(), err), SSEResponseMetadata{}
 	}
 
 	// Step 3: Calculate MD5 hash and add SSE metadata to chunks
@@ -644,8 +747,8 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 			Crtime:   now.Unix(),
 			Mtime:    now.Unix(),
 			FileMode: fileMode,
-			Uid:      0,
-			Gid:      0,
+			Uid:      filer_pb.OS_UID,
+			Gid:      filer_pb.OS_GID,
 			Mime:     mimeType,
 			FileSize: uint64(chunkResult.TotalSize),
 			TtlSec:   lifecycleTTLSec,
@@ -689,8 +792,14 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 	// Set object owner according to bucket ownership settings.
 	s3a.setObjectOwnerFromRequest(r, bucket, entry)
 
-	// Set version ID if present
+	// Set version ID if present. It is later used as a filer path segment, so a
+	// value carrying "/", "\\" or ".." must never be stored.
 	if versionIdHeader := r.Header.Get(s3_constants.ExtVersionIdKey); versionIdHeader != "" {
+		if !isValidVersionID(versionIdHeader) {
+			glog.Warningf("putToFiler: rejecting invalid version ID %q for object %s", versionIdHeader, filePath)
+			s3a.deleteOrphanedChunks(chunkResult.FileChunks)
+			return "", s3err.ErrInvalidRequest, SSEResponseMetadata{}
+		}
 		entry.Extended[s3_constants.ExtVersionIdKey] = []byte(versionIdHeader)
 		glog.V(3).Infof("putToFiler: setting version ID %s for object %s", versionIdHeader, filePath)
 	}
@@ -788,6 +897,12 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 		glog.V(3).Infof("putToFiler: storing SSE-S3 metadata - keyID=%s, raw len=%d", sseS3Key.KeyID, len(sseS3Metadata))
 	}
 
+	// Parts (object == "") stay flat: completion rebases chunk offsets, which
+	// manifest chunks cannot express.
+	if object != "" {
+		entry.Chunks = s3a.manifestizeChunks(filePath, bucket, lifecycleTTLSec, entry.GetChunks())
+	}
+
 	// Step 4: Save metadata to filer via gRPC
 	// Use context.Background() to ensure metadata save completes even if HTTP request is cancelled
 	// This matches the chunk upload behavior and prevents orphaned chunks
@@ -809,7 +924,14 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 				Entry:     entry,
 			}
 			glog.V(3).Infof("putToFiler: Calling CreateEntry for %s", filePath)
-			if err := filer_pb.CreateEntry(context.Background(), client, req); err != nil {
+			err := filer_pb.CreateEntry(context.Background(), client, req)
+			if errors.Is(err, filer_pb.ErrExistingIsDirectory) && !isReservedDirectoryName(entry.Name) {
+				// Other keys are nested under this one. S3 keys are flat, so the key is
+				// stored on the directory they live under rather than refused.
+				entry.MarkPrefixObject()
+				err = filer_pb.CreateEntry(context.Background(), client, req)
+			}
+			if err != nil {
 				glog.Errorf("putToFiler: CreateEntry returned error: %v", err)
 				return err
 			}
@@ -819,9 +941,9 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 			return filerErrorToS3Error(createErr)
 		}
 		entryCreated = true
-		if afterCreate != nil {
-			if afterCreateCode := afterCreate(entry); afterCreateCode != s3err.ErrNone {
-				rollbackErr = s3a.rmObject(path.Dir(filePath), path.Base(filePath), true, false)
+		if finalize != nil && finalize.afterCreate != nil {
+			if afterCreateCode := finalize.afterCreate(entry); afterCreateCode != s3err.ErrNone {
+				rollbackErr = s3a.rmObject(context.Background(), path.Dir(filePath), path.Base(filePath), true, false)
 				if rollbackErr != nil {
 					glog.Errorf("putToFiler: failed to rollback created entry for %s after post-create error: %v", filePath, rollbackErr)
 				} else {
@@ -833,15 +955,19 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 		return s3err.ErrNone
 	}
 
-	// Route the create to the object's owner filer, whose per-path lock
-	// serializes it, then run afterCreate (e.g. a versioned finalize that routes
-	// itself). Conditional/object-lock/non-reducible cases fall back to the
-	// distributed lock.
+	// Route the create to the object's owner filer (its per-path lock serializes
+	// it); conditional/object-lock/non-reducible cases fall back to the lock.
 	var createCode s3err.ErrorCode
 	routed := false
 	if owner := s3a.routableWriteOwner(bucket, object); owner != "" {
 		if cond, ok := routeWriteCondition(r, uniqueWritePath); ok {
-			resp, err := s3a.routedPut(owner, s3a.objectRouteKey(bucket, object), filePath, entry, cond)
+			// Routed mutations ride in the PUT's transaction (committing atomically),
+			// so lockKey is the object path they carry, not the version file path.
+			lockKey, finalizeMutations := filePath, []*filer_pb.ObjectMutation(nil)
+			if finalize != nil && len(finalize.mutations) > 0 {
+				lockKey, finalizeMutations = finalize.lockKey, finalize.mutations
+			}
+			resp, err := s3a.routedPut(owner, s3a.objectRouteKey(bucket, object), lockKey, filePath, entry, cond, "", finalizeMutations)
 			switch {
 			case err != nil:
 				glog.Warningf("putToFiler: routed PUT to %s failed for %s, falling back to lock: %v", owner, filePath, err)
@@ -852,8 +978,10 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 				glog.Warningf("putToFiler: routed PUT to %s returned %q for %s, falling back to lock", owner, resp.Error, filePath)
 			default:
 				entryCreated, routed, createCode = true, true, s3err.ErrNone
-				if afterCreate != nil {
-					createCode = afterCreate(entry)
+				// Bundled mutations already finalized in the transaction above;
+				// a finalize with none (suspended versioning) runs off the lock.
+				if len(finalizeMutations) == 0 && finalize != nil && finalize.afterCreate != nil {
+					createCode = finalize.afterCreate(entry)
 				}
 			}
 		}
@@ -867,12 +995,30 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 		}
 
 		// If the entry was never created, the uploaded chunks are orphaned and must be deleted.
-		if !entryCreated && len(chunkResult.FileChunks) > 0 {
-			glog.Warningf("putToFiler: finalization failed, attempting to cleanup %d orphaned chunks", len(chunkResult.FileChunks))
-			s3a.deleteOrphanedChunks(chunkResult.FileChunks)
+		if !entryCreated {
+			// A failed create does not prove the entry is absent: a lost response
+			// can hide a commit (issue #11366) and the filer can fail after
+			// inserting the entry (issue #11387), so the entry's presence — not
+			// the error class — decides the chunks' fate.
+			landed, absent := s3a.confirmCreateLanded(filePath, bucket, object, entry, chunkResult.FileChunks, finalize)
+			if landed {
+				createCode = s3err.ErrNone
+			}
+			if createCode != s3err.ErrNone && absent {
+				orphaned := chunkResult.FileChunks
+				if manifestChunks, _ := filer.SeparateManifestChunks(entry.GetChunks()); len(manifestChunks) > 0 {
+					orphaned = append(manifestChunks, orphaned...)
+				}
+				if len(orphaned) > 0 {
+					glog.Warningf("putToFiler: finalization failed, attempting to cleanup %d orphaned chunks", len(orphaned))
+					s3a.deleteOrphanedChunks(orphaned)
+				}
+			}
 		}
 
-		return "", createCode, SSEResponseMetadata{}
+		if createCode != s3err.ErrNone {
+			return "", createCode, SSEResponseMetadata{}
+		}
 	}
 	glog.V(3).Infof("putToFiler: CreateEntry SUCCESS for %s", filePath)
 
@@ -897,6 +1043,123 @@ func (s3a *S3ApiServer) putToFiler(r *http.Request, filePath string, dataReader 
 	}
 
 	return etag, s3err.ErrNone, responseMetadata
+}
+
+// createLookupTimeout bounds the entry lookups confirmCreateLanded runs under
+// the object write lock, so a hung filer cannot stall the write path.
+const createLookupTimeout = 10 * time.Second
+
+// confirmCreateLanded resolves a create whose outcome is uncertain: a stored
+// entry resolving to the uploaded chunks confirms the write landed — the
+// finalization the error skipped then runs under the object write lock, and
+// landed reports success — while absent requires every filer the create could
+// have committed on to lack the entry, the only outcome where the uploaded
+// chunks are orphaned.
+func (s3a *S3ApiServer) confirmCreateLanded(filePath, bucket, object string, entry *filer_pb.Entry, uploaded []*filer_pb.FileChunk, finalize *putFinalize) (landed, absent bool) {
+	dir, name := path.Dir(filePath), path.Base(filePath)
+	owner := s3a.routableWriteOwner(bucket, object)
+	lookupCtx, cancel := context.WithTimeout(context.Background(), createLookupTimeout)
+	defer cancel()
+	// Verify, finalize, and roll back inside one critical section: a concurrent
+	// write to the same key must not slip in between them.
+	s3a.withObjectWriteLock(bucket, object, nil, func() s3err.ErrorCode {
+		var existing *filer_pb.Entry
+		uncertain, queried := false, false
+		for _, target := range s3a.createTargetFilers(owner, bucket, object) {
+			e, lookupErr := s3a.lookupEntryOnFiler(lookupCtx, target, dir, name)
+			queried = true
+			if e != nil {
+				existing = e
+				break
+			}
+			if lookupErr != nil && !errors.Is(lookupErr, filer_pb.ErrNotFound) {
+				uncertain = true
+			}
+		}
+		if existing == nil {
+			absent = queried && !uncertain
+			return s3err.ErrNone
+		}
+		if len(uploaded) == 0 {
+			return s3err.ErrNone
+		}
+		resolved, _, resolveErr := filer.ResolveChunkManifest(lookupCtx, s3a.createLookupFileIdFunction(), existing.GetChunks(), 0, math.MaxInt64, s3a.filerClient)
+		if resolveErr != nil || !sameFileChunks(resolved, uploaded) {
+			return s3err.ErrNone
+		}
+		glog.Warningf("putToFiler: create entry for %s failed but the entry exists, treating the write as successful", filePath)
+		if finalize == nil || finalize.afterCreate == nil {
+			landed = true
+			return s3err.ErrNone
+		}
+		if code := finalize.afterCreate(entry); code != s3err.ErrNone {
+			// Same undo the create path applies when post-create finalization fails.
+			if rbErr := s3a.rmObject(context.Background(), dir, name, true, false); rbErr != nil {
+				glog.Errorf("putToFiler: failed to rollback recovered entry for %s: %v", filePath, rbErr)
+			}
+			return s3err.ErrNone
+		}
+		landed = true
+		return s3err.ErrNone
+	})
+	return landed, absent
+}
+
+// createTargetFilers lists the filers a failed create could have committed on:
+// the routed owner and the prior one mid-rebalance first, then the failover
+// set the lock path dials. Deduped, empty addresses skipped.
+func (s3a *S3ApiServer) createTargetFilers(owner pb.ServerAddress, bucket, object string) []pb.ServerAddress {
+	var filers []pb.ServerAddress
+	seen := map[pb.ServerAddress]bool{}
+	add := func(f pb.ServerAddress) {
+		if f != "" && !seen[f] {
+			seen[f] = true
+			filers = append(filers, f)
+		}
+	}
+	add(owner)
+	add(s3a.priorWriteOwner(bucket, object))
+	if s3a.filerClient != nil {
+		add(s3a.filerClient.GetCurrentFiler())
+		for _, f := range s3a.filerClient.GetAllFilers() {
+			add(f)
+		}
+	}
+	for _, f := range s3a.option.Filers {
+		add(f)
+	}
+	return filers
+}
+
+// sameFileChunks reports whether two chunk lists reference the same needles,
+// regardless of order. File id strings are normalized through the parsed Fid so
+// a non-canonical representation cannot masquerade as a different chunk.
+func sameFileChunks(a, b []*filer_pb.FileChunk) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	key := func(c *filer_pb.FileChunk) string {
+		fid := c.GetFid()
+		if fid == nil {
+			fid, _ = filer_pb.ToFileIdObject(c.GetFileIdString())
+		}
+		if fid == nil {
+			return c.GetFileIdString()
+		}
+		return fmt.Sprintf("%d,%x,%x", fid.VolumeId, fid.FileKey, fid.Cookie)
+	}
+	counts := make(map[string]int, len(a))
+	for _, c := range a {
+		counts[key(c)]++
+	}
+	for _, c := range b {
+		k := key(c)
+		if counts[k] == 0 {
+			return false
+		}
+		counts[k]--
+	}
+	return true
 }
 
 // checksumAlgorithmMapping maps algorithm name strings to their enum and header name.
@@ -935,6 +1198,31 @@ var checksumHeaders = []struct {
 	{s3_constants.AmzChecksumCRC64NVME, ChecksumAlgorithmCRC64NVMe, s3_constants.AmzChecksumCRC64NVME},
 	{s3_constants.AmzChecksumSHA1, ChecksumAlgorithmSHA1, s3_constants.AmzChecksumSHA1},
 	{s3_constants.AmzChecksumSHA256, ChecksumAlgorithmSHA256, s3_constants.AmzChecksumSHA256},
+}
+
+// ChecksumResult carries the flexible-checksum members S3 returns inside an XML
+// response body, keyed by the canonical x-amz-checksum-* header name.
+type ChecksumResult struct {
+	ChecksumCRC32     string `xml:"ChecksumCRC32,omitempty"`
+	ChecksumCRC32C    string `xml:"ChecksumCRC32C,omitempty"`
+	ChecksumCRC64NVME string `xml:"ChecksumCRC64NVME,omitempty"`
+	ChecksumSHA1      string `xml:"ChecksumSHA1,omitempty"`
+	ChecksumSHA256    string `xml:"ChecksumSHA256,omitempty"`
+}
+
+func (c *ChecksumResult) SetChecksum(headerName, value string) {
+	switch headerName {
+	case s3_constants.AmzChecksumCRC32:
+		c.ChecksumCRC32 = value
+	case s3_constants.AmzChecksumCRC32C:
+		c.ChecksumCRC32C = value
+	case s3_constants.AmzChecksumCRC64NVME:
+		c.ChecksumCRC64NVME = value
+	case s3_constants.AmzChecksumSHA1:
+		c.ChecksumSHA1 = value
+	case s3_constants.AmzChecksumSHA256:
+		c.ChecksumSHA256 = value
+	}
 }
 
 // lookupHeaderOrQuery returns the value of an x-amz-* parameter, checking the
@@ -1113,6 +1401,14 @@ func (s3a *S3ApiServer) setSSEResponseHeaders(w http.ResponseWriter, r *http.Req
 	}
 }
 
+// isReservedDirectoryName reports whether a directory standing at an object's path is
+// one SeaweedFS keeps its own state in - a multipart staging folder, or a key's version
+// history - rather than a prefix the key can be stored on. Writing the object onto it
+// would replace that state with the object's own.
+func isReservedDirectoryName(name string) bool {
+	return name == s3_constants.MultipartUploadsFolder || strings.HasSuffix(name, s3_constants.VersionsFolder)
+}
+
 func filerErrorToS3Error(err error) s3err.ErrorCode {
 	if err == nil {
 		return s3err.ErrNone
@@ -1130,13 +1426,55 @@ func filerErrorToS3Error(err error) s3err.ErrorCode {
 		return s3err.ErrAccessDenied
 	}
 
+	// A transport failure leaves the outcome ambiguous — the write may have
+	// been applied anyway — so it must stay retryable, not a permanent 4xx.
+	switch status.Code(err) {
+	case codes.Canceled, codes.DeadlineExceeded, codes.Unavailable:
+		return s3err.ErrServiceUnavailable
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return s3err.ErrServiceUnavailable
+	}
+
 	// Non-filer errors that don't go through CreateEntryResponse — string matching required
 	errString := err.Error()
 	switch {
 	case errString == constants.ErrMsgBadDigest:
 		return s3err.ErrBadDigest
 	case strings.Contains(errString, "context canceled") || strings.Contains(errString, "code = Canceled"):
-		return s3err.ErrInvalidRequest
+		return s3err.ErrServiceUnavailable
+	default:
+		return s3err.ErrInternalError
+	}
+}
+
+// mapChunkedUploadErrorToS3Error classifies a failed streaming upload. A truncated
+// request body (client abort or reverse-proxy timeout) is a request error, so report
+// IncompleteBody (400) rather than a 500 a reverse proxy would relay as a confusing
+// 502. Only the source read is tagged, so a volume-server upload fault still maps to
+// InternalError.
+//
+// reqCtx is the request context, which separates the two ways a body ends early: a
+// peer that went away, and a body that arrived short while the peer was still there.
+// Both surface as the same read error, so without this they are indistinguishable in
+// logs even though they point at opposite causes — a network path versus a client.
+// The upload itself deliberately runs on a background context, so cancellation of
+// reqCtx races the read error; a missed signal degrades to IncompleteBody as before.
+//
+// This reads cancellation as "the peer is gone", which is what net/http means by it
+// today: nothing on the S3 request path cancels reqCtx for its own reasons. Anything
+// added later that does — a request budget, an auth deadline, shutdown draining —
+// would have to cancel with its own cause and be excluded here, otherwise a body
+// truncated at that instant gets attributed to the peer.
+func mapChunkedUploadErrorToS3Error(reqCtx context.Context, err error) s3err.ErrorCode {
+	switch {
+	case strings.Contains(err.Error(), s3err.ErrMsgPayloadChecksumMismatch):
+		return s3err.ErrInvalidDigest
+	case errors.Is(err, operation.ErrTruncatedBody):
+		if errors.Is(reqCtx.Err(), context.Canceled) {
+			return s3err.ErrClientDisconnected
+		}
+		return s3err.ErrIncompleteBody
 	default:
 		return s3err.ErrInternalError
 	}
@@ -1204,40 +1542,6 @@ func (s3a *S3ApiServer) putSuspendedVersioningObject(r *http.Request, bucket, ob
 	glog.V(3).Infof("putSuspendedVersioningObject: START bucket=%s, object=%s, normalized=%s",
 		bucket, object, normalizedObject)
 
-	bucketDir := s3a.bucketDir(bucket)
-
-	// Check if there's an existing null version in .versions directory and delete it
-	// This ensures suspended versioning properly overwrites the null version as per S3 spec
-	// Note: We only delete null versions, NOT regular versions (those should be preserved)
-	versionsObjectPath := normalizedObject + s3_constants.VersionsFolder
-	versionsDir := bucketDir + "/" + versionsObjectPath
-	entries, _, err := s3a.list(versionsDir, "", "", false, 1000)
-	if err == nil {
-		// .versions directory exists
-		glog.V(3).Infof("putSuspendedVersioningObject: found %d entries in .versions for %s/%s", len(entries), bucket, object)
-		for _, entry := range entries {
-			if entry.Extended != nil {
-				if versionIdBytes, ok := entry.Extended[s3_constants.ExtVersionIdKey]; ok {
-					versionId := string(versionIdBytes)
-					glog.V(3).Infof("putSuspendedVersioningObject: found version '%s' in .versions", versionId)
-					if versionId == "null" {
-						// Only delete null version - preserve real versioned entries
-						glog.V(3).Infof("putSuspendedVersioningObject: deleting null version from .versions")
-						err := s3a.rm(versionsDir, entry.Name, true, false)
-						if err != nil {
-							glog.Warningf("putSuspendedVersioningObject: failed to delete null version: %v", err)
-						} else {
-							glog.V(3).Infof("putSuspendedVersioningObject: successfully deleted null version")
-						}
-						break
-					}
-				}
-			}
-		}
-	} else {
-		glog.V(3).Infof("putSuspendedVersioningObject: no .versions directory for %s/%s", bucket, object)
-	}
-
 	filePath := s3a.toFilerPath(bucket, normalizedObject)
 
 	body := dataReader
@@ -1300,23 +1604,23 @@ func (s3a *S3ApiServer) putSuspendedVersioningObject(r *http.Request, bucket, ob
 		}
 	}
 
-	// Upload the file using putToFiler - this will create the file with version metadata.
-	// Versioned/suspended bucket → resolver returns 0 by construction;
-	// pass 0 directly so the path is explicit at the call site.
-	//
-	// Clear the prior latest-version pointer (and stamp the displaced
-	// entry with NoncurrentSinceNs) inside the afterCreate callback so
-	// it runs while withObjectWriteLock is still held in putToFiler.
-	// Doing it after putToFiler returns would race a concurrent PUT
-	// promoting a newer latest, which we'd then incorrectly wipe.
-	etag, errCode, sseMetadata = s3a.putToFiler(r, filePath, body, bucket, normalizedObject, 1, 0, func(_ *filer_pb.Entry) s3err.ErrorCode {
-		if err := s3a.updateIsLatestFlagsForSuspendedVersioning(bucket, normalizedObject); err != nil {
-			// Best-effort: a stale IsLatest flag is recoverable on the
-			// next list-versions resync, so don't fail the PUT.
-			glog.Warningf("putSuspendedVersioningObject: failed to update IsLatest flags: %v", err)
-		}
-		return s3err.ErrNone
-	}, false)
+	// Versioned/suspended bucket → resolver returns 0; pass it directly.
+	// afterCreate retires the null delete marker a preceding DELETE left, clears the
+	// prior latest pointer and stamps the displaced version with NoncurrentSinceNs —
+	// off-ring under the write lock, routed off-lock after the PUT. Only once the write
+	// has committed: retiring the marker for a write that then fails leaves the pointer
+	// naming a marker that is gone, and the read path heals that by promoting an older
+	// version, republishing the deleted key. Best-effort, as a stale flag self-heals on
+	// the next list.
+	etag, errCode, sseMetadata = s3a.putToFiler(r, filePath, body, bucket, normalizedObject, 1, 0, &putFinalize{
+		afterCreate: func(entry *filer_pb.Entry) s3err.ErrorCode {
+			writtenETag := string(entry.Extended[s3_constants.ExtETagKey])
+			if err := s3a.finalizeSuspendedNullWrite("", bucket, normalizedObject, s3_constants.ExtETagKey, writtenETag); err != nil {
+				glog.Warningf("putSuspendedVersioningObject: failed to retire the null delete marker: %v", err)
+			}
+			return s3err.ErrNone
+		},
+	}, false, "")
 	if errCode != s3err.ErrNone {
 		glog.Errorf("putSuspendedVersioningObject: failed to upload object: %v", errCode)
 		return "", errCode, SSEResponseMetadata{}
@@ -1325,6 +1629,26 @@ func (s3a *S3ApiServer) putSuspendedVersioningObject(r *http.Request, bucket, ob
 	glog.V(2).Infof("putSuspendedVersioningObject: successfully created null version for %s/%s", bucket, object)
 
 	return etag, s3err.ErrNone, sseMetadata
+}
+
+// removeNullVersionFile deletes the "null" version file from an object's .versions
+// directory, leaving real versions alone. Best-effort: a leftover null version is
+// superseded by the object at the regular path on the next read.
+func (s3a *S3ApiServer) removeNullVersionFile(bucket, object string) {
+	versionsDir := s3a.bucketDir(bucket) + "/" + object + s3_constants.VersionsFolder
+	entries, _, err := s3a.list(versionsDir, "", "", false, 1000)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if string(entry.Extended[s3_constants.ExtVersionIdKey]) != "null" {
+			continue
+		}
+		if rmErr := s3a.rm(context.Background(), versionsDir, entry.Name, true, false); rmErr != nil {
+			glog.Warningf("removeNullVersionFile: %s/%s: %v", bucket, object, rmErr)
+		}
+		return
+	}
 }
 
 // updateIsLatestFlagsForSuspendedVersioning sets IsLatest=false on all existing versions/delete markers
@@ -1399,6 +1723,9 @@ func (s3a *S3ApiServer) updateIsLatestFlagsForSuspendedVersioning(bucket, object
 		delete(versionsEntry.Extended, s3_constants.ExtLatestVersionIdKey)
 		delete(versionsEntry.Extended, s3_constants.ExtLatestVersionFileNameKey)
 		clearCachedVersionMetadata(versionsEntry.Extended)
+		// Record that the null object is current explicitly: an absent pointer
+		// alone also looks like replication lag to a reader.
+		versionsEntry.Extended[s3_constants.ExtNullVersionIsLatestKey] = []byte("true")
 
 		// Update the .versions directory entry
 		err = s3a.mkFile(bucketDir, versionsObjectPath, versionsEntry.Chunks, func(updatedEntry *filer_pb.Entry) {
@@ -1483,7 +1810,7 @@ func (s3a *S3ApiServer) putVersionedObject(r *http.Request, bucket, object strin
 	// directly — versioned objects sit on regular volumes and the
 	// lifecycle worker handles their expiration.
 	etag, errCode, sseMetadata = s3a.putToFiler(r, versionFilePath, body, bucket, normalizedObject, 1, 0,
-		s3a.versionedAfterCreate(bucket, normalizedObject, versionId, versionFileName, useInvertedFormat), true)
+		s3a.versionedFinalize(bucket, normalizedObject, versionId, versionFileName, useInvertedFormat), true, "")
 	if errCode != s3err.ErrNone {
 		glog.Errorf("putVersionedObject: failed to upload version: %v", errCode)
 		return "", "", errCode, SSEResponseMetadata{}
@@ -1549,6 +1876,7 @@ func (s3a *S3ApiServer) updateLatestVersionInDirectory(bucket, object, versionId
 
 	versionsEntry.Extended[s3_constants.ExtLatestVersionIdKey] = []byte(versionId)
 	versionsEntry.Extended[s3_constants.ExtLatestVersionFileNameKey] = []byte(versionFileName)
+	delete(versionsEntry.Extended, s3_constants.ExtNullVersionIsLatestKey)
 
 	// Cache list metadata for single-scan efficiency (avoids extra getEntry per object during list)
 	setCachedListMetadata(versionsEntry, versionEntry)
@@ -1957,6 +2285,17 @@ type conditionalHeaders struct {
 	isSet             bool // true if any conditional headers are present
 }
 
+// parseHTTPDate parses a conditional date header. It accepts the three HTTP-date
+// formats required by RFC 9110 via http.ParseTime, then falls back to RFC1123 so
+// the non-standard "UTC" zone that Go clients emit with t.UTC().Format(time.RFC1123)
+// keeps working as it did before http.ParseTime was adopted.
+func parseHTTPDate(value string) (time.Time, error) {
+	if t, err := http.ParseTime(value); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC1123, value)
+}
+
 // parseConditionalHeaders extracts and validates conditional headers from the request
 func parseConditionalHeaders(r *http.Request) (conditionalHeaders, s3err.ErrorCode) {
 	headers := conditionalHeaders{
@@ -1978,7 +2317,7 @@ func parseConditionalHeaders(r *http.Request) (conditionalHeaders, s3err.ErrorCo
 	// Parse date headers with validation
 	var err error
 	if ifModifiedSinceStr != "" {
-		headers.ifModifiedSince, err = time.Parse(time.RFC1123, ifModifiedSinceStr)
+		headers.ifModifiedSince, err = parseHTTPDate(ifModifiedSinceStr)
 		if err != nil {
 			glog.V(3).Infof("parseConditionalHeaders: Invalid If-Modified-Since format: %v", err)
 			return headers, s3err.ErrInvalidRequest
@@ -1986,7 +2325,7 @@ func parseConditionalHeaders(r *http.Request) (conditionalHeaders, s3err.ErrorCo
 	}
 
 	if ifUnmodifiedSinceStr != "" {
-		headers.ifUnmodifiedSince, err = time.Parse(time.RFC1123, ifUnmodifiedSinceStr)
+		headers.ifUnmodifiedSince, err = parseHTTPDate(ifUnmodifiedSinceStr)
 		if err != nil {
 			glog.V(3).Infof("parseConditionalHeaders: Invalid If-Unmodified-Since format: %v", err)
 			return headers, s3err.ErrInvalidRequest
@@ -2150,7 +2489,7 @@ func (s3a *S3ApiServer) checkConditionalHeaders(r *http.Request, bucket, object 
 
 	// Use resolveObjectEntry to correctly handle versioned objects.
 	// This ensures we check conditions against the LATEST version, not a null version.
-	entry, err := s3a.resolveObjectEntry(bucket, object)
+	entry, err := s3a.resolveObjectEntry(bucket, object, "")
 	if err != nil {
 		if errors.Is(err, filer_pb.ErrNotFound) || errors.Is(err, ErrDeleteMarker) {
 			entry = nil
@@ -2171,18 +2510,14 @@ func (s3a *S3ApiServer) validateConditionalHeadersForReads(r *http.Request, head
 	entry = normalizeConditionalTargetEntry(entry)
 	objectExists := entry != nil
 
-	// If object doesn't exist, fail for If-Match and If-Unmodified-Since
+	// A precondition only fails against an object that exists: AWS keeps GET/HEAD of a
+	// missing key a missing-key answer, so a condition never turns absence into 412.
+	// If-None-Match and If-Modified-Since pass here and the handler answers 404 itself.
 	if !objectExists {
-		if headers.ifMatch != "" {
-			glog.V(3).Infof("validateConditionalHeadersForReads: If-Match failed - object %s/%s does not exist", bucket, object)
-			return ConditionalHeaderResult{ErrorCode: s3err.ErrPreconditionFailed, Entry: nil}
+		if headers.ifMatch != "" || !headers.ifUnmodifiedSince.IsZero() {
+			glog.V(3).Infof("validateConditionalHeadersForReads: object %s/%s does not exist", bucket, object)
+			return ConditionalHeaderResult{ErrorCode: s3err.ErrNoSuchKey, Entry: nil}
 		}
-		if !headers.ifUnmodifiedSince.IsZero() {
-			glog.V(3).Infof("validateConditionalHeadersForReads: If-Unmodified-Since failed - object %s/%s does not exist", bucket, object)
-			return ConditionalHeaderResult{ErrorCode: s3err.ErrPreconditionFailed, Entry: nil}
-		}
-		// If-None-Match and If-Modified-Since succeed when object doesn't exist
-		// No entry to return since object doesn't exist
 		return ConditionalHeaderResult{ErrorCode: s3err.ErrNone, Entry: nil}
 	}
 
@@ -2269,9 +2604,10 @@ func (s3a *S3ApiServer) checkConditionalHeadersForReads(r *http.Request, bucket,
 		return ConditionalHeaderResult{ErrorCode: s3err.ErrNone, Entry: nil}
 	}
 
-	// Use resolveObjectEntry to correctly handle versioned objects.
-	// This ensures we check conditions against the LATEST version, not a null version.
-	entry, err := s3a.resolveObjectEntry(bucket, object)
+	// Use resolveObjectEntry to correctly handle versioned objects: the version the
+	// request names, or the LATEST version rather than a null version.
+	versionId := r.URL.Query().Get("versionId")
+	entry, err := s3a.resolveObjectEntry(bucket, object, versionId)
 	if err != nil {
 		if errors.Is(err, filer_pb.ErrNotFound) || errors.Is(err, ErrDeleteMarker) {
 			entry = nil
@@ -2279,6 +2615,11 @@ func (s3a *S3ApiServer) checkConditionalHeadersForReads(r *http.Request, bucket,
 			glog.Errorf("checkConditionalHeadersForReads: error resolving object entry for %s/%s: %v", bucket, object, err)
 			return ConditionalHeaderResult{ErrorCode: s3err.ErrInternalError, Entry: nil}
 		}
+	}
+	// A named version that resolves to nothing is the handler's answer to give: only it
+	// knows whether the bucket is versioned, and so whether that is NoSuchVersion.
+	if versionId != "" && normalizeConditionalTargetEntry(entry) == nil {
+		return ConditionalHeaderResult{ErrorCode: s3err.ErrNone, Entry: nil}
 	}
 	return s3a.validateConditionalHeadersForReads(r, headers, entry, bucket, object)
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
@@ -17,7 +18,7 @@ import (
 // openIndex returns a file descriptor for the volume's index, and the index size in bytes.
 func (v *Volume) openIndex() (*os.File, int64, error) {
 	idxFileName := v.FileName(".idx")
-	idxFile, err := os.OpenFile(idxFileName, os.O_RDONLY, 0644)
+	idxFile, err := backend.OpenVolumeFile(idxFileName, os.O_RDONLY)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to open IDX file %s for volume %v: %v", idxFileName, v.Id, err)
 	}
@@ -79,6 +80,11 @@ func (v *Volume) scrubVolumeData(idxFile *os.File, idxFileSize int64) (int64, []
 	version := v.Version()
 	err := idx.WalkIndexFile(idxFile, 0, func(id types.NeedleId, offset types.Offset, size types.Size) error {
 		count++
+		// A remote-tier delete records an offset-0 tombstone with no physical .dat
+		// bytes, so it must not contribute to totalRead.
+		if offset.IsZero() && size.IsDeleted() {
+			return nil
+		}
 		// compute the actual size of the needle in disk, including needle header, body and alignment padding.
 		actualSize := int64(needle.GetActualSize(size, version))
 
@@ -146,22 +152,80 @@ func CheckVolumeDataIntegrity(v *Volume, indexFile *os.File) (lastAppendAtNs uin
 	// fits inside .dat — issue #8928) lives in volume.load(): it reads
 	// MaximumNeedleEnd from the needle map after the load walk, so we don't
 	// need a redundant linear scan of the .idx here.
-	healthyIndexSize := indexSize
-	for i := 1; i <= 10 && indexSize >= int64(i)*types.NeedleMapEntrySize; i++ {
-		// check and fix last 10 entries
-		lastAppendAtNs, err = doCheckAndFixVolumeData(v, indexFile, indexSize-int64(i)*types.NeedleMapEntrySize)
-		if err == io.EOF {
-			healthyIndexSize = indexSize - int64(i)*types.NeedleMapEntrySize
-			continue
-		}
-		if err != ErrorSizeMismatch {
-			break
+
+	// Verify the needle physically last in the .dat (the highest offset) and
+	// that the .dat ends exactly at it. The .idx is not always in .dat append
+	// order: weed fix and other rebuilds could rewrite it sorted by key, which
+	// puts the highest-key needle last instead of the .dat-tail needle. Picking
+	// the last file-position entry there compares a mid-file needle's tail
+	// against the full .dat size and falsely flips the volume read-only on every
+	// load (issue #9688).
+	tailEntryPos, err := findDatTailEntryOffset(v, indexFile, indexSize)
+	if err != nil {
+		return 0, fmt.Errorf("CheckVolumeDataIntegrity %s: %v", indexFile.Name(), err)
+	}
+	if tailEntryPos < 0 {
+		// pre-allocated / all-zero index, nothing to verify against the .dat
+		return 0, nil
+	}
+
+	if lastAppendAtNs, err = doCheckAndFixVolumeData(v, indexFile, tailEntryPos); err != nil {
+		return lastAppendAtNs, fmt.Errorf("CheckVolumeDataIntegrity %s failed: %v", indexFile.Name(), err)
+	}
+	return lastAppendAtNs, nil
+}
+
+// findDatTailEntryOffset returns the .idx file position of the entry whose
+// needle is physically last in the .dat (highest offset). The common case — an
+// append-ordered .idx — is resolved in O(1): the last entry's on-disk end
+// equals the .dat size. A key-sorted .idx (e.g. legacy weed fix output) falls
+// back to a single linear scan for the maximum offset. Returns -1 when no entry
+// has a non-zero offset (a pre-allocated / all-zero index).
+func findDatTailEntryOffset(v *Volume, indexFile *os.File, indexSize int64) (int64, error) {
+	// Fast path: an append-ordered .idx ends with the .dat-tail needle, so the
+	// last entry's on-disk end matches the .dat size.
+	if v.DataBackend != nil {
+		if datSize, _, statErr := v.DataBackend.GetStat(); statErr == nil && datSize > 0 {
+			lastPos := indexSize - types.NeedleMapEntrySize
+			entryBytes, err := readIndexEntryAtOffset(indexFile, lastPos)
+			if err != nil {
+				return 0, fmt.Errorf("read last index entry: %v", err)
+			}
+			_, offset, size := idx.IdxFileEntry(entryBytes)
+			if !offset.IsZero() && needleDiskEnd(offset, size, v.Version()) == datSize {
+				return lastPos, nil
+			}
 		}
 	}
-	if healthyIndexSize < indexSize {
-		return 0, fmt.Errorf("CheckVolumeDataIntegrity %s failed: index size %d differs from healthy size %d", indexFile.Name(), indexSize, healthyIndexSize)
+
+	// Slow path: scan the whole .idx for the entry at the maximum offset.
+	maxEntryPos := int64(-1)
+	maxActualOffset := int64(-1)
+	entryPos := int64(0)
+	if err := idx.WalkIndexFile(indexFile, 0, func(_ types.NeedleId, offset types.Offset, _ types.Size) error {
+		if !offset.IsZero() {
+			if ao := offset.ToActualOffset(); ao > maxActualOffset {
+				maxActualOffset = ao
+				maxEntryPos = entryPos
+			}
+		}
+		entryPos += types.NeedleMapEntrySize
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("scan index: %v", err)
 	}
-	return
+	return maxEntryPos, nil
+}
+
+// needleDiskEnd returns the byte offset just past the needle's on-disk record.
+// Deletion tombstones carry TombstoneFileSize (-1) in the .idx but are written
+// with DataSize=0, so their on-disk record is sized as 0.
+func needleDiskEnd(offset types.Offset, size types.Size, version needle.Version) int64 {
+	onDiskSize := size
+	if size.IsDeleted() {
+		onDiskSize = 0
+	}
+	return offset.ToActualOffset() + needle.GetActualSize(onDiskSize, version)
 }
 
 func doCheckAndFixVolumeData(v *Volume, indexFile *os.File, indexOffset int64) (lastAppendAtNs uint64, err error) {
@@ -174,10 +238,10 @@ func doCheckAndFixVolumeData(v *Volume, indexFile *os.File, indexOffset int64) (
 		return 0, nil
 	}
 	if size < 0 {
-		// read the deletion entry. Pass io.EOF and ErrorSizeMismatch through
-		// unwrapped so CheckVolumeDataIntegrity can recognize them and run its
-		// trailing-truncation / wrap-around recovery loop, matching the live
-		// branch below.
+		// Deletion tombstone: the .idx carries TombstoneFileSize (-1) but the
+		// appended needle in .dat carries Size=0. verifyDeletedNeedleIntegrity
+		// reads it with Size=0 (the size check / 32GB wrap-around retry would
+		// otherwise read past EOF) and still verifies the .dat ends at it.
 		if lastAppendAtNs, err = verifyDeletedNeedleIntegrity(v.DataBackend, v.Version(), offset.ToActualOffset(), key); err != nil {
 			if err == io.EOF || err == ErrorSizeMismatch {
 				return lastAppendAtNs, err
@@ -193,6 +257,124 @@ func doCheckAndFixVolumeData(v *Volume, indexFile *os.File, indexOffset int64) (
 		}
 	}
 	return lastAppendAtNs, nil
+}
+
+// recoverLastModifiedTs points the TTL clock at the newest write recorded in
+// the volume, replacing the .dat mtime the loader starts from. A delete appends
+// a tombstone and vacuum rewrites the .dat wholesale, so the mtime moves
+// without any write: every restart of a volume taking delete traffic re-armed
+// expired() for another full TTL and the volume was never reclaimed. Left on
+// the mtime when no write is recoverable.
+func (v *Volume) recoverLastModifiedTs(indexFile *os.File) {
+	if v.Ttl == nil || v.Ttl.Minutes() == 0 {
+		return
+	}
+	indexSize, err := verifyIndexFileIntegrity(indexFile)
+	if err != nil || indexSize == 0 {
+		return
+	}
+	appendAtNs, err := findLastWriteAppendAtNs(v, indexFile, indexSize)
+	if err != nil {
+		glog.Warningf("volume %d recover last write from %s: %v", v.Id, indexFile.Name(), err)
+		return
+	}
+	if appendAtNs == 0 {
+		return
+	}
+	v.lastModifiedTsSeconds = appendAtNs / uint64(time.Second)
+}
+
+// vacuumedLastWriteScanEntries bounds the work a vacuumed volume's recovery
+// does, where key order makes every write a candidate for the newest one. A
+// volume with more live needles than this keeps the .dat mtime: reading a
+// subset could recover a timestamp older than the newest write and expire data
+// still inside its TTL, so a scan that will not fit declines instead of
+// guessing. A variable so tests can exercise that path.
+var vacuumedLastWriteScanEntries = 1 << 16
+
+// findLastWriteAppendAtNs scans the .idx backwards for the newest write -- an
+// entry that is not a deletion tombstone -- and returns that needle's append
+// timestamp. The .idx and the .dat share an order, so an append-ordered volume
+// answers with the first write the scan reaches. Vacuum rewrites both in key
+// order, which tracks write order only because the master issues keys
+// increasing: an overwrite keeps its original, lower key, so a vacuumed volume
+// has to take the maximum over every write it indexes. Returns 0 when the .idx
+// holds nothing but tombstones, when a vacuumed volume holds more needles than
+// the scan budget, or for a volume older than version 3, whose needles carry no
+// append timestamp.
+func findLastWriteAppendAtNs(v *Volume, indexFile *os.File, indexSize int64) (uint64, error) {
+	version := v.Version()
+	if version != needle.Version3 {
+		return 0, nil
+	}
+	scanEveryWrite := v.SuperBlock.CompactionRevision > 0
+	entryBudget := vacuumedLastWriteScanEntries
+	var lastWriteAppendAtNs uint64
+	block := make([]byte, types.NeedleMapEntrySize*idx.RowsToRead)
+	for end := indexSize; end > 0; {
+		start := max(end-int64(len(block)), 0)
+		entries := block[:end-start]
+		readCount, err := indexFile.ReadAt(entries, start)
+		if err == io.EOF && readCount == len(entries) {
+			err = nil
+		}
+		if err != nil {
+			return 0, fmt.Errorf("read %s at %d: %v", indexFile.Name(), start, err)
+		}
+		for i := len(entries) - types.NeedleMapEntrySize; i >= 0; i -= types.NeedleMapEntrySize {
+			key, offset, size := idx.IdxFileEntry(entries[i : i+types.NeedleMapEntrySize])
+			if offset.IsZero() || size.IsDeleted() {
+				continue
+			}
+			needleOffset := findNeedleOffset(v.DataBackend, version, offset.ToActualOffset(), key, size)
+			if needleOffset < 0 {
+				continue
+			}
+			appendAtNs, err := readNeedleAppendAtNs(v.DataBackend, needleOffset, size)
+			if err != nil {
+				return 0, err
+			}
+			lastWriteAppendAtNs = max(lastWriteAppendAtNs, appendAtNs)
+			if !scanEveryWrite {
+				return lastWriteAppendAtNs, nil
+			}
+			if entryBudget--; entryBudget == 0 {
+				glog.V(0).Infof("volume %d: more than %d needles to scan for its last write, keeping the %s mtime",
+					v.Id, vacuumedLastWriteScanEntries, v.FileName(".dat"))
+				return 0, nil
+			}
+		}
+		end = start
+	}
+	return lastWriteAppendAtNs, nil
+}
+
+// findNeedleOffset returns the .dat offset holding the needle an .idx entry
+// describes, or -1 when no needle there matches it. A .dat past
+// MaxPossibleVolumeSize wraps the 4-byte offsets in its .idx, so the needle can
+// sit one volume size further in; doCheckAndFixVolumeData retries the same way.
+func findNeedleOffset(datFile backend.BackendStorageFile, version needle.Version, offset int64, key types.NeedleId, size types.Size) int64 {
+	for _, at := range []int64{offset, offset + int64(types.MaxPossibleVolumeSize)} {
+		n, _, _, err := needle.ReadNeedleHeader(datFile, version, at)
+		if err == nil && n.Id == key && n.Size == size {
+			return at
+		}
+	}
+	return -1
+}
+
+// readNeedleAppendAtNs reads the append timestamp a version 3 needle carries
+// past its checksum.
+func readNeedleAppendAtNs(datFile backend.BackendStorageFile, offset int64, size types.Size) (uint64, error) {
+	bytes := make([]byte, types.TimestampSize)
+	readCount, err := datFile.ReadAt(bytes, offset+types.NeedleHeaderSize+int64(size)+needle.NeedleChecksumSize)
+	if err == io.EOF && readCount == types.TimestampSize {
+		err = nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return util.BytesToUint64(bytes), nil
 }
 
 func verifyIndexFileIntegrity(indexFile *os.File) (indexSize int64, err error) {
@@ -230,19 +412,13 @@ func verifyNeedleIntegrity(datFile backend.BackendStorageFile, v needle.Version,
 		return 0, ErrorSizeMismatch
 	}
 	if v == needle.Version3 {
-		bytes := make([]byte, types.TimestampSize)
-		var readCount int
-		readCount, err = datFile.ReadAt(bytes, offset+types.NeedleHeaderSize+int64(size)+needle.NeedleChecksumSize)
-		if err == io.EOF && readCount == types.TimestampSize {
-			err = nil
-		}
+		n.AppendAtNs, err = readNeedleAppendAtNs(datFile, offset, size)
 		if err == io.EOF {
 			return 0, err
 		}
 		if err != nil {
 			return 0, fmt.Errorf("verifyNeedleIntegrity check %s entry offset %d size %d: %v", datFile.Name(), offset, size, err)
 		}
-		n.AppendAtNs = util.BytesToUint64(bytes)
 		fileTailOffset := offset + needle.GetActualSize(size, v)
 		fileSize, _, err := datFile.GetStat()
 		if err != nil {
@@ -274,8 +450,8 @@ func verifyDeletedNeedleIntegrity(datFile backend.BackendStorageFile, v needle.V
 	// which reads past EOF and falsely marks the volume read-only.
 	size := types.Size(0)
 	if err = n.ReadData(datFile, offset, size, v); err != nil {
-		// Preserve io.EOF and ErrorSizeMismatch as-is so CheckVolumeDataIntegrity
-		// can detect trailing truncation and trigger its wrap-around retry.
+		// A truncated tail surfaces here as io.EOF; pass it (and a size mismatch)
+		// through so the volume is marked read-only.
 		if err == io.EOF || err == ErrorSizeMismatch {
 			return n.AppendAtNs, err
 		}
@@ -284,7 +460,17 @@ func verifyDeletedNeedleIntegrity(datFile backend.BackendStorageFile, v needle.V
 	if n.Id != key {
 		return n.AppendAtNs, fmt.Errorf("index key %v does not match needle's Id %v", key, n.Id)
 	}
-	return n.AppendAtNs, err
+	// This tombstone is the needle at the .dat tail (the highest offset), so the
+	// .dat must end exactly at it; extra bytes mean an unindexed trailing record.
+	fileSize, _, statErr := datFile.GetStat()
+	if statErr != nil {
+		return n.AppendAtNs, fmt.Errorf("stat file %s: %v", datFile.Name(), statErr)
+	}
+	if fileTailOffset := offset + needle.GetActualSize(size, v); fileSize > fileTailOffset {
+		glog.Warningf("data file %s actual %d bytes expected %d bytes!", datFile.Name(), fileSize, fileTailOffset)
+		return n.AppendAtNs, fmt.Errorf("data file %s actual %d bytes expected %d bytes", datFile.Name(), fileSize, fileTailOffset)
+	}
+	return n.AppendAtNs, nil
 }
 
 func (v *Volume) checkIdxFile() error {

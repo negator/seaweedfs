@@ -28,6 +28,13 @@ type LockClient struct {
 	ringMu      sync.RWMutex
 	ring        *lock_manager.HashRing
 	ringVersion int64
+
+	// priorRing is the ring before the most recent change, kept for priorWindow so a
+	// route-by-key caller can consult a just-moved key's previous owner during a
+	// rebalance. Mirrors the master's lock_manager.LockRing.PriorOwner cooling-off.
+	priorRing     *lock_manager.HashRing
+	ringChangedAt time.Time
+	priorWindow   time.Duration
 }
 
 func NewLockClient(grpcDialOption grpc.DialOption, seedFiler pb.ServerAddress) *LockClient {
@@ -36,6 +43,7 @@ func NewLockClient(grpcDialOption grpc.DialOption, seedFiler pb.ServerAddress) *
 		maxLockDuration: 5 * time.Second,
 		sleepDuration:   2473 * time.Millisecond,
 		seedFiler:       seedFiler,
+		priorWindow:     5 * time.Second,
 	}
 }
 
@@ -50,10 +58,15 @@ func (lc *LockClient) SetRing(servers []pb.ServerAddress, version int64) {
 		return
 	}
 	lc.ringVersion = version
-	if lc.ring == nil {
-		lc.ring = lock_manager.NewHashRing(lock_manager.DefaultVnodeCount)
+	// Build a fresh ring (not an in-place mutation) so the outgoing ring survives as
+	// priorRing with its own servers for the cooling-off window.
+	newRing := lock_manager.NewHashRing(lock_manager.DefaultVnodeCount)
+	newRing.SetServers(servers)
+	if lc.ring != nil {
+		lc.priorRing = lc.ring
+		lc.ringChangedAt = time.Now()
 	}
-	lc.ring.SetServers(servers)
+	lc.ring = newRing
 }
 
 // hostForKey returns the filer that should own key per the current ring view,
@@ -82,7 +95,29 @@ func (lc *LockClient) PrimaryForKey(key string) pb.ServerAddress {
 	return lc.ring.GetPrimary(key)
 }
 
+// PriorOwnerForKey returns key's owner from the prior ring while a rebalance is
+// within the cooling-off window and ownership actually moved, else "". Lets a
+// route-by-key reader consult a just-moved key's previous owner before the new
+// owner's NotFound is final (the new owner may not have replicated the key yet).
+func (lc *LockClient) PriorOwnerForKey(key string) pb.ServerAddress {
+	lc.ringMu.RLock()
+	defer lc.ringMu.RUnlock()
+	if lc.ring == nil || lc.priorRing == nil {
+		return ""
+	}
+	if time.Since(lc.ringChangedAt) > lc.priorWindow {
+		return ""
+	}
+	current := lc.ring.GetPrimary(key)
+	prior := lc.priorRing.GetPrimary(key)
+	if prior != "" && prior != current {
+		return prior
+	}
+	return ""
+}
+
 type LiveLock struct {
+	generation          int64 // fencing token from the lock server; MUST stay first so the 64-bit atomic ops stay 8-byte aligned on 32-bit ARM
 	key                 string
 	renewToken          string
 	expireAtNs          int64
@@ -95,8 +130,7 @@ type LiveLock struct {
 	lc                  *LockClient
 	owner               string
 	lockTTL             time.Duration
-	consecutiveFailures int   // Track connection failures to trigger fallback
-	generation          int64 // fencing token from the lock server
+	consecutiveFailures int // Track connection failures to trigger fallback
 }
 
 // NewShortLivedLock creates a lock with a 5-second duration

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"slices"
 	"testing"
 	"time"
 
@@ -61,6 +62,101 @@ func TestExtractV4AuthInfoFromHeader_S3Tables(t *testing.T) {
 				if authInfo.HashedPayload != emptySHA256 {
 					t.Errorf("Expected non-auto-hashed payload %s (emptySHA256), got %s", emptySHA256, authInfo.HashedPayload)
 				}
+			}
+		})
+	}
+}
+
+func TestParseSignedHeaderRejectsEmptyHeaderNames(t *testing.T) {
+	cases := []string{
+		"SignedHeaders=host;",
+		"SignedHeaders=;host",
+		"SignedHeaders=host;;x-amz-date",
+	}
+
+	for _, tc := range cases {
+		if _, errCode := parseSignedHeader(tc); errCode != s3err.ErrMissingFields {
+			t.Fatalf("parseSignedHeader(%q) errCode = %v, want %v", tc, errCode, s3err.ErrMissingFields)
+		}
+	}
+}
+
+func TestExtractV4AuthInfoFromQueryRejectsEmptySignedHeaderNames(t *testing.T) {
+	now := time.Now().UTC()
+	cases := []string{
+		"host;",
+		";host",
+		"host;;x-amz-date",
+	}
+
+	for _, tc := range cases {
+		t.Run(tc, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, "http://localhost/bucket/object", nil)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+
+			query := req.URL.Query()
+			query.Set("X-Amz-Algorithm", signV4Algorithm)
+			query.Set("X-Amz-Credential", fmt.Sprintf("AKIAIOSFODNN7EXAMPLE/%s/us-east-1/s3/aws4_request", now.Format(yyyymmdd)))
+			query.Set("X-Amz-Date", now.Format(iso8601Format))
+			query.Set("X-Amz-Expires", "60")
+			query.Set("X-Amz-Signature", "dummy")
+			query.Set("X-Amz-SignedHeaders", tc)
+			req.URL.RawQuery = query.Encode()
+
+			if _, errCode := extractV4AuthInfoFromQuery(req); errCode != s3err.ErrMissingFields {
+				t.Fatalf("extractV4AuthInfoFromQuery(%q) errCode = %v, want %v", tc, errCode, s3err.ErrMissingFields)
+			}
+		})
+	}
+}
+
+func TestGetCanonicalQueryString(t *testing.T) {
+	tests := []struct {
+		name        string
+		target      string
+		isPresigned bool
+		want        string
+	}{
+		{
+			name:   "sorts repeated values",
+			target: "http://localhost/bucket/key?partNumber=2&partNumber=10&uploadId=z",
+			want:   "partNumber=10&partNumber=2&uploadId=z",
+		},
+		{
+			name:        "removes presigned signature",
+			target:      "http://localhost/bucket/key?X-Amz-Date=20260618T000000Z&X-Amz-Signature=dummy&X-Amz-SignedHeaders=host",
+			isPresigned: true,
+			want:        "X-Amz-Date=20260618T000000Z&X-Amz-SignedHeaders=host",
+		},
+		{
+			name:   "sorts mixed single and repeated parameters",
+			target: "http://localhost/bucket/key?z=last&a=2&bucket=b&a=1",
+			want:   "a=1&a=2&bucket=b&z=last",
+		},
+		{
+			name:   "encodes query parameter values",
+			target: "http://localhost/bucket/key?prefix=photos/2026&marker=a%2Bb",
+			want:   "marker=a%2Bb&prefix=photos%2F2026",
+		},
+		{
+			name:   "empty query string",
+			target: "http://localhost/bucket/key",
+			want:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, tt.target, nil)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+
+			got := getCanonicalQueryString(req, tt.isPresigned)
+			if got != tt.want {
+				t.Fatalf("canonical query = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -421,6 +517,125 @@ func TestExtractHostHeader(t *testing.T) {
 			result := extractHostHeader(req, tt.externalHost)
 			if result != tt.expected {
 				t.Errorf("extractHostHeader() = %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestExtractHostHeaderCandidates tests the alternate host values tried during verification
+// when the true client-facing host is ambiguous behind a reverse proxy.
+func TestExtractHostHeaderCandidates(t *testing.T) {
+	tests := []struct {
+		name           string
+		hostHeader     string
+		forwardedHost  string
+		forwardedPort  string
+		forwardedProto string
+		externalHost   string
+		expected       []string
+	}{
+		{
+			name:         "externalHost leads, request host still follows",
+			hostHeader:   "backend:8333",
+			externalHost: "api.example.com:9000",
+			expected:     []string{"api.example.com:9000", "backend:8333"},
+		},
+		{
+			name:          "externalHost leads the forwarded candidates",
+			hostHeader:    "backend:8333",
+			forwardedHost: "example.com",
+			forwardedPort: "9000",
+			externalHost:  "api.example.com",
+			expected:      []string{"api.example.com", "example.com:9000", "example.com"},
+		},
+		{
+			name:         "externalHost equal to the request host is not repeated",
+			hostHeader:   "api.example.com:9000",
+			externalHost: "api.example.com:9000",
+			expected:     []string{"api.example.com:9000"},
+		},
+		{
+			name:          "X-Forwarded-Host with port is trusted as-is",
+			hostHeader:    "backend:8333",
+			forwardedHost: "example.com:9000",
+			forwardedPort: "443",
+			expected:      []string{"example.com:9000"},
+		},
+		{
+			name:       "plain Host with port is the only candidate",
+			hostHeader: "example.com:8080",
+			expected:   []string{"example.com:8080"},
+		},
+		{
+			name:           "portless X-Forwarded-Host, hostnames match: r.Host port first, then X-Forwarded-Port, then bare",
+			hostHeader:     "example.com:8333",
+			forwardedHost:  "example.com",
+			forwardedPort:  "9000",
+			forwardedProto: "http",
+			expected:       []string{"example.com:8333", "example.com:9000", "example.com"},
+		},
+		{
+			name:          "portless X-Forwarded-Host, hostnames match, no X-Forwarded-Port: bare host as fallback",
+			hostHeader:    "example.com:8333",
+			forwardedHost: "example.com",
+			expected:      []string{"example.com:8333", "example.com"},
+		},
+		{
+			name:          "portless X-Forwarded-Host, hostnames differ: X-Forwarded-Port, then bare",
+			hostHeader:    "backend:8333",
+			forwardedHost: "example.com",
+			forwardedPort: "9000",
+			expected:      []string{"example.com:9000", "example.com"},
+		},
+		{
+			name:           "default X-Forwarded-Port collapses into the bare candidate",
+			hostHeader:     "example.com:8333",
+			forwardedHost:  "example.com",
+			forwardedPort:  "443",
+			forwardedProto: "https",
+			expected:       []string{"example.com:8333", "example.com"},
+		},
+		{
+			name:          "portless Host with X-Forwarded-Port: forwarded port, then bare",
+			hostHeader:    "example.com",
+			forwardedPort: "9000",
+			expected:      []string{"example.com:9000", "example.com"},
+		},
+		{
+			name:          "bracketed portless IPv6 X-Forwarded-Host matches the request host",
+			hostHeader:    "[::1]:8333",
+			forwardedHost: "[::1]",
+			expected:      []string{"[::1]:8333", "::1"},
+		},
+		{
+			name:          "unbracketed portless IPv6 X-Forwarded-Host with X-Forwarded-Port",
+			hostHeader:    "backend:8333",
+			forwardedHost: "::1",
+			forwardedPort: "8080",
+			expected:      []string{"[::1]:8080", "::1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest("GET", "http://"+tt.hostHeader+"/bucket/object", nil)
+			if err != nil {
+				t.Fatalf("Failed to create request: %v", err)
+			}
+			req.Host = tt.hostHeader
+			if tt.forwardedHost != "" {
+				req.Header.Set("X-Forwarded-Host", tt.forwardedHost)
+			}
+			if tt.forwardedPort != "" {
+				req.Header.Set("X-Forwarded-Port", tt.forwardedPort)
+			}
+			if tt.forwardedProto != "" {
+				req.Header.Set("X-Forwarded-Proto", tt.forwardedProto)
+			}
+
+			result := extractHostHeaderCandidates(req, tt.externalHost)
+			if !slices.Equal(result, tt.expected) {
+				t.Errorf("extractHostHeaderCandidates() = %v, want %v", result, tt.expected)
 			}
 		})
 	}

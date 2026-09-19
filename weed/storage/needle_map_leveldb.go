@@ -117,8 +117,16 @@ func generateLevelDbFile(dbFileName string, indexFile *os.File) error {
 		glog.Fatalf("stat file %s: %v", indexFile.Name(), err)
 		return err
 	} else {
-		if watermark*NeedleMapEntrySize > uint64(stat.Size()) {
-			glog.Warningf("wrong watermark %d for filesize %d", watermark, stat.Size())
+		// A watermark past the end of the .idx means the .ldb is stale relative
+		// to the index it must mirror (e.g. an interrupted compaction left the
+		// old .ldb beside a freshly swapped, shorter .idx). Trusting it would
+		// replay zero entries and silently poison the needle map, so rebuild
+		// from offset 0 instead.
+		// Compare in entries, not bytes: watermark*NeedleMapEntrySize can
+		// overflow uint64 for a corrupted watermark and wrap past the size check.
+		if watermark > uint64(stat.Size())/NeedleMapEntrySize {
+			glog.Warningf("stale watermark %d for %s (filesize %d); rebuilding leveldb from start", watermark, dbFileName, stat.Size())
+			watermark = 0
 		}
 		glog.V(1).Infof("generateLevelDbFile %s, watermark %d, num of entries:%d", dbFileName, watermark, (uint64(stat.Size())-watermark*NeedleMapEntrySize)/NeedleMapEntrySize)
 	}
@@ -178,7 +186,7 @@ func (m *LevelDbNeedleMap) Put(key NeedleId, offset Offset, size Size) error {
 		watermark = (m.recordCount / watermarkBatchSize) * watermarkBatchSize
 		glog.V(1).Infof("put cnt:%d for %s,watermark: %d", m.recordCount, m.dbFileName, watermark)
 	}
-	return levelDbWrite(m.db, key, offset, size, watermark == 0, watermark)
+	return levelDbWrite(m.db, key, offset, size, watermark != 0, watermark)
 }
 
 func getWatermark(db *leveldb.DB) uint64 {
@@ -244,7 +252,7 @@ func (m *LevelDbNeedleMap) Delete(key NeedleId, offset Offset) error {
 	} else {
 		watermark = (m.recordCount / watermarkBatchSize) * watermarkBatchSize
 	}
-	return levelDbWrite(m.db, key, oldNeedle.Offset, -oldNeedle.Size, watermark == 0, watermark)
+	return levelDbWrite(m.db, key, oldNeedle.Offset, -oldNeedle.Size, watermark != 0, watermark)
 }
 
 func (m *LevelDbNeedleMap) Close() {
@@ -351,7 +359,7 @@ func (m *LevelDbNeedleMap) DoOffsetLoading(v *Volume, indexFile *os.File, startF
 
 	}()
 	if dbErr != nil {
-		if errors.IsCorrupted(err) {
+		if errors.IsCorrupted(dbErr) {
 			db, dbErr = leveldb.RecoverFile(dbFileName, nil)
 		}
 		if dbErr != nil {

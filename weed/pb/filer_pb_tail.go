@@ -109,12 +109,64 @@ func makeSubscribeMetadataFunc(option *MetadataFollowOption, processEventFn Proc
 			}
 		}
 
+		// handleOneEvent processes a single response, whether it arrived as the
+		// batch envelope or inside resp.Events. Freshness signals carry a timestamp
+		// but no entry: the idle heartbeat (nil EventNotification) and the
+		// MaxUnsyncedEvents marker (empty one). Both route to OnIdleHeartbeat,
+		// else the marker pins sync_offset to the stale processed watermark and a
+		// nil heartbeat folded into a batch nil-derefs in the sync job path.
+		handleOneEvent := func(resp *filer_pb.SubscribeMetadataResponse) {
+			if resp.EventNotification == nil || filer_pb.IsEmpty(resp) {
+				if resp.TsNs > 0 && option.OnIdleHeartbeat != nil {
+					option.OnIdleHeartbeat(resp.TsNs)
+				}
+				// The marker advances the resume cursor past the filtered range; the
+				// heartbeat leaves StartTsNs put so a restart cannot outrun a straggler.
+				if resp.EventNotification != nil && resp.TsNs > 0 {
+					option.StartTsNs = resp.TsNs
+				}
+				return
+			}
+			if err := processEventFn(resp); err != nil {
+				handleErr(resp, err)
+			}
+			option.StartTsNs = resp.TsNs
+		}
+
 		var pendingRefs []*filer_pb.LogFileChunkRef
+
+		// drainPendingRefs reads whatever chunk refs have accumulated. The server
+		// sends refs in their own responses, so they can only be read once
+		// something tells us the run of refs has ended — either a normal event, or
+		// the end of the stream. A bounded subscription (StopTsNs set, range
+		// already in the past) may get nothing but refs and then EOF, so draining
+		// only on the former silently returns no events at all.
+		drainPendingRefs := func() error {
+			if len(pendingRefs) == 0 || option.LogFileReaderFn == nil {
+				return nil
+			}
+			lastTs, readErr := ReadLogFileRefs(pendingRefs, option.LogFileReaderFn,
+				option.StartTsNs, option.StopTsNs,
+				PathFilter{
+					PathPrefix:             option.PathPrefix,
+					AdditionalPathPrefixes: option.AdditionalPathPrefixes,
+					DirectoriesToWatch:     option.DirectoriesToWatch,
+				},
+				processEventFn)
+			if readErr != nil {
+				return fmt.Errorf("%w: %w", ErrLogFileRead, readErr)
+			}
+			if lastTs > 0 {
+				option.StartTsNs = lastTs
+			}
+			pendingRefs = nil
+			return nil
+		}
 
 		for {
 			resp, listenErr := stream.Recv()
 			if listenErr == io.EOF {
-				return nil
+				return drainPendingRefs()
 			}
 			if listenErr != nil {
 				return listenErr
@@ -127,49 +179,17 @@ func makeSubscribeMetadataFunc(option *MetadataFollowOption, processEventFn Proc
 			}
 
 			// Process accumulated refs before handling normal events (transition point)
-			if len(pendingRefs) > 0 && option.LogFileReaderFn != nil {
-				lastTs, readErr := ReadLogFileRefs(pendingRefs, option.LogFileReaderFn,
-					option.StartTsNs, option.StopTsNs,
-					PathFilter{
-						PathPrefix:             option.PathPrefix,
-						AdditionalPathPrefixes: option.AdditionalPathPrefixes,
-						DirectoriesToWatch:     option.DirectoriesToWatch,
-					},
-					processEventFn)
-				if readErr != nil {
-					return fmt.Errorf("read log file refs: %w", readErr)
-				}
-				if lastTs > 0 {
-					option.StartTsNs = lastTs
-				}
-				pendingRefs = nil
+			if err := drainPendingRefs(); err != nil {
+				return err
 			}
 
-			// Idle heartbeat: the source is caught up and has no new events, so
-			// it sends an empty response carrying the current time. Surface it as
-			// a freshness signal but leave option.StartTsNs untouched so a restart
-			// still resumes from the last real event.
-			if resp.EventNotification == nil && len(resp.Events) == 0 && resp.TsNs > 0 {
-				if option.OnIdleHeartbeat != nil {
-					option.OnIdleHeartbeat(resp.TsNs)
-				}
-				continue
-			}
-
-			// Process the first event (always present in top-level fields)
-			if resp.EventNotification != nil {
-				if err := processEventFn(resp); err != nil {
-					handleErr(resp, err)
-				}
-				option.StartTsNs = resp.TsNs
-			}
-
-			// Process any additional batched events
+			// Process the envelope event (top-level fields) and any batched tail.
+			// The server folds a backlog into one response: the first event lives in
+			// the top-level fields, the rest in resp.Events. Either slot can hold a
+			// freshness signal, so both go through the same handler.
+			handleOneEvent(resp)
 			for _, batchedEvent := range resp.Events {
-				if err := processEventFn(batchedEvent); err != nil {
-					handleErr(batchedEvent, err)
-				}
-				option.StartTsNs = batchedEvent.TsNs
+				handleOneEvent(batchedEvent)
 			}
 		}
 	}

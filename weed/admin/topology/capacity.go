@@ -162,6 +162,7 @@ func (at *ActiveTopology) GetDisksWithEffectiveCapacity(taskType TaskType, exclu
 				// Create a new DiskInfo with current capacity information
 				diskCopy := DiskInfo{
 					NodeID:     disk.DiskInfo.NodeID,
+					Address:    disk.DiskInfo.Address,
 					DiskID:     disk.DiskInfo.DiskID,
 					DiskType:   disk.DiskInfo.DiskType,
 					DataCenter: disk.DiskInfo.DataCenter,
@@ -180,6 +181,8 @@ func (at *ActiveTopology) GetDisksWithEffectiveCapacity(taskType TaskType, exclu
 					ActiveVolumeCount: disk.DiskInfo.DiskInfo.ActiveVolumeCount,
 					FreeVolumeCount:   disk.DiskInfo.DiskInfo.FreeVolumeCount,
 					Tags:              append([]string(nil), disk.DiskInfo.DiskInfo.Tags...),
+					DiskTotalBytes:    disk.DiskInfo.DiskInfo.DiskTotalBytes,
+					DiskFreeBytes:     disk.DiskInfo.DiskInfo.DiskFreeBytes,
 				}
 				diskCopy.DiskInfo = diskInfoCopy
 				diskCopy.DiskInfo.MaxVolumeCount = disk.DiskInfo.DiskInfo.MaxVolumeCount // Ensure Max is set
@@ -226,6 +229,7 @@ func (at *ActiveTopology) GetDisksForPlanning(taskType TaskType, excludeNodeID s
 				// Create a new DiskInfo with planning information
 				diskCopy := DiskInfo{
 					NodeID:     disk.DiskInfo.NodeID,
+					Address:    disk.DiskInfo.Address,
 					DiskID:     disk.DiskInfo.DiskID,
 					DiskType:   disk.DiskInfo.DiskType,
 					DataCenter: disk.DiskInfo.DataCenter,
@@ -244,6 +248,8 @@ func (at *ActiveTopology) GetDisksForPlanning(taskType TaskType, excludeNodeID s
 					ActiveVolumeCount: disk.DiskInfo.DiskInfo.ActiveVolumeCount,
 					FreeVolumeCount:   disk.DiskInfo.DiskInfo.FreeVolumeCount,
 					Tags:              append([]string(nil), disk.DiskInfo.DiskInfo.Tags...),
+					DiskTotalBytes:    disk.DiskInfo.DiskInfo.DiskTotalBytes,
+					DiskFreeBytes:     disk.DiskInfo.DiskInfo.DiskFreeBytes,
 				}
 				diskCopy.DiskInfo = diskInfoCopy
 

@@ -24,8 +24,8 @@ type FuseTestFramework struct {
 	mountPoint   string
 	dataDir      string
 	logDir       string
-	miniProcess  *os.Process
-	mountProcess *os.Process
+	miniProcess  *managedProcess
+	mountProcess *managedProcess
 	filerAddr    string
 	filerPort    int
 	weedBinary   string
@@ -34,14 +34,18 @@ type FuseTestFramework struct {
 
 // TestConfig holds configuration for FUSE tests
 type TestConfig struct {
-	Collection   string
-	Replication  string
-	ChunkSizeMB  int
-	CacheSizeMB  int
-	NumVolumes   int
-	EnableDebug  bool
-	MountOptions []string
-	SkipCleanup  bool // for debugging failed tests
+	Collection  string
+	Replication string
+	ChunkSizeMB int
+	CacheSizeMB int
+	NumVolumes  int
+	EnableDebug bool
+	// MountGlobalOptions are glog flags (-v, -logtostderr, ...) registered on
+	// weed's global flagset; they must precede the subcommand name or the
+	// mount process dies at flag parsing.
+	MountGlobalOptions []string
+	MountOptions       []string
+	SkipCleanup        bool // for debugging failed tests
 }
 
 // DefaultTestConfig returns a default configuration for FUSE tests
@@ -82,33 +86,45 @@ func NewFuseTestFramework(t *testing.T, config *TestConfig) *FuseTestFramework {
 	}
 }
 
-// freePort asks the OS for a free TCP port in a range where the gRPC
-// offset (port + 10000) won't collide with well-known ports.
-// Stay below the Linux ephemeral floor (32768) so the kernel does not
-// reuse the chosen port for an outbound connection between close() here
-// and re-bind in the child "weed mini" process.
+// grpcPortOffset mirrors weed's HTTP->gRPC port convention (gRPC = HTTP + offset);
+// "weed mount" derives the filer gRPC port from the filer HTTP address the same way.
+const grpcPortOffset = 10000
+
+// freePort returns a free filer HTTP port whose gRPC sibling (port+grpcPortOffset)
+// is also free. Both must stay below the Linux ephemeral floor (32768): a gRPC port
+// above it can be transiently grabbed by an outbound connection, forcing mini to
+// relocate its filer gRPC port while "weed mount" keeps dialing HTTP+10000 — the
+// mount then never connects and the test times out. Capping HTTP at 22000 keeps the
+// gRPC port at or below 32000.
 func freePort(t *testing.T) int {
 	t.Helper()
 	const (
 		minServicePort = 20000
-		maxServicePort = 32000
+		maxServicePort = 22000
 	)
 
 	portCount := maxServicePort - minServicePort + 1
 	start := minServicePort + int(time.Now().UnixNano()%int64(portCount))
 
-	for attempt := 0; attempt < 512; attempt++ {
+	for attempt := 0; attempt < portCount; attempt++ {
 		port := minServicePort + (start-minServicePort+attempt)%portCount
-		l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
-		if err != nil {
-			continue
+		if portIsFree(port) && portIsFree(port+grpcPortOffset) {
+			return port
 		}
-		l.Close()
-		return port
 	}
 
-	t.Fatalf("failed to allocate port <= %d after repeated attempts", maxServicePort)
+	t.Fatalf("failed to allocate a free HTTP/gRPC port pair in [%d,%d]", minServicePort, maxServicePort)
 	return 0
+}
+
+// portIsFree reports whether a TCP port can currently be bound on 127.0.0.1.
+func portIsFree(port int) bool {
+	l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		return false
+	}
+	l.Close()
+	return true
 }
 
 // Setup starts "weed mini" and mounts the FUSE filesystem.
@@ -130,7 +146,7 @@ func (f *FuseTestFramework) Setup(config *TestConfig) error {
 	}
 
 	// Wait for filer to be ready (mini starts all services on filerPort)
-	if err := f.waitForService(f.filerAddr, 30*time.Second); err != nil {
+	if err := f.waitForService(f.miniProcess, f.filerAddr, 30*time.Second); err != nil {
 		f.dumpLog("mini")
 		return fmt.Errorf("weed mini not ready: %v", err)
 	}
@@ -157,16 +173,11 @@ func (f *FuseTestFramework) Cleanup() {
 		f.DumpLogs()
 	}
 
-	if f.mountProcess != nil {
-		f.unmountFuse()
-	}
-
 	// Stop processes in reverse order
-	for _, proc := range []*os.Process{f.mountProcess, f.miniProcess} {
-		if proc != nil {
-			proc.Signal(syscall.SIGTERM)
-			proc.Wait()
-		}
+	f.unmountFuse()
+	if f.miniProcess != nil {
+		f.miniProcess.stop()
+		f.miniProcess = nil
 	}
 
 	f.copyLogsForCI()
@@ -193,9 +204,43 @@ func (f *FuseTestFramework) GetFilerAddr() string {
 	return f.filerAddr
 }
 
+// managedProcess is a started weed sub-command whose exit is watched, so a wait
+// for it to come up ends the moment it dies instead of burning its full timeout.
+type managedProcess struct {
+	cmd  *exec.Cmd
+	done chan struct{}
+	err  error // exit error, read only after done is closed
+}
+
+// exited returns the exit error once the process is gone, nil while it runs.
+func (p *managedProcess) exited() error {
+	select {
+	case <-p.done:
+		if p.err != nil {
+			return p.err
+		}
+		return fmt.Errorf("exit status 0")
+	default:
+		return nil
+	}
+}
+
+// stop asks the process to terminate and waits for it to go away.
+func (p *managedProcess) stop() {
+	// Signal fails with os.ErrProcessDone when the child is already gone, which
+	// is exactly the case the select below handles.
+	_ = p.cmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case <-p.done:
+	case <-time.After(10 * time.Second):
+		p.cmd.Process.Kill()
+		<-p.done
+	}
+}
+
 // startProcess is a helper that starts a weed sub-command with output captured
 // to a log file in f.logDir.
-func (f *FuseTestFramework) startProcess(name string, args []string) (*os.Process, error) {
+func (f *FuseTestFramework) startProcess(name string, args []string) (*managedProcess, error) {
 	logFile, err := os.Create(filepath.Join(f.logDir, name+".log"))
 	if err != nil {
 		return nil, fmt.Errorf("create log file: %v", err)
@@ -210,7 +255,13 @@ func (f *FuseTestFramework) startProcess(name string, args []string) (*os.Proces
 	}
 	// Close the file handle — the child process inherited it.
 	logFile.Close()
-	return cmd.Process, nil
+
+	p := &managedProcess{cmd: cmd, done: make(chan struct{})}
+	go func() {
+		p.err = cmd.Wait()
+		close(p.done)
+	}()
+	return p, nil
 }
 
 // dumpLog prints the last lines of a process log file to the test output
@@ -246,19 +297,20 @@ func (f *FuseTestFramework) copyLogsForCI() {
 
 // startMini starts "weed mini" which runs master+volume+filer in one process.
 func (f *FuseTestFramework) startMini(config *TestConfig) error {
-	args := []string{
-		"mini",
-		"-dir=" + f.dataDir,
-		"-ip=127.0.0.1",
-		"-ip.bind=127.0.0.1",
-		"-filer.port=" + strconv.Itoa(f.filerPort),
-		"-s3=false",
-		"-webdav=false",
-		"-admin.ui=false",
-	}
+	var args []string
 	if config.EnableDebug {
 		args = append(args, "-v=4")
 	}
+	args = append(args,
+		"mini",
+		"-dir="+f.dataDir,
+		"-ip=127.0.0.1",
+		"-ip.bind=127.0.0.1",
+		"-filer.port="+strconv.Itoa(f.filerPort),
+		"-s3=false",
+		"-webdav=false",
+		"-admin.ui=false",
+	)
 
 	proc, err := f.startProcess("mini", args)
 	if err != nil {
@@ -270,14 +322,18 @@ func (f *FuseTestFramework) startMini(config *TestConfig) error {
 
 // mountFuse mounts the SeaweedFS FUSE filesystem
 func (f *FuseTestFramework) mountFuse(config *TestConfig) error {
-	args := []string{
+	args := append([]string{}, config.MountGlobalOptions...)
+	if config.EnableDebug {
+		args = append(args, "-v=4")
+	}
+	args = append(args,
 		"mount",
-		"-filer=127.0.0.1:" + strconv.Itoa(f.filerPort),
-		"-dir=" + f.mountPoint,
+		"-filer=127.0.0.1:"+strconv.Itoa(f.filerPort),
+		"-dir="+f.mountPoint,
 		"-filer.path=/",
 		"-dirAutoCreate",
 		"-allowOthers=false",
-	}
+	)
 
 	if config.Collection != "" {
 		args = append(args, "-collection="+config.Collection)
@@ -290,9 +346,6 @@ func (f *FuseTestFramework) mountFuse(config *TestConfig) error {
 	}
 	if config.CacheSizeMB > 0 {
 		args = append(args, fmt.Sprintf("-cacheCapacityMB=%d", config.CacheSizeMB))
-	}
-	if config.EnableDebug {
-		args = append(args, "-v=4")
 	}
 
 	args = append(args, config.MountOptions...)
@@ -308,8 +361,7 @@ func (f *FuseTestFramework) mountFuse(config *TestConfig) error {
 // unmountFuse unmounts the FUSE filesystem
 func (f *FuseTestFramework) unmountFuse() error {
 	if f.mountProcess != nil {
-		f.mountProcess.Signal(syscall.SIGTERM)
-		f.mountProcess.Wait()
+		f.mountProcess.stop()
 		f.mountProcess = nil
 	}
 
@@ -320,7 +372,7 @@ func (f *FuseTestFramework) unmountFuse() error {
 }
 
 // waitForService waits for a service to be available
-func (f *FuseTestFramework) waitForService(addr string, timeout time.Duration) error {
+func (f *FuseTestFramework) waitForService(proc *managedProcess, addr string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
@@ -328,23 +380,48 @@ func (f *FuseTestFramework) waitForService(addr string, timeout time.Duration) e
 			conn.Close()
 			return nil
 		}
+		if exitErr := proc.exited(); exitErr != nil {
+			return fmt.Errorf("process exited (%v) before %s accepted connections", exitErr, addr)
+		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("service at %s not ready within timeout", addr)
 }
 
-// waitForMount waits for the FUSE mount to be ready
+// waitForMount waits for the FUSE mount to be ready. A stat/ReadDir probe
+// alone is not enough: the bare mount point directory passes both before the
+// mount process finishes starting, letting tests race ahead and write to the
+// local disk underneath the mount. The mount point's device ID differing from
+// its parent's confirms a filesystem is actually mounted there.
 func (f *FuseTestFramework) waitForMount(timeout time.Duration) error {
+	parentDev, err := deviceID(filepath.Dir(f.mountPoint))
+	if err != nil {
+		return fmt.Errorf("stat mount point parent: %v", err)
+	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(f.mountPoint); err == nil {
+		if dev, err := deviceID(f.mountPoint); err == nil && dev != parentDev {
 			if _, err := os.ReadDir(f.mountPoint); err == nil {
 				return nil
 			}
 		}
+		// A mount that cannot mount at all (no /dev/fuse, fusermount not setuid)
+		// dies within a second; reporting that beats waiting out the timeout.
+		if exitErr := f.mountProcess.exited(); exitErr != nil {
+			return fmt.Errorf("mount process exited (%v)", exitErr)
+		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("mount point not ready within timeout")
+}
+
+// deviceID returns the device ID of the filesystem containing path.
+func deviceID(path string) (uint64, error) {
+	var st syscall.Stat_t
+	if err := syscall.Stat(path, &st); err != nil {
+		return 0, err
+	}
+	return uint64(st.Dev), nil
 }
 
 // findWeedBinary locates the weed binary.

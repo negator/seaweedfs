@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"syscall"
@@ -43,6 +44,41 @@ func TestGrpcErrorToFuseStatusDropsCanceledThroughPercentV(t *testing.T) {
 	}
 }
 
+// A full cluster must surface as ENOSPC so cp/rsync abort with "No space left
+// on device" instead of a generic I/O error. The master's message reaches the
+// mount stringified inside AssignVolumeResponse.Error, in one of two shapes:
+// the load-shedding gRPC status text or the topology's plain error text.
+func TestWriteErrorToFuseStatus(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want fuse.Status
+	}{
+		{
+			"assign shed during growth",
+			errors.New("upload data: filerGrpcAddress assign volume: assign volume failure count:1: assign volume: rpc error: code = ResourceExhausted desc = no writable volumes for replication:000 collection:, volume growth in progress"),
+			fuse.Status(syscall.ENOSPC),
+		},
+		{
+			"no free volumes left",
+			errors.New("flush data: upload data: assign volume: No writable volumes available for collection: replication:000 ttl: and no free volumes left for {replication:000}"),
+			fuse.Status(syscall.ENOSPC),
+		},
+		{
+			"unrelated upload failure",
+			errors.New("upload data: put http://volume:8080/3,0144: connection reset by peer"),
+			fuse.EIO,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := writeErrorToFuseStatus(tc.err); got != tc.want {
+				t.Fatalf("writeErrorToFuseStatus(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIsRetryableFilerError(t *testing.T) {
 	cases := []struct {
 		name string
@@ -82,13 +118,13 @@ func TestRetryMetadataFlushIfShortCircuitsOnPermanentError(t *testing.T) {
 	t.Cleanup(func() {
 		metadataFlushSleep = originalSleep
 	})
-	metadataFlushSleep = func(_ time.Duration) {
+	metadataFlushSleep = func(_ context.Context, _ time.Duration) {
 		t.Fatal("sleep should not be called when shouldRetry returns false")
 	}
 
 	attempts := 0
 	permanent := status.Error(codes.NotFound, "entry missing")
-	err := retryMetadataFlushIf(func() error {
+	err := retryMetadataFlushIf(context.Background(), func() error {
 		attempts++
 		return permanent
 	}, isRetryableFilerError, nil)
@@ -108,11 +144,11 @@ func TestRetryMetadataFlushIfRetriesTransientErrors(t *testing.T) {
 	t.Cleanup(func() {
 		metadataFlushSleep = originalSleep
 	})
-	metadataFlushSleep = func(_ time.Duration) {}
+	metadataFlushSleep = func(_ context.Context, _ time.Duration) {}
 
 	attempts := 0
 	transient := status.Error(codes.Canceled, "grpc: the client connection is closing")
-	err := retryMetadataFlushIf(func() error {
+	err := retryMetadataFlushIf(context.Background(), func() error {
 		attempts++
 		return transient
 	}, isRetryableFilerError, nil)
